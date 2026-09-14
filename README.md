@@ -179,6 +179,21 @@ A tag at 1 m is large and bright and passes at almost any exposure, so the cliff
 measure sits far below the real one against field tags at 3–6 m. Use a representative
 distance.
 
+### Held-card mode carries extra margin, on purpose
+
+Detecting one tag is easier than getting several tags detected *well enough to multi-tag*.
+Measured on the same rig minutes apart:
+
+```
+field tags, multi-tag solve rate  ->  4735
+held card, single-tag detection   ->  2990      (1.6x shorter)
+```
+
+So a held card measures the **single-tag detection floor**, which is below what a field
+multi-tag solve actually needs — it would under-expose you for the thing you depend on.
+`--reference-bias` (default 1.6) compensates. If you can, re-run against real field tags
+once you have access and trust that result over the pit one.
+
 ## Options
 
 | Flag | Default | |

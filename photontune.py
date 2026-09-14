@@ -294,7 +294,15 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
                 log("   WARNING: reference tag %d never seen at any exposure." % args.reference_tag)
                 result["range_warning"] = "reference tag never detected"
 
-        chosen, shortest, cliff = choose_exposure(samples, args.bias, args.min_tags,
+        # A single held tag is detected at shorter exposures than a full multi-tag
+        # solve needs, so held-card mode measures a LOWER cliff than field
+        # conditions require. Carry extra margin to compensate.
+        bias = args.bias
+        if args.reference_tag is not None:
+            bias *= args.reference_bias
+            log("   held-card mode: bias %.2f x %.2f = %.2f (single-tag detection is "
+                "easier than a multi-tag solve)" % (args.bias, args.reference_bias, bias))
+        chosen, shortest, cliff = choose_exposure(samples, bias, args.min_tags,
                                                   args.max_ambiguity, args.reference_tag)
         if chosen is None:
             log("   NOTHING PASSED - restoring original. Try more light or a higher --gain.")
@@ -303,7 +311,7 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
             return result
 
         log("   cliff ~%.0f (bracketed), shortest verified pass %.0f, bias %.2f  ->  %.0f"
-            % (cliff, shortest.exposure, args.bias, chosen))
+            % (cliff, shortest.exposure, bias, chosen))
         blur = lambda deg: math.radians(deg) * (chosen / 1e6) * args.fx
         log("   predicted blur: %.1f px @90deg/s, %.1f px @360deg/s (tag edge ~70 px)"
             % (blur(90), blur(360)))
@@ -526,6 +534,9 @@ def build_parser():
     p.add_argument("--fx", type=float, default=1105.9, help="focal length in px, for the blur estimate")
     p.add_argument("--reference-tag", type=int, default=None,
                    help="tag ID held in front of the camera; score on its detection rate")
+    p.add_argument("--reference-bias", type=float, default=1.6,
+                   help="extra margin in held-card mode; a single tag is detected at "
+                        "shorter exposures than a multi-tag solve needs (default 1.6)")
     p.add_argument("--move-pause", type=float, default=8.0,
                    help="seconds to move the held card between cameras (held-card mode)")
     p.add_argument("--reference-range", type=float, default=None,
