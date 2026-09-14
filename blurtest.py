@@ -12,15 +12,33 @@ import sys, time, math, json
 import numpy as np, ntcore
 from photonlibpy.photonCamera import PhotonCamera
 
-HOST = sys.argv[1] if len(sys.argv) > 1 else "192.168.1.202"
-TAG  = int(sys.argv[2]) if len(sys.argv) > 2 else 6
-EXP  = float(sys.argv[3]) if len(sys.argv) > 3 else None   # us, for the blur figure
-DUR  = float(sys.argv[4]) if len(sys.argv) > 4 else 30.0
+import argparse
+_ap = argparse.ArgumentParser(
+    description="Measure how much motion blur AprilTag detection actually tolerates.")
+_ap.add_argument("host", nargs="?", default="photonvision.local")
+_ap.add_argument("tag", nargs="?", type=int, default=0, help="tag ID to track")
+_ap.add_argument("exposure", nargs="?", type=float, default=None,
+                 help="current exposure in us, for the blur figure")
+_ap.add_argument("seconds", nargs="?", type=float, default=30.0)
+_ap.add_argument("--camera", default=None, help="camera nickname (default: auto-detect)")
+_a = _ap.parse_args()
+HOST, TAG, EXP, DUR = _a.host, _a.tag, _a.exposure, _a.seconds
 
 inst = ntcore.NetworkTableInstance.getDefault()
 inst.startClient4("blurtest")
 inst.setServer(HOST, ntcore.NetworkTableInstance.kDefaultPort4)
-cam = PhotonCamera("OV9281")
+if _a.camera is None:
+    import urllib.request, json as _j, zipfile as _z, io as _io, sqlite3 as _s, tempfile as _t, os as _o
+    raw = urllib.request.urlopen("http://%s:5800/api/settings/photonvision_config.zip" % HOST,
+                                 timeout=60).read()
+    with _t.TemporaryDirectory() as _td, _z.ZipFile(_io.BytesIO(raw)) as _zz:
+        _n = [n for n in _zz.namelist() if n.endswith("photon.sqlite")][0]
+        _zz.extract(_n, _td)
+        _c = _s.connect(_o.path.join(_td, _n))
+        _a.camera = _j.loads(_c.execute("select config_json from cameras").fetchone()[0]).get("nickname")
+        _c.close()
+    print("auto-detected camera: %s" % _a.camera)
+cam = PhotonCamera(_a.camera)
 
 samples = []          # (t, centroid, size_px, ambiguity, range_m)
 gaps = 0              # frames where the tag vanished

@@ -160,7 +160,12 @@ class Photon:
         self.ws = None
 
     async def __aenter__(self):
-        self.ws = await websockets.connect(self.uri, open_timeout=10, max_size=80_000_000)
+        try:
+            self.ws = await websockets.connect(self.uri, open_timeout=10, max_size=80_000_000)
+        except Exception as exc:
+            raise ConnectionError(
+                "could not reach PhotonVision at %s - check the host and that it is running (%s)"
+                % (self.uri, type(exc).__name__)) from None
         return self
 
     async def __aexit__(self, *a):
@@ -427,14 +432,16 @@ async def run(args, log=print, progress=None, on_camera=None):
     async with Photon(args.host, args.port) as pv:
         cams = await pv.cameras()
         if not cams:
-            log("no cameras reported by PhotonVision at %s" % args.host)
-            return []
+            raise LookupError("no cameras reported by PhotonVision at %s" % args.host)
         if args.cameras:
             want = {c.strip().lower() for c in args.cameras.split(",")}
-            cams = [c for c in cams if c["nickname"].lower() in want or c["uniqueName"].lower() in want]
-            if not cams:
-                log("none of the requested cameras matched")
-                return []
+            matched = [c for c in cams
+                       if c["nickname"].lower() in want or c["uniqueName"].lower() in want]
+            if not matched:
+                raise LookupError(
+                    "no camera matched %r. Available: %s"
+                    % (args.cameras, ", ".join(c["nickname"] for c in cams)))
+            cams = matched
         log("tuning %d camera(s): %s" % (len(cams), ", ".join(c["nickname"] for c in cams)))
         results = []
         for idx, cam in enumerate(cams):   # sequential: avoids cameras perturbing each other
@@ -630,13 +637,19 @@ def main():
     if args.min_exposure <= 0 or args.max_exposure <= args.min_exposure:
         sys.exit("--max-exposure must exceed --min-exposure, both > 0")
     if args.calibrate_reference_bias:
-        asyncio.run(calibrate_reference_bias(args))
+        try:
+            asyncio.run(calibrate_reference_bias(args))
+        except (ConnectionError, LookupError) as exc:
+            sys.exit("photontune: %s" % exc)
         return
     if args.daemon:
         asyncio.run(daemon(args))
         return
     t0 = time.time()
-    results = asyncio.run(run(args))
+    try:
+        results = asyncio.run(run(args))
+    except (ConnectionError, LookupError) as exc:
+        sys.exit("photontune: %s" % exc)
     if args.json:
         print(json.dumps(results, indent=2))
     else:
