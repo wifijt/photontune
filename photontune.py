@@ -211,10 +211,42 @@ class Photon:
         await self._pump(timeout, handle)
         return list(found.values())
 
+    # PhotonVision SILENTLY DISCARDS a float sent to an integer-typed setting.
+    # No error, no log line - the write simply does not happen. Coerce them.
+    INT_SETTINGS = {"cameraGain", "cameraBrightness", "decimate", "numIterations",
+                    "threads", "decisionMargin", "cameraRedGain", "cameraBlueGain",
+                    "cameraVideoModeIndex", "pipelineIndex"}
+
     async def set_setting(self, unique_name, **kw):
-        payload = dict(kw)
+        payload = {}
+        for k, v in kw.items():
+            if k in self.INT_SETTINGS and isinstance(v, float):
+                v = int(round(v))
+            payload[k] = v
         payload["cameraUniqueName"] = unique_name
         await self.ws.send(msgpack.packb({"changePipelineSetting": payload}))
+
+    async def set_and_verify(self, unique_name, settle=1.5, **kw):
+        """Write settings and confirm the camera took them. Returns list of failures."""
+        await self.set_setting(unique_name, **kw)
+        await asyncio.sleep(settle)
+        cams = await self.cameras(timeout=8)
+        got = next((c for c in cams if c["uniqueName"] == unique_name), None)
+        if not got:
+            return [("<camera>", None, None)]
+        live = got["settings"]
+        bad = []
+        for k, want in kw.items():
+            if k in self.INT_SETTINGS and isinstance(want, float):
+                want = int(round(want))
+            have = live.get(k)
+            try:
+                same = abs(float(have) - float(want)) < 1e-6
+            except (TypeError, ValueError):
+                same = (have == want)
+            if not same:
+                bad.append((k, want, have))
+        return bad
 
     async def collect(self, unique_name, seconds, ref_tag=None):
         """Gather pipeline results for one camera."""
@@ -261,8 +293,13 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
               "applied": None, "samples": [], "cliff": None, "gain": gain}
 
     try:
-        await pv.set_setting(unique, cameraAutoExposure=False, cameraGain=gain)
-        await asyncio.sleep(0.4)
+        bad = await pv.set_and_verify(unique, settle=max(args.settle, 1.5),
+                                      cameraAutoExposure=False, cameraGain=gain)
+        if bad:
+            for k, want, have in bad:
+                log("   WARNING: %s did not take (wanted %s, camera has %s)" % (k, want, have))
+            log("   the sweep below is NOT at the gain it claims - results are unreliable")
+            result["setting_rejected"] = [list(map(str, b)) for b in bad]
 
         samples = []
         sweep = geometric_sweep(args.min_exposure, args.max_exposure, args.steps)
