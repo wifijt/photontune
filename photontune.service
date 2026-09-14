@@ -1,0 +1,26 @@
+[Unit]
+Description=PhotonTune - NetworkTables-triggered exposure tuner for PhotonVision
+After=network-online.target photonvision.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/photontune
+# --nt-server: point at the roboRIO at competition (e.g. 10.TE.AM.2),
+#              or use --team <number> instead. 127.0.0.1 works while
+#              PhotonVision itself is running the NT server (bench only).
+ExecStart=/usr/bin/python3 /opt/photontune/photontune.py \
+    --daemon \
+    --nt-server 127.0.0.1 \
+    --host 127.0.0.1 \
+    --nt-table PhotonTune \
+    --steps 8 \
+    --dwell 2.5 \
+    --bias 1.5
+Restart=on-failure
+RestartSec=5
+# Never higher priority than the vision pipeline itself
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
