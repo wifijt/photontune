@@ -507,6 +507,28 @@ async def optimise_gain(pv, cam, args, log=print, progress=None):
     log("   chose gain %.0f with exposure %.0f (shortest exposure with acceptable reproj)"
         % (pick[0], pick[1]))
     args.gain = pick[0]
+
+    # Explicitly apply the winner. The trials leave whichever pair was tried LAST
+    # on the camera, which is only the winner by luck - so write it, then confirm
+    # the camera actually took it rather than assuming.
+    if not args.dry_run:
+        await pv.set_setting(cam["uniqueName"], cameraAutoExposure=False,
+                             cameraGain=pick[0], cameraExposureRaw=float(pick[1]))
+        await asyncio.sleep(args.settle)
+        live = await pv.cameras(timeout=8)
+        got = next((c for c in live if c["uniqueName"] == cam["uniqueName"]), None)
+        if got:
+            gs = got["settings"]
+            ok = (abs(float(gs["cameraGain"]) - pick[0]) < 1e-6
+                  and abs(float(gs["cameraExposureRaw"]) - pick[1]) < 1e-6)
+            log("   applied gain %.0f / exposure %.0f - camera reports %s / %s  %s"
+                % (pick[0], pick[1], gs["cameraGain"], gs["cameraExposureRaw"],
+                   "confirmed" if ok else "*** MISMATCH ***"))
+            if not ok:
+                pick[3]["apply_mismatch"] = {"wanted": [pick[0], pick[1]],
+                                             "got": [gs["cameraGain"], gs["cameraExposureRaw"]]}
+        pick[3]["applied"] = pick[1]
+        pick[3]["gain"] = pick[0]
     return pick[3]
 
 
