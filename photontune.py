@@ -648,6 +648,10 @@ async def daemon(args, log=print):
     hold_e = tbl.getEntry("holdCard")             # <- true while you must hold it steady
     hold_for_e = tbl.getEntry("holdFor")          # <- WHICH camera to hold it in front of
     camera_e = tbl.getEntry("camera")             # <- camera being tuned, "2 of 3"
+    # Automatic tune shortly after boot, so nobody has to remember to press run.
+    boot_ran = tbl.getEntry("bootTuneRan")        # <- did the automatic run happen at all
+    boot_ok = tbl.getEntry("bootTuneOk")          # <- did it succeed
+    boot_sum = tbl.getEntry("bootTuneSummary")    # <- what it did, or why it did not
     ref_tag_e.setDefaultDouble(-1 if args.reference_tag is None else args.reference_tag)
     ref_range_e.setDefaultDouble(args.reference_range or 0.0)
     hold_e.setBoolean(False)
@@ -657,6 +661,36 @@ async def daemon(args, log=print):
     busy.setBoolean(False)
     ok_entry.setBoolean(False)
     progress_e.setDouble(0.0)
+    boot_ran.setBoolean(False)
+    boot_ok.setBoolean(False)
+    boot_sum.setString("pending" if args.autorun else "disabled")
+
+    # Fire one tune after PhotonVision is actually answering - a fixed sleep from
+    # service start is not enough, the pipeline comes up well after the process does.
+    auto = {"fire": False, "done": not args.autorun}
+    async def _autorun():
+        t0 = time.time()
+        ready = False
+        while time.time() - t0 < args.autorun_timeout:
+            try:
+                async with Photon(args.host, args.port) as probe:
+                    if await probe.cameras():
+                        ready = True
+                        break
+            except Exception:
+                pass
+            await asyncio.sleep(2.0)
+        if not ready:
+            auto["done"] = True
+            why = "PhotonVision not ready within %.0fs" % args.autorun_timeout
+            boot_ran.setBoolean(False); boot_ok.setBoolean(False); boot_sum.setString(why)
+            log("autorun skipped: " + why)
+            return
+        log("autorun: PhotonVision up, tuning in %.0fs" % args.autorun_delay)
+        await asyncio.sleep(args.autorun_delay)
+        auto["fire"] = True
+    if args.autorun:
+        asyncio.ensure_future(_autorun())
 
     log("daemon up. table /%s  - set 'run' true to tune." % args.nt_table)
     last = False
@@ -665,11 +699,19 @@ async def daemon(args, log=print):
         beat += 1.0
         heartbeat.setDouble(beat)
         trigger = run_entry.getBoolean(False)
-        if trigger and not last:
+        boot_fire = auto["fire"] and not auto["done"]
+        if boot_fire:
+            auto["fire"] = False
+            auto["done"] = True
+            trigger = True
+        if trigger and (not last or boot_fire):
             if robot_is_enabled(inst):
                 status.setString("refused: robot enabled")
                 log("trigger ignored - robot is enabled")
                 run_entry.setBoolean(False)
+                if boot_fire:
+                    boot_ran.setBoolean(False); boot_ok.setBoolean(False)
+                    boot_sum.setString("skipped: robot was enabled at boot")
             else:
                 # Read held-card settings written by the dashboard.
                 nt_tag = int(ref_tag_e.getDouble(-1))
@@ -732,6 +774,12 @@ async def daemon(args, log=print):
                     hold_for_e.setString("")
                     camera_e.setString("")
                     run_entry.setBoolean(False)
+                    if boot_fire:
+                        boot_ran.setBoolean(True)
+                        boot_ok.setBoolean(ok_entry.getBoolean(False))
+                        boot_sum.setString(summary.getString("")[:200])
+                        log("autorun done: ok=%s %s"
+                            % (ok_entry.getBoolean(False), summary.getString("")))
         last = trigger
         await asyncio.sleep(0.2)
 
@@ -791,6 +839,12 @@ def build_parser():
     p.add_argument("--nt-server", default=None, help="NT server host (daemon mode)")
     p.add_argument("--team", type=int, default=0, help="team number for NT (daemon mode)")
     p.add_argument("--nt-table", default="PhotonTune")
+    p.add_argument("--autorun", action="store_true",
+                   help="daemon: tune once automatically after PhotonVision comes up")
+    p.add_argument("--autorun-delay", type=float, default=5.0,
+                   help="seconds to wait after PhotonVision answers, before the automatic tune")
+    p.add_argument("--autorun-timeout", type=float, default=90.0,
+                   help="give up waiting for PhotonVision after this many seconds")
     return p
 
 
