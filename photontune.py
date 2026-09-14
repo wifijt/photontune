@@ -246,7 +246,7 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
 
     gain = args.gain if args.gain is not None else original["cameraGain"]
     result = {"camera": name, "uniqueName": unique, "original": original,
-              "applied": None, "samples": [], "cliff": None}
+              "applied": None, "samples": [], "cliff": None, "gain": gain}
 
     try:
         await pv.set_setting(unique, cameraAutoExposure=False, cameraGain=gain)
@@ -311,9 +311,23 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
         chosen, shortest, cliff = choose_exposure(samples, bias, args.min_tags,
                                                   args.max_ambiguity, args.reference_tag)
         if chosen is None:
-            log("   NOTHING PASSED - restoring original. Try more light or a higher --gain.")
+            # Exposure alone could not get there. Raising gain buys brightness
+            # WITHOUT buying motion blur, so escalate gain rather than accept a
+            # long exposure - which is what a naive tuner would do.
+            if args.gain_steps and gain < args.max_gain:
+                nxt = min(args.max_gain, max(gain * 1.5, gain + 10))
+                log("   nothing passed at gain %g - retrying at gain %g" % (gain, nxt))
+                log("   (gain costs noise; exposure costs blur - prefer gain)")
+                args.gain = nxt
+                args.gain_steps -= 1
+                return await tune_camera(pv, cam, args, log, progress)
+            log("   NOTHING PASSED even at gain %g." % gain)
+            log("   That is a LIGHTING or CONFIG problem, not an exposure one:")
+            log("     - check cameraBrightness (a low value crushes the image to black)")
+            log("     - check the camera is actually pointed at tags")
+            log("     - add light, or raise --max-gain")
             await pv.set_setting(unique, **original)
-            result["error"] = "no passing exposure"
+            result["error"] = "no passing exposure even at max gain"
             return result
 
         result["cliff"] = cliff
@@ -604,7 +618,11 @@ def build_parser():
     p.add_argument("--steps", type=int, default=8)
     p.add_argument("--bias", type=float, default=1.5,
                    help="safety factor above the shortest passing exposure (default 1.5)")
-    p.add_argument("--gain", type=float, default=None, help="fixed gain (default: leave as-is)")
+    p.add_argument("--gain", type=float, default=None, help="starting gain (default: leave as-is)")
+    p.add_argument("--gain-steps", type=int, default=3,
+                   help="how many times to escalate gain if no exposure passes (0 = never)")
+    p.add_argument("--max-gain", type=float, default=100.0,
+                   help="ceiling for gain escalation")
     p.add_argument("--dwell", type=float, default=2.5, help="seconds of data per candidate")
     p.add_argument("--settle", type=float, default=1.5, help="seconds to wait after changing a setting")
     p.add_argument("--min-tags", type=float, default=2.0,
