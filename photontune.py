@@ -240,7 +240,8 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
     log("── %s ──  current exposure %s, gain %s" % (name, original["cameraExposureRaw"], original["cameraGain"]))
 
     gain = args.gain if args.gain is not None else original["cameraGain"]
-    result = {"camera": name, "uniqueName": unique, "original": original, "applied": None, "samples": []}
+    result = {"camera": name, "uniqueName": unique, "original": original,
+              "applied": None, "samples": [], "cliff": None}
 
     try:
         await pv.set_setting(unique, cameraAutoExposure=False, cameraGain=gain)
@@ -310,6 +311,7 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
             result["error"] = "no passing exposure"
             return result
 
+        result["cliff"] = cliff
         log("   cliff ~%.0f (bracketed), shortest verified pass %.0f, bias %.2f  ->  %.0f"
             % (cliff, shortest.exposure, bias, chosen))
         blur = lambda deg: math.radians(deg) * (chosen / 1e6) * args.fx
@@ -349,6 +351,76 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
             pass
         result["error"] = str(exc)
         return result
+
+
+async def calibrate_reference_bias(args, log=print):
+    """Measure YOUR reference-bias by running both modes back to back.
+
+    A single held tag is an easier detection problem than a full multi-tag solve,
+    so held-card mode measures a lower cliff than field conditions require. The
+    ratio is NOT a universal constant - it depends on how many field tags your
+    camera sees and how far away the hardest one is - so it has to be measured
+    per camera, once, with representative tags in view.
+    """
+    if args.reference_tag is None:
+        sys.exit("--calibrate-reference-bias needs --reference-tag (the card you will hold)")
+
+    held_tag, held_range = args.reference_tag, args.reference_range
+    dry, bias_in = args.dry_run, args.reference_bias
+    args.dry_run = True          # never disturb the camera's settings while calibrating
+    args.reference_bias = 1.0    # measure the raw cliffs, unbiased
+
+    log("=" * 66)
+    log("STEP 1/2  held card - hold tag %d steady%s" % (
+        held_tag, (" at %.2f m" % held_range) if held_range else ""))
+    log("=" * 66)
+    held = await run(args, log=log)
+
+    log("")
+    log("=" * 66)
+    log("STEP 2/2  field tags - you can put the card down now")
+    log("=" * 66)
+    args.reference_tag, args.reference_range = None, None
+    field = await run(args, log=log)
+
+    args.dry_run, args.reference_bias = dry, bias_in
+    args.reference_tag, args.reference_range = held_tag, held_range
+
+    log("")
+    log("=" * 66)
+    log("RESULT")
+    log("=" * 66)
+    by_name = {r["camera"]: r for r in field}
+    out = []
+    for h in held:
+        f = by_name.get(h["camera"])
+        hc, fc = h.get("cliff"), (f or {}).get("cliff")
+        if not hc or not fc:
+            log("  %-14s could not measure both modes - skipped" % h["camera"])
+            continue
+        ratio = fc / hc
+        out.append((h["camera"], hc, fc, ratio))
+        log("  %-14s held-card cliff %7.0f   field cliff %7.0f   ratio %.2f"
+            % (h["camera"], hc, fc, ratio))
+        if ratio < 1.0:
+            log("     SUSPECT: the held card needed MORE exposure than the field tags.")
+            log("     A single close tag should be EASIER, so this usually means the card")
+            log("     was not presented consistently - drooping, tilted, glare, or moved")
+            log("     mid-sweep. Re-run holding it square and steady, or tape it up.")
+    if not out:
+        log("  nothing measured. Are field tags visible, and was the card held throughout?")
+        return out
+    worst = max(r for _, _, _, r in out)
+    log("")
+    if len(out) > 1:
+        log("  Cameras differ; using the largest ratio so no camera is under-exposed.")
+    log("  Put this in your systemd unit / command line:")
+    log("")
+    log("      --reference-bias %.2f" % worst)
+    log("")
+    log("  Valid while your camera geometry stays similar. Re-measure if you move")
+    log("  or re-aim a camera, or if the tags you rely on change distance.")
+    return out
 
 
 async def run(args, log=print, progress=None, on_camera=None):
@@ -541,6 +613,9 @@ def build_parser():
                    help="seconds to move the held card between cameras (held-card mode)")
     p.add_argument("--reference-range", type=float, default=None,
                    help="string length in metres - the tool verifies the tag really is there")
+    p.add_argument("--calibrate-reference-bias", action="store_true",
+                   help="measure YOUR held-card vs field-tag ratio (needs --reference-tag "
+                        "and representative field tags in view). Changes no settings.")
     p.add_argument("--dry-run", action="store_true", help="measure and report, change nothing")
     p.add_argument("--json", action="store_true", help="emit JSON results")
     p.add_argument("--daemon", action="store_true", help="NT-triggered service mode")
@@ -554,6 +629,9 @@ def main():
     args = build_parser().parse_args()
     if args.min_exposure <= 0 or args.max_exposure <= args.min_exposure:
         sys.exit("--max-exposure must exceed --min-exposure, both > 0")
+    if args.calibrate_reference_bias:
+        asyncio.run(calibrate_reference_bias(args))
+        return
     if args.daemon:
         asyncio.run(daemon(args))
         return

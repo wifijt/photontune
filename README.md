@@ -191,8 +191,21 @@ held card, single-tag detection   ->  2990      (1.6x shorter)
 
 So a held card measures the **single-tag detection floor**, which is below what a field
 multi-tag solve actually needs — it would under-expose you for the thing you depend on.
-`--reference-bias` (default 1.6) compensates. If you can, re-run against real field tags
-once you have access and trust that result over the pit one.
+`--reference-bias` compensates — but **the right value is specific to your camera**, because
+the field cliff is set by the hardest tag in view, not an average. Measure yours once:
+
+```sh
+python3 photontune.py --calibrate-reference-bias --reference-tag 6 --reference-range 3.0
+```
+
+It runs both modes back to back (changing no settings) and prints the flag to paste into
+your systemd unit. Re-measure if you move or re-aim a camera.
+
+**Hold the card consistently.** It is only as repeatable as your presentation — square to
+the camera, steady, no glare. If the tool reports a ratio below 1.0 it will tell you the
+result is suspect: a single close tag should always be easier than a full multi-tag solve,
+so an inverted ratio means the card moved rather than anything about your camera. Taping
+the card to something beats holding it.
 
 ## Options
 
