@@ -150,13 +150,40 @@ Then anyone can trigger it from the dashboard:
 | `PhotonTune/referenceTag` | double | **write before running**: held tag ID, `-1` = use field tags |
 | `PhotonTune/referenceRange` | double | **write before running**: string length in metres |
 | `PhotonTune/holdCard` | bool | true while a card must be held steady |
-| `PhotonTune/holdFor` | string | **which camera** to hold it in front of |
+| `PhotonTune/holdFor` | string | **which camera** to hold it in front of
+| `PhotonTune/bootTuneRan` | bool | the automatic boot tune actually executed |
+| `PhotonTune/bootTuneOk` | bool | it succeeded on **every** camera |
+| `PhotonTune/bootTuneSummary` | string | what it applied, or why it did not run | |
 
 Press the button, watch the bar, wait for the green box.
 
 **`heartbeat` matters.** If the daemon dies, `ok` and `busy` hold their last values
 forever and the button silently does nothing. A frozen heartbeat means the service is
 down — not that tuning failed. Check it before pressing.
+
+### Tuning automatically at boot
+
+Add `--autorun` and the daemon tunes once by itself shortly after startup, so nobody
+has to remember to press anything:
+
+```
+--autorun --autorun-delay 5
+```
+
+The delay is counted from when **PhotonVision starts answering**, not from when the
+service starts. `After=photonvision.service` only waits for the process, not for the
+pipeline, so a fixed sleep fires into a camera that is not streaming yet. The daemon
+polls until PhotonVision reports cameras, waits `--autorun-delay`, then tunes once.
+If PhotonVision never comes up it gives up after `--autorun-timeout` (default 90 s)
+and says so in `bootTuneSummary` rather than hanging.
+
+**A failed boot tune changes nothing.** If the robot powers up in the pit with no tags
+in view, the sweep finds no passing exposure and every failure path restores the
+original exposure and gain before returning. You get `bootTuneOk=false`, a reason in
+`bootTuneSummary`, and the settings you had. The same is true of any exception.
+
+If the robot is already enabled when the daemon starts, the automatic run is skipped
+entirely — `bootTuneSummary` says so.
 
 The daemon **refuses to run while the robot is enabled** (`FMSInfo/FMSControlData` bit 0).
 
