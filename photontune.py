@@ -79,8 +79,14 @@ class Sample:
     def ref_range(self):
         return _median(self.ref_ranges)
 
-    def passes(self, min_tags, max_ambiguity, ref_tag=None):
+    def passes(self, min_tags, max_ambiguity, ref_tag=None, tag_target=None):
         if self.frames < 3:
+            return False
+        # Multi-tag solves happily on a subset, so "it solved" is not the same as
+        # "it saw everything available". Require most of the tags that the best
+        # exposure in this sweep managed to find - otherwise we settle for a short
+        # exposure that quietly drops the hardest (usually farthest) tags.
+        if tag_target is not None and self.mean_tags < tag_target:
             return False
         # Reference-tag mode: a single held tag cannot multi-tag, and its
         # ambiguity is dominated by viewing angle rather than exposure, so
@@ -124,7 +130,8 @@ def geometric_sweep(lo, hi, steps):
     return [lo * (r ** i) for i in range(steps)]
 
 
-def choose_exposure(samples, bias, min_tags, max_ambiguity, ref_tag=None):
+def choose_exposure(samples, bias, min_tags, max_ambiguity, ref_tag=None,
+                    tag_fraction=0.85):
     """Estimate where detection actually fails, then sit a safety factor above it.
 
     Biasing off the shortest *tested* passing value double-counts margin: with a
@@ -135,13 +142,18 @@ def choose_exposure(samples, bias, min_tags, max_ambiguity, ref_tag=None):
 
     Returns (chosen, shortest_passing_sample, cliff_estimate).
     """
-    passing = [s for s in samples if s.passes(min_tags, max_ambiguity, ref_tag)]
+    # How many tags did the BEST exposure in this sweep see? Anything much below
+    # that is leaving detections on the table.
+    best_tags = max((s.mean_tags for s in samples), default=0.0)
+    tag_target = best_tags * tag_fraction if (best_tags >= 2 and ref_tag is None) else None
+    passing = [s for s in samples
+               if s.passes(min_tags, max_ambiguity, ref_tag, tag_target)]
     if not passing:
         return None, None, None
     shortest = min(passing, key=lambda s: s.exposure)
     failing_below = [s for s in samples
                      if s.exposure < shortest.exposure
-                     and not s.passes(min_tags, max_ambiguity, ref_tag)]
+                     and not s.passes(min_tags, max_ambiguity, ref_tag, tag_target)]
     if failing_below:
         highest_fail = max(failing_below, key=lambda s: s.exposure).exposure
         cliff = math.sqrt(highest_fail * shortest.exposure)
@@ -149,7 +161,7 @@ def choose_exposure(samples, bias, min_tags, max_ambiguity, ref_tag=None):
         # Everything we tested passed - the cliff is at or below our range.
         cliff = shortest.exposure
     ceiling = max(s.exposure for s in samples)
-    return min(cliff * bias, ceiling), shortest, cliff
+    return min(cliff * bias, ceiling), shortest, cliff, tag_target
 
 
 # ───────────────────────── PhotonVision link ─────────────────────────
@@ -308,8 +320,12 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
             bias *= args.reference_bias
             log("   held-card mode: bias %.2f x %.2f = %.2f (single-tag detection is "
                 "easier than a multi-tag solve)" % (args.bias, args.reference_bias, bias))
-        chosen, shortest, cliff = choose_exposure(samples, bias, args.min_tags,
-                                                  args.max_ambiguity, args.reference_tag)
+        chosen, shortest, cliff, tag_target = choose_exposure(
+            samples, bias, args.min_tags, args.max_ambiguity, args.reference_tag,
+            args.tag_fraction)
+        if tag_target:
+            log("   best exposure saw %.2f tags - requiring >= %.2f (%.0f%%)"
+                % (max(s.mean_tags for s in samples), tag_target, 100*args.tag_fraction))
         if chosen is None:
             # Exposure alone could not get there. Raising gain buys brightness
             # WITHOUT buying motion blur, so escalate gain rather than accept a
@@ -442,6 +458,58 @@ async def calibrate_reference_bias(args, log=print):
     return out
 
 
+async def optimise_gain(pv, cam, args, log=print, progress=None):
+    """Find the (gain, exposure) pair giving the SHORTEST exposure that still sees
+    all the tags - because exposure costs motion blur and gain only costs noise.
+
+    Sweeping exposure at a fixed gain answers "what is the shortest exposure at THIS
+    gain", which is not the question. Raising gain lowers the exposure needed; the
+    limit is that noise eventually degrades corner precision, so we stop when
+    reprojection error starts getting worse rather than simply maximising gain.
+    """
+    start = args.gain if args.gain is not None else cam["settings"]["cameraGain"]
+    gains, g = [], float(start)
+    while len(gains) < args.gain_search_steps and g <= args.max_gain:
+        gains.append(g)
+        g = max(g * 1.7, g + 8)
+    log("── %s ──  gain search over %s" % (cam["nickname"], [round(x) for x in gains]))
+
+    trials = []
+    saved_steps, args.gain_steps = args.gain_steps, 0      # no escalation inside a trial
+    for i, gv in enumerate(gains):
+        args.gain = gv
+        if progress:
+            progress(i / float(len(gains)))
+        r = await tune_camera(pv, cam, args, log=lambda m: None, progress=None)
+        exp = r.get("applied") or (r.get("cliff") and None)
+        if r.get("applied") and r.get("samples"):
+            best = min((x for x in r["samples"] if x["passes"]),
+                       key=lambda x: x["exposure"], default=None)
+            rp = best.get("med_reproj") if best else None
+            trials.append((gv, r["applied"], rp, r))
+            log("   gain %-5.0f -> exposure %7.0f   reproj %s"
+                % (gv, r["applied"], ("%.3f" % rp) if rp else "n/a"))
+        else:
+            log("   gain %-5.0f -> no passing exposure" % gv)
+    args.gain_steps = saved_steps
+
+    if not trials:
+        args.gain = start
+        return None
+    good = [t for t in trials if t[2] is not None]
+    best_rp = min((t[2] for t in good), default=None)
+    if best_rp is not None:
+        # Reject gains where noise has visibly hurt the fit.
+        usable = [t for t in trials if t[2] is None or t[2] <= best_rp * args.reproj_tolerance]
+    else:
+        usable = trials
+    pick = min(usable, key=lambda t: t[1])
+    log("   chose gain %.0f with exposure %.0f (shortest exposure with acceptable reproj)"
+        % (pick[0], pick[1]))
+    args.gain = pick[0]
+    return pick[3]
+
+
 async def run(args, log=print, progress=None, on_camera=None):
     async with Photon(args.host, args.port) as pv:
         cams = await pv.cameras()
@@ -464,6 +532,11 @@ async def run(args, log=print, progress=None, on_camera=None):
                     progress((idx + f) / float(len(cams)))
             if on_camera:
                 on_camera(cam["nickname"], idx, len(cams))
+            if args.optimise_gain:
+                r = await optimise_gain(pv, cam, args, log, cam_progress)
+                if r is not None:
+                    results.append(r)
+                    continue
             # Held-card mode: the card is only visible to one camera at a time,
             # so give whoever is holding it a chance to move before we sweep.
             if args.reference_tag is not None and idx > 0 and args.move_pause > 0:
@@ -623,11 +696,23 @@ def build_parser():
                    help="how many times to escalate gain if no exposure passes (0 = never)")
     p.add_argument("--max-gain", type=float, default=100.0,
                    help="ceiling for gain escalation")
+    p.add_argument("--optimise-gain", "--optimize-gain", dest="optimise_gain",
+                   action="store_true",
+                   help="search gain AND exposure together for the shortest exposure that "
+                        "still sees all the tags (slower, but exposure is the costly one)")
+    p.add_argument("--gain-search-steps", type=int, default=4,
+                   help="how many gain values to try with --optimise-gain")
+    p.add_argument("--reproj-tolerance", type=float, default=1.5,
+                   help="reject a gain whose reprojection exceeds this multiple of the "
+                        "best seen - stops noise being traded for exposure indefinitely")
     p.add_argument("--dwell", type=float, default=2.5, help="seconds of data per candidate")
     p.add_argument("--settle", type=float, default=1.5, help="seconds to wait after changing a setting")
     p.add_argument("--min-tags", type=float, default=2.0,
                    help="mean tags per frame required when multi-tag is unavailable")
     p.add_argument("--max-ambiguity", type=float, default=0.20)
+    p.add_argument("--tag-fraction", type=float, default=0.85,
+                   help="require at least this fraction of the tags the best exposure "
+                        "in the sweep saw (default 0.85); 0 disables")
     p.add_argument("--fx", type=float, default=1105.9, help="focal length in px, for the blur estimate")
     p.add_argument("--reference-tag", type=int, default=None,
                    help="tag ID held in front of the camera; score on its detection rate")
