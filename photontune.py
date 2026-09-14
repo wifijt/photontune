@@ -343,7 +343,7 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
         return result
 
 
-async def run(args, log=print, progress=None):
+async def run(args, log=print, progress=None, on_camera=None):
     async with Photon(args.host, args.port) as pv:
         cams = await pv.cameras()
         if not cams:
@@ -361,6 +361,13 @@ async def run(args, log=print, progress=None):
             def cam_progress(f, idx=idx):
                 if progress:
                     progress((idx + f) / float(len(cams)))
+            if on_camera:
+                on_camera(cam["nickname"], idx, len(cams))
+            # Held-card mode: the card is only visible to one camera at a time,
+            # so give whoever is holding it a chance to move before we sweep.
+            if args.reference_tag is not None and idx > 0 and args.move_pause > 0:
+                log("   move the card to '%s' - %.0fs" % (cam["nickname"], args.move_pause))
+                await asyncio.sleep(args.move_pause)
             results.append(await tune_camera(pv, cam, args, log, cam_progress))
         if progress:
             progress(1.0)
@@ -402,8 +409,18 @@ async def daemon(args, log=print):
     progress_e = tbl.getEntry("progress")    # <- 0..1, for a progress bar
     heartbeat = tbl.getEntry("heartbeat")    # <- proves the service is alive
     result_entry = tbl.getEntry("result")    # full JSON
+    # Held-card mode, settable from the dashboard before pressing run.
+    ref_tag_e = tbl.getEntry("referenceTag")      # tag ID, -1 = off (use field tags)
+    ref_range_e = tbl.getEntry("referenceRange")  # string length, metres
+    hold_e = tbl.getEntry("holdCard")             # <- true while you must hold it steady
+    hold_for_e = tbl.getEntry("holdFor")          # <- WHICH camera to hold it in front of
+    camera_e = tbl.getEntry("camera")             # <- camera being tuned, "2 of 3"
+    ref_tag_e.setDefaultDouble(-1 if args.reference_tag is None else args.reference_tag)
+    ref_range_e.setDefaultDouble(args.reference_range or 0.0)
+    hold_e.setBoolean(False)
     status.setString("idle")
     summary.setString("never run")
+    hold_e.setBoolean(False)
     busy.setBoolean(False)
     ok_entry.setBoolean(False)
     progress_e.setDouble(0.0)
@@ -421,16 +438,41 @@ async def daemon(args, log=print):
                 log("trigger ignored - robot is enabled")
                 run_entry.setBoolean(False)
             else:
+                # Read held-card settings written by the dashboard.
+                nt_tag = int(ref_tag_e.getDouble(-1))
+                nt_range = ref_range_e.getDouble(0.0)
+                args.reference_tag = nt_tag if nt_tag >= 0 else None
+                args.reference_range = nt_range if nt_range > 0 else None
+
                 busy.setBoolean(True)
                 ok_entry.setBoolean(False)
                 progress_e.setDouble(0.0)
-                status.setString("tuning...")
-                summary.setString("running...")
+                if args.reference_tag is not None:
+                    hold_e.setBoolean(True)
+                    msg = ("HOLD tag %d steady at %.2f m" % (args.reference_tag, args.reference_range)
+                           if args.reference_range else
+                           "HOLD tag %d steady" % args.reference_tag)
+                    status.setString(msg)
+                    summary.setString(msg)
+                    log(msg)
+                else:
+                    status.setString("tuning on field tags...")
+                    summary.setString("running...")
                 lines = []
                 def cap(msg):
                     lines.append(str(msg)); log(msg); status.setString(str(msg)[:120])
+                def announce(nick, idx, total):
+                    camera_e.setString("%s (%d of %d)" % (nick, idx + 1, total))
+                    if args.reference_tag is not None:
+                        hold_for_e.setString(nick)
+                        note = "HOLD tag %d in front of %s" % (args.reference_tag, nick)
+                        if args.reference_range:
+                            note += " at %.2f m" % args.reference_range
+                        status.setString(note); summary.setString(note); cap(note)
+
                 try:
-                    res = await run(args, log=cap, progress=lambda f: progress_e.setDouble(f))
+                    res = await run(args, log=cap, progress=lambda f: progress_e.setDouble(f),
+                                    on_camera=announce)
                     applied = [r for r in res if r.get("applied")]
                     failed = [r for r in res if not r.get("applied")]
                     line = "; ".join(
@@ -453,6 +495,9 @@ async def daemon(args, log=print):
                     log("error: %s" % exc)
                 finally:
                     busy.setBoolean(False)
+                    hold_e.setBoolean(False)
+                    hold_for_e.setString("")
+                    camera_e.setString("")
                     run_entry.setBoolean(False)
         last = trigger
         await asyncio.sleep(0.2)
@@ -481,6 +526,8 @@ def build_parser():
     p.add_argument("--fx", type=float, default=1105.9, help="focal length in px, for the blur estimate")
     p.add_argument("--reference-tag", type=int, default=None,
                    help="tag ID held in front of the camera; score on its detection rate")
+    p.add_argument("--move-pause", type=float, default=8.0,
+                   help="seconds to move the held card between cameras (held-card mode)")
     p.add_argument("--reference-range", type=float, default=None,
                    help="string length in metres - the tool verifies the tag really is there")
     p.add_argument("--dry-run", action="store_true", help="measure and report, change nothing")

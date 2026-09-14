@@ -120,6 +120,11 @@ Then anyone can trigger it from the dashboard:
 | `PhotonTune/status` | string | live line, updates each sweep point |
 | `PhotonTune/heartbeat` | double | increments continuously — proves the service is alive |
 | `PhotonTune/result` | string | full JSON: every sample, ranges, warnings |
+| `PhotonTune/camera` | string | camera being tuned, e.g. `Front (2 of 3)` |
+| `PhotonTune/referenceTag` | double | **write before running**: held tag ID, `-1` = use field tags |
+| `PhotonTune/referenceRange` | double | **write before running**: string length in metres |
+| `PhotonTune/holdCard` | bool | true while a card must be held steady |
+| `PhotonTune/holdFor` | string | **which camera** to hold it in front of |
 
 Press the button, watch the bar, wait for the green box.
 
@@ -137,6 +142,25 @@ you ever get field access:
 ```sh
 python3 photontune.py --reference-tag 8 --reference-range 3.0
 ```
+
+From the dashboard, write `referenceTag` and `referenceRange` first, then press `run`.
+Leave `referenceTag` at `-1` to tune against whatever field tags are in view instead.
+
+### With more than one camera
+
+Cameras point in different directions, so a held card is only ever visible to one of them.
+The tool tunes cameras **sequentially** and tells the person holding it where to stand:
+
+```
+camera  = "Front (1 of 2)"     holdFor = "Front"
+   ... 40 s ...
+   move the card to 'Rear' - 8s        <- --move-pause
+camera  = "Rear (2 of 2)"      holdFor = "Rear"
+```
+
+Put `holdFor` somewhere large on the dashboard. Budget roughly
+`40s x cameras + 8s x (cameras - 1)`. Tune `--move-pause` to however long it actually takes
+to walk between them.
 
 Scoring switches to that tag's **detection rate** — a single held tag cannot multi-tag,
 and its ambiguity is driven by viewing angle rather than exposure.
