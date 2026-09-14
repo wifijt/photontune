@@ -45,6 +45,32 @@ accuracy rests on roughly 0.2 px of corner precision.)
 A tuner that picked "the middle of the plateau" would happily choose 12000 — about 104 px
 of smear on a 70 px tag during a fast spin. The tag is erased.
 
+### This is measured, not just modelled
+
+`blurtest.py` records PhotonVision's own detected corners while you wave a tag, derives
+image-plane speed from frame-to-frame corner displacement, and correlates it with
+detection. Two 30-second runs, same tag on a 3 m string, same motion:
+
+```
+                          4735 us        15000 us
+detection while moving      99%            76%      <- 553 frames lost
+median blur                0.70 px        2.03 px
+max blur                   8.39 px       30.74 px
+ambiguity, moving          0.357          0.431
+```
+
+**Both settings scored 100% on the static sweep.** Under motion one holds 99% detection
+and the other loses a quarter of its frames — at a peak rate of only ~106 deg/s, far below
+a defensive pivot. That is the whole argument for biasing short, and it is why a tuner
+scored on a stationary camera must not be trusted to pick its own spot on the plateau.
+
+Ambiguity also tripled with motion at the *short* exposure (0.117 still to 0.357 moving),
+so blur degrades pose quality well before it costs you detections.
+
+```sh
+python3 blurtest.py <host> <tagId> <exposure_us> <seconds>
+```
+
 So `photontune` finds where detection actually *fails*, and sits a small safety factor
 above that. It is correcting for a cost that is real, known in direction, and invisible
 to the instrument.
