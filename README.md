@@ -262,6 +262,11 @@ the card to something beats holding it.
   takes N times as long.
 - The cliff genuinely moves as lighting changes. Retune when conditions change materially.
 
+## See also
+
+[photonvision-tools](https://github.com/wifijt/photonvision-tools) — surveying a custom
+AprilTag layout, and scripted PhotonVision configuration.
+
 ## License
 
 GPLv3. See [LICENSE](LICENSE).
