@@ -130,6 +130,63 @@ def geometric_sweep(lo, hi, steps):
     return [lo * (r ** i) for i in range(steps)]
 
 
+def sweep_holes(samples):
+    """Find physically impossible gaps in an exposure sweep.
+
+    Brightness rises monotonically with exposure, so detection cannot come back
+    after vanishing. A sample with tags, then one with none, then tags again, is
+    a measurement artefact - not a property of the scene. Seen in the wild when
+    another process was reading PhotonVision's websocket concurrently and
+    starving individual samples: tags went 0.25, 0, 0.03, 0, 0, 1.08, 3.00 and
+    the cliff estimate landed 4x too long.
+
+    Catches a STRONG detection, then none, then strong again. Note it does NOT
+    catch every corrupted sweep: a run starved by a competing websocket reader
+    produced 0.25, 0, 0.03, 0, 0, 1.08, 3.00 - wrong at specific points but
+    still rising, so nothing here fires. baseline_contradiction() is the check
+    for that.
+
+    Returns the list of (exposure, mean_tags) that sit in a hole.
+    """
+    seq = sorted(samples, key=lambda s: s.exposure)
+    holes = []
+    for j in range(1, len(seq) - 1):
+        if seq[j].mean_tags > 0.5:
+            continue
+        before = any(s.mean_tags > 0.5 for s in seq[:j])
+        after = any(s.mean_tags > 0.5 for s in seq[j + 1:])
+        if before and after:
+            holes.append((seq[j].exposure, seq[j].mean_tags))
+    return holes
+
+
+def baseline_contradiction(samples, base_exposure, base_tags):
+    """Does the sweep contradict what the camera was already doing?
+
+    Before sweeping we record detection at the exposure the camera came in on.
+    If the sweep then claims a NEARBY exposure sees far fewer tags, the sweep is
+    wrong - the scene did not change, the measurement did. This is what catches a
+    sweep starved by another process reading PhotonVision's websocket, where the
+    numbers stay plausibly ordered but are individually false.
+
+    Returns (exposure, swept_tags) of the worst contradicting sample, or None.
+    """
+    if base_tags < 1.0 or base_exposure <= 0:
+        return None                      # nothing to contradict
+    worst = None
+    for s in samples:
+        # Asymmetric on purpose. A SHORTER exposure seeing fewer tags is just the
+        # detection cliff - that is the whole point of the sweep. A LONGER one
+        # seeing fewer is impossible until over-exposure, so cap the window
+        # rather than flag the bright tail.
+        if not (0.95 * base_exposure <= s.exposure <= 2.5 * base_exposure):
+            continue
+        if s.mean_tags < 0.4 * base_tags:
+            if worst is None or s.mean_tags < worst[1]:
+                worst = (s.exposure, s.mean_tags)
+    return worst
+
+
 def choose_exposure(samples, bias, min_tags, max_ambiguity, ref_tag=None,
                     tag_fraction=0.85):
     """Estimate where detection actually fails, then sit a safety factor above it.
@@ -313,6 +370,14 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
                 " settings were sent; this is a readback timeout, not a rejection.")
             result["unverified"] = True
 
+        # What is the camera doing RIGHT NOW, before we touch the exposure? Used
+        # afterwards to tell a bad measurement from a genuine detection cliff.
+        base_exposure = float(original.get("cameraExposureRaw") or 0.0)
+        base_raw = await pv.collect(unique, max(1.5, args.dwell * 0.6), args.reference_tag)
+        base_tags = (sum(base_raw["tags"]) / len(base_raw["tags"])) if base_raw["tags"] else 0.0
+        log("   baseline: at its current %.0f the camera sees %.2f tags"
+            % (base_exposure, base_tags))
+
         samples = []
         sweep = geometric_sweep(args.min_exposure, args.max_exposure, args.steps)
         for step_i, exposure in enumerate(sweep):
@@ -364,6 +429,37 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
         # A single held tag is detected at shorter exposures than a full multi-tag
         # solve needs, so held-card mode measures a LOWER cliff than field
         # conditions require. Carry extra margin to compensate.
+        contra = baseline_contradiction(samples, base_exposure, base_tags)
+        if contra:
+            log("   *** SWEEP CONTRADICTS THE CAMERA'S OWN STARTING STATE - NOT APPLYING ***")
+            log("   At its incoming exposure %.0f the camera saw %.2f tags, but the"
+                % (base_exposure, base_tags))
+            log("   sweep claims %.0f - a LONGER exposure - saw only %.2f."
+                % (contra[0], contra[1]))
+            log("   The scene did not change that much; the measurement is wrong.")
+            log("   Usual cause: something else reading PhotonVision's websocket at")
+            log("   the same time. Stop it and re-run. Settings left untouched.")
+            await pv.set_setting(unique, **original)
+            result["error"] = ("sweep contradicts baseline (%.0f saw %.2f tags vs %.2f at %.0f)"
+                               % (contra[0], contra[1], base_tags, base_exposure))
+            return result
+
+        holes = sweep_holes(samples)
+        if holes:
+            log("   *** THIS SWEEP IS NOT PHYSICALLY POSSIBLE - NOT APPLYING ***")
+            log("   Detection vanished and came back as exposure increased:")
+            for e, t in holes:
+                log("     exposure %8.0f saw %.2f tags, but both shorter AND longer"
+                    " exposures saw tags" % (e, t))
+            log("   Brightness only goes up with exposure, so these samples are")
+            log("   measurement artefacts, not the scene. Usual cause: something")
+            log("   else reading PhotonVision's websocket at the same time, or the")
+            log("   scene changed mid-sweep (someone walked in front of the camera).")
+            log("   Re-run with nothing else talking to PhotonVision.")
+            await pv.set_setting(unique, **original)
+            result["error"] = "non-monotonic sweep (%d impossible samples)" % len(holes)
+            return result
+
         bias = args.bias
         if args.reference_tag is not None:
             bias *= args.reference_bias
