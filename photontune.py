@@ -140,7 +140,9 @@ def choose_exposure(samples, bias, min_tags, max_ambiguity, ref_tag=None,
     between the highest failing and lowest passing sample and take the geometric
     mean, which is the best single estimate from a log-spaced sweep.
 
-    Returns (chosen, shortest_passing_sample, cliff_estimate).
+    Returns (chosen, shortest_passing_sample, cliff_estimate, tag_target).
+    All four are returned on every path - the caller unpacks four, and a
+    3-tuple here silently killed the gain-escalation path for dark rooms.
     """
     # How many tags did the BEST exposure in this sweep see? Anything much below
     # that is leaving detections on the table.
@@ -149,7 +151,9 @@ def choose_exposure(samples, bias, min_tags, max_ambiguity, ref_tag=None,
     passing = [s for s in samples
                if s.passes(min_tags, max_ambiguity, ref_tag, tag_target)]
     if not passing:
-        return None, None, None
+        # chosen=None tells the caller to escalate gain. tag_target still comes
+        # back so it can say WHY nothing passed.
+        return None, None, None, tag_target
     shortest = min(passing, key=lambda s: s.exposure)
     failing_below = [s for s in samples
                      if s.exposure < shortest.exposure
@@ -233,7 +237,9 @@ class Photon:
         cams = await self.cameras(timeout=8)
         got = next((c for c in cams if c["uniqueName"] == unique_name), None)
         if not got:
-            return [("<camera>", None, None)]
+            # Could not read the camera back at all - that is NOT the same as a
+            # setting being rejected, and must not raise the "unreliable" banner.
+            return [(None, None, None)]
         live = got["settings"]
         bad = []
         for k, want in kw.items():
@@ -295,11 +301,17 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
     try:
         bad = await pv.set_and_verify(unique, settle=max(args.settle, 1.5),
                                       cameraAutoExposure=False, cameraGain=gain)
-        if bad:
-            for k, want, have in bad:
+        rejected = [b for b in bad if b[0] is not None]
+        unverified = [b for b in bad if b[0] is None]
+        if rejected:
+            for k, want, have in rejected:
                 log("   WARNING: %s did not take (wanted %s, camera has %s)" % (k, want, have))
             log("   the sweep below is NOT at the gain it claims - results are unreliable")
-            result["setting_rejected"] = [list(map(str, b)) for b in bad]
+            result["setting_rejected"] = [list(map(str, b)) for b in rejected]
+        if unverified:
+            log("   NOTE: could not read the camera back to confirm the gain. The"
+                " settings were sent; this is a readback timeout, not a rejection.")
+            result["unverified"] = True
 
         samples = []
         sweep = geometric_sweep(args.min_exposure, args.max_exposure, args.steps)
