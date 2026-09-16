@@ -341,6 +341,22 @@ class Photon:
 
 # ───────────────────────── the sweep ─────────────────────────
 
+async def sample(pv, cam, args, seconds, ref_tag, after_capture=None):
+    """Collect detections, preferring NetworkTables over the throttled websocket."""
+    reader = getattr(args, "_nt", {}).get(cam["nickname"])
+    if reader is not None:
+        # ntcore blocks; keep the event loop free so nothing else stalls.
+        return await asyncio.get_event_loop().run_in_executor(
+            None, reader.collect, seconds, ref_tag, after_capture)
+    return await pv.collect(cam["uniqueName"], seconds, ref_tag)
+
+
+def capture_mark(args, cam):
+    """Newest capture timestamp right now, to gate out pre-change frames."""
+    reader = getattr(args, "_nt", {}).get(cam["nickname"])
+    return reader.newest_capture() if reader is not None else None
+
+
 async def tune_camera(pv, cam, args, log=print, progress=None):
     name = cam["nickname"]
     unique = cam["uniqueName"]
@@ -373,7 +389,7 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
         # What is the camera doing RIGHT NOW, before we touch the exposure? Used
         # afterwards to tell a bad measurement from a genuine detection cliff.
         base_exposure = float(original.get("cameraExposureRaw") or 0.0)
-        base_raw = await pv.collect(unique, max(1.5, args.dwell * 0.6), args.reference_tag)
+        base_raw = await sample(pv, cam, args, max(1.5, args.dwell * 0.6), args.reference_tag)
         base_tags = (sum(base_raw["tags"]) / len(base_raw["tags"])) if base_raw["tags"] else 0.0
         log("   baseline: at its current %.0f the camera sees %.2f tags"
             % (base_exposure, base_tags))
@@ -383,9 +399,10 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
         for step_i, exposure in enumerate(sweep):
             if progress:
                 progress(step_i / float(len(sweep)))
+            mark = capture_mark(args, cam)
             await pv.set_setting(unique, cameraExposureRaw=float(exposure))
             await asyncio.sleep(args.settle)
-            raw = await pv.collect(unique, args.dwell, args.reference_tag)
+            raw = await sample(pv, cam, args, args.dwell, args.reference_tag, mark)
 
             s = Sample(exposure)
             s.frames = raw["frames"]
@@ -502,10 +519,11 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
             log("   dry run - restoring original")
             await pv.set_setting(unique, **original)
         else:
+            mark = capture_mark(args, cam)
             await pv.set_setting(unique, cameraExposureRaw=float(chosen), cameraGain=gain,
                                  cameraAutoExposure=False)
             await asyncio.sleep(args.settle)
-            raw = await pv.collect(unique, args.dwell, args.reference_tag)
+            raw = await sample(pv, cam, args, args.dwell, args.reference_tag, mark)
             check = Sample(chosen)
             check.frames = raw["frames"]; check.multitag_solves = raw["solves"]
             check.reproj = raw["reproj"]; check.tag_counts = raw["tags"]
@@ -692,6 +710,23 @@ async def run(args, log=print, progress=None, on_camera=None):
                     % (args.cameras, ", ".join(c["nickname"] for c in cams)))
             cams = matched
         log("tuning %d camera(s): %s" % (len(cams), ", ".join(c["nickname"] for c in cams)))
+        args._nt = {}
+        if not getattr(args, "no_nt", False):
+            ntsrv = args.nt_server or args.host
+            for c in cams:
+                try:
+                    r = NTResults(ntsrv, c["nickname"])
+                    if r.available():
+                        args._nt[c["nickname"]] = r
+                except Exception as exc:
+                    log("   NT unavailable (%s)" % exc)
+                    break
+        if args._nt:
+            log("   sampling over NetworkTables (~4.8x the frames of the websocket)")
+        else:
+            log("   sampling over the websocket - it is throttled to ~9 fps, so each")
+            log("   sweep point is scored on ~30 frames. Run with an NT server"
+                " reachable for better data.")
         results = []
         for idx, cam in enumerate(cams):   # sequential: avoids cameras perturbing each other
             def cam_progress(f, idx=idx):
@@ -716,6 +751,112 @@ async def run(args, log=print, progress=None, on_camera=None):
 
 
 # ───────────────────────── B: NetworkTables trigger ─────────────────────────
+
+class NTResults:
+    """Read PhotonVision's detections off NetworkTables instead of its websocket.
+
+    The websocket is the DASHBOARD feed and is throttled for the UI: measured
+    ~9 results/s on a pipeline running 42. A 2.5 s dwell therefore scored each
+    sweep point on ~30 frames, and at a 90% pass threshold that makes 32/36 vs
+    33/36 - one frame - decide a 2x exposure change. NT carries every frame:
+    42.9 results/s measured, ~107 frames per dwell, 4.8x the samples.
+
+    Imports ONLY the decoder. photonlibpy.PhotonCamera pulls in
+    photonlibpy/timesync/timeSyncServer.py, which creates a TimeSyncServer at
+    module scope (line 94) and binds a UDP port PhotonVision already owns -
+    "OSError: [Errno 98] Address already in use" on the coprocessor itself.
+    Packet + PhotonPipelineResult start no threads.
+
+    Needs an NT server to exist somewhere. On a robot that is the roboRIO; on a
+    bench it is PhotonVision itself when runNTServer is on. If there is none,
+    callers fall back to the websocket.
+    """
+
+    def __init__(self, server, nickname):
+        import ntcore
+        from photonlibpy.packet import Packet
+        from photonlibpy.targeting.photonPipelineResult import PhotonPipelineResult
+        self._Packet = Packet
+        self._Result = PhotonPipelineResult
+        self.inst = ntcore.NetworkTableInstance.getDefault()
+        if not self.inst.isConnected():
+            self.inst.startClient4("photontune-nt")
+            self.inst.setServer(server, ntcore.NetworkTableInstance.kDefaultPort4)
+        tbl = self.inst.getTable("photonvision").getSubTable(nickname)
+        self.sub = tbl.getRawTopic("rawBytes").subscribe(
+            "rawBytes", b"", ntcore.PubSubOptions(periodic=0.005, sendAll=True,
+                                                  keepDuplicates=True))
+
+    def newest_capture(self):
+        """captureTimestampMicros of the latest frame, or None."""
+        raw = self.sub.get()
+        if not raw:
+            return None
+        try:
+            r = self._Result.photonStruct.unpack(self._Packet(raw))
+            return r.metadata.captureTimestampMicros
+        except Exception:
+            return None
+
+    def available(self, wait=4.0):
+        """True if results are actually arriving - not merely that NT connected."""
+        end = time.time() + wait
+        while time.time() < end:
+            if self.sub.get():
+                return True
+            time.sleep(0.1)
+        return False
+
+    def collect(self, seconds, ref_tag=None, after_capture=None):
+        """after_capture: discard frames CAPTURED at or before this timestamp.
+
+        Waiting a settle period is not enough. The pipeline runs ~125 ms behind,
+        so frames arriving just after an exposure change were exposed BEFORE it.
+        Sampled without this gate, the first sweep point inherited frames from
+        the baseline collect at a much longer exposure and read 0.96 tags where
+        the truth was 0.17 - which then tripped the sanity check. Capture
+        timestamps are stamped at the sensor, so gating on them is exact.
+        """
+        out = {"frames": 0, "solves": 0, "reproj": [], "tags": [], "amb": [],
+               "ref_seen": 0, "ref_ranges": [], "stale_dropped": 0}
+        seen = set()
+        end = time.time() + seconds
+        # ntcore's readQueue() returned nothing here regardless of pollStorage,
+        # so poll and dedupe on sequenceID. At 500 Hz nothing is missed at 24 ms.
+        while time.time() < end:
+            raw = self.sub.get()
+            if raw:
+                try:
+                    r = self._Result.photonStruct.unpack(self._Packet(raw))
+                except Exception:
+                    r = None
+                if r is not None and r.metadata.sequenceID not in seen:
+                    seen.add(r.metadata.sequenceID)
+                    if (after_capture is not None
+                            and r.metadata.captureTimestampMicros <= after_capture):
+                        out["stale_dropped"] += 1
+                        time.sleep(0.002)
+                        continue
+                    out["frames"] += 1
+                    targets = r.getTargets()
+                    out["tags"].append(len(targets))
+                    for t in targets:
+                        out["amb"].append(getattr(t, "poseAmbiguity", -1))
+                        if ref_tag is not None and int(getattr(t, "fiducialId", -1)) == ref_tag:
+                            out["ref_seen"] += 1
+                            p = getattr(t, "bestCameraToTarget", None)
+                            if p is not None:
+                                out["ref_ranges"].append(
+                                    math.sqrt(p.X() ** 2 + p.Y() ** 2 + p.Z() ** 2))
+                    mt = getattr(r, "multitagResult", None)
+                    if mt is not None and hasattr(mt, "isPresent"):
+                        mt = mt.get() if mt.isPresent() else None
+                    if mt is not None and getattr(mt, "estimatedPose", None) is not None:
+                        out["solves"] += 1
+                        out["reproj"].append(float(mt.estimatedPose.bestReprojErr))
+            time.sleep(0.002)
+        return out
+
 
 def robot_is_enabled(inst):
     """True if the FMS/DS says enabled. Never retune during a match."""
@@ -947,6 +1088,8 @@ def build_parser():
     p.add_argument("--nt-server", default=None, help="NT server host (daemon mode)")
     p.add_argument("--team", type=int, default=0, help="team number for NT (daemon mode)")
     p.add_argument("--nt-table", default="PhotonTune")
+    p.add_argument("--no-nt", action="store_true",
+                   help="always sample from the websocket, never NetworkTables")
     p.add_argument("--autorun", action="store_true",
                    help="daemon: tune once automatically after PhotonVision comes up")
     p.add_argument("--autorun-delay", type=float, default=5.0,
