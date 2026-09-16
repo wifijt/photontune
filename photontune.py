@@ -234,7 +234,15 @@ class Photon:
 
     async def __aenter__(self):
         try:
-            self.ws = await websockets.connect(self.uri, open_timeout=10, max_size=80_000_000)
+            # ping_interval=None: no client-side keepalive. Once sampling moved to
+            # NetworkTables this socket is only used for set_setting, so it sits
+            # idle for tens of seconds and the default 20 s ping/pong killed it
+            # mid-tune - "sent 1011 (unexpected error) keepalive ping timeout".
+            # It is a local connection with an explicit lifetime; we do not need
+            # the library policing it.
+            self.ws = await websockets.connect(self.uri, open_timeout=10,
+                                               max_size=80_000_000,
+                                               ping_interval=None, close_timeout=5)
         except Exception as exc:
             raise ConnectionError(
                 "could not reach PhotonVision at %s - check the host and that it is running (%s)"
@@ -287,11 +295,44 @@ class Photon:
         payload["cameraUniqueName"] = unique_name
         await self.ws.send(msgpack.packb({"changePipelineSetting": payload}))
 
+    async def cameras_fresh(self, timeout=8):
+        """Camera list over a NEW connection.
+
+        PhotonVision sends cameraSettings ONCE, on connect - measured: 1 in 25 s
+        against 441 updatePipelineResult. Pumping the long-lived socket for it
+        therefore never succeeds after the first read, which silently broke the
+        readback in set_and_verify. A fresh connection re-triggers the broadcast.
+        """
+        found = {}
+        uri = self.uri
+        async with websockets.connect(uri, max_size=80_000_000, open_timeout=10,
+                                      ping_interval=None) as ws:
+            t0 = time.time()
+            while time.time() - t0 < timeout:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    break
+                if not isinstance(raw, bytes):
+                    continue
+                msg = msgpack.unpackb(raw, raw=False)
+                if not isinstance(msg, dict):
+                    continue
+                for cam in msg.get("cameraSettings", []) or []:
+                    found[cam["uniqueName"]] = {
+                        "uniqueName": cam["uniqueName"],
+                        "nickname": cam.get("nickname", "?"),
+                        "settings": cam["currentPipelineSettings"],
+                    }
+                if found:
+                    break
+        return list(found.values())
+
     async def set_and_verify(self, unique_name, settle=1.5, **kw):
         """Write settings and confirm the camera took them. Returns list of failures."""
         await self.set_setting(unique_name, **kw)
         await asyncio.sleep(settle)
-        cams = await self.cameras(timeout=8)
+        cams = await self.cameras_fresh(timeout=8)
         got = next((c for c in cams if c["uniqueName"] == unique_name), None)
         if not got:
             # Could not read the camera back at all - that is NOT the same as a
