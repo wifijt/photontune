@@ -398,14 +398,19 @@ def capture_mark(args, cam):
     return reader.newest_capture() if reader is not None else None
 
 
-async def tune_camera(pv, cam, args, log=print, progress=None):
+async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
+                      skip_baseline=False):
     name = cam["nickname"]
     unique = cam["uniqueName"]
-    original = {
-        "cameraExposureRaw": cam["settings"]["cameraExposureRaw"],
-        "cameraGain": cam["settings"]["cameraGain"],
-        "cameraAutoExposure": cam["settings"]["cameraAutoExposure"],
-    }
+    # `original` is threaded through gain re-sweeps. Re-deriving it there read
+    # post-sweep state, so a later failure "restored" the camera to whatever the
+    # last swept exposure happened to be.
+    if original is None:
+        original = {
+            "cameraExposureRaw": cam["settings"]["cameraExposureRaw"],
+            "cameraGain": cam["settings"]["cameraGain"],
+            "cameraAutoExposure": cam["settings"]["cameraAutoExposure"],
+        }
     log("── %s ──  current exposure %s, gain %s" % (name, original["cameraExposureRaw"], original["cameraGain"]))
 
     gain = args.gain if args.gain is not None else original["cameraGain"]
@@ -413,6 +418,24 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
               "applied": None, "samples": [], "cliff": None, "gain": gain}
 
     try:
+        # Structural settings FIRST. Tuning exposure against a crushed brightness
+        # just answers with a long, blurry exposure and calls it a success.
+        if getattr(args, "baseline", True) and not skip_baseline:
+            _changed, _failed = await assert_baseline(pv, cam, args, log)
+            if _changed:
+                fresh = await pv.cameras_fresh(timeout=8)
+                newer = next((c for c in fresh if c["uniqueName"] == unique), None)
+                if newer:
+                    cam = dict(cam)
+                    cam["settings"] = newer["settings"]
+            result["baseline_changed"] = list(_changed)
+            if _failed:
+                result["baseline_failed"] = [list(map(str, f)) for f in _failed]
+        if getattr(args, "baseline_only", False):
+            result["applied"] = None
+            result["error"] = "baseline only - not tuned"
+            return result
+
         bad = await pv.set_and_verify(unique, settle=max(args.settle, 1.5),
                                       cameraAutoExposure=False, cameraGain=gain)
         rejected = [b for b in bad if b[0] is not None]
@@ -435,6 +458,7 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
         log("   baseline: at its current %.0f the camera sees %.2f tags"
             % (base_exposure, base_tags))
 
+        PENDING_RESTORE[unique] = dict(original)
         samples = []
         sweep = geometric_sweep(args.min_exposure, args.max_exposure, args.steps)
         for step_i, exposure in enumerate(sweep):
@@ -539,13 +563,15 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
                 log("   (gain costs noise; exposure costs blur - prefer gain)")
                 args.gain = nxt
                 args.gain_steps -= 1
-                return await tune_camera(pv, cam, args, log, progress)
+                return await tune_camera(pv, cam, args, log, progress,
+                                         original=original, skip_baseline=True)
             log("   NOTHING PASSED even at gain %g." % gain)
             log("   That is a LIGHTING or CONFIG problem, not an exposure one:")
             log("     - check cameraBrightness (a low value crushes the image to black)")
             log("     - check the camera is actually pointed at tags")
             log("     - add light, or raise --max-gain")
             await pv.set_setting(unique, **original)
+            PENDING_RESTORE.pop(unique, None)
             result["error"] = "no passing exposure even at max gain"
             return result
 
@@ -553,8 +579,45 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
         log("   cliff ~%.0f (bracketed), shortest verified pass %.0f, bias %.2f  ->  %.0f"
             % (cliff, shortest.exposure, bias, chosen))
         blur = lambda deg: math.radians(deg) * (chosen / 1e6) * args.fx
-        log("   predicted blur: %.1f px @90deg/s, %.1f px @360deg/s (tag edge ~70 px)"
-            % (blur(90), blur(360)))
+        log("   predicted blur: %.1f px @90deg/s, %.1f px @%.0fdeg/s"
+            % (blur(90), blur(args.blur_rate), args.blur_rate))
+
+        # Blur is a BUDGET, not a footnote. Until now it was printed and ignored,
+        # so a camera at low gain could be handed an 18814 us exposure - 131 px of
+        # smear across a ~70 px tag, i.e. blind the moment the robot moves - and
+        # the tool would call it a pass because the bench was stationary.
+        # Gain costs noise; exposure costs blur. Trade them.
+        predicted = blur(args.blur_rate)
+        # Only worth raising gain if there is room to go SHORTER. When the cliff
+        # already sits at the bottom of the sweep, more gain cannot buy a shorter
+        # exposure - it just re-sweeps to the same answer until gain_steps runs
+        # out, a minute a time. Seen looping at 10.4 px against a 10 px budget.
+        at_floor = shortest.exposure <= args.min_exposure * 1.25
+        if predicted > args.max_blur_px * 1.15 and not at_floor:
+            if args.gain_steps and gain < args.max_gain:
+                nxt = min(args.max_gain, max(gain * 1.5, gain + 10))
+                log("   %.0f px of blur at %.0f deg/s exceeds the %.0f px budget"
+                    % (predicted, args.blur_rate, args.max_blur_px))
+                log("   raising gain %g -> %g and re-sweeping (gain costs noise, "
+                    "exposure costs blur)" % (gain, nxt))
+                args.gain = nxt
+                args.gain_steps -= 1
+                return await tune_camera(pv, cam, args, log, progress,
+                                         original=original, skip_baseline=True)
+            log("   !! %.1f px of blur at %.0f deg/s, over the %.0f px budget, and"
+                % (predicted, args.blur_rate, args.max_blur_px))
+            log("   !! gain is already at %g. Works on a BENCH; will smear on a"
+                % gain)
+            log("   !! moving robot. Add light, or raise --max-gain.")
+            result["over_blur_budget"] = round(predicted, 1)
+        elif predicted > args.max_blur_px and at_floor:
+            log("   note: %.1f px of blur at %.0f deg/s is over the %.0f px budget,"
+                % (predicted, args.blur_rate, args.max_blur_px))
+            log("   but the cliff is already at the bottom of the sweep (%.0f us) -"
+                % args.min_exposure)
+            log("   more gain cannot buy a shorter exposure. Lower --min-exposure"
+                " to explore further, or add light.")
+            result["over_blur_budget"] = round(predicted, 1)
 
         if args.dry_run:
             log("   dry run - restoring original")
@@ -580,14 +643,27 @@ async def tune_camera(pv, cam, args, log=print, progress=None):
                 await asyncio.sleep(args.settle)
                 result["applied"] = shortest.exposure
                 result["fellback"] = True
+        PENDING_RESTORE.pop(unique, None)
         return result
 
-    except Exception as exc:
-        log("   ERROR (%s) - restoring original settings" % exc)
+    except BaseException as exc:
+        # BaseException, not Exception. Ctrl-C raises KeyboardInterrupt, which is
+        # NOT an Exception - so an interrupt during the sweep skipped this restore
+        # and left the camera sitting at whatever exposure was being tested.
+        # asyncio.CancelledError is the same family. Restore, then re-raise those
+        # two so the interrupt still ends the program.
+        log("   %s (%s) - restoring original settings"
+            % ("INTERRUPTED" if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError))
+               else "ERROR", exc or type(exc).__name__))
         try:
             await pv.set_setting(unique, **original)
-        except Exception:
+            await asyncio.sleep(0.4)          # let the write reach PhotonVision
+        except BaseException:
             pass
+        PENDING_RESTORE.pop(unique, None)
+        if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
+            PENDING_RESTORE[unique] = dict(original)   # loop is dying; main() retries
+            raise
         result["error"] = str(exc)
         return result
 
@@ -836,6 +912,31 @@ async def _tune_all(pv, cams, args, log, progress, on_camera, results):
 
 # ───────────────────────── B: NetworkTables trigger ─────────────────────────
 
+# Cameras whose settings we have changed and not yet put back. Ctrl-C during a
+# sweep leaves the camera at whatever exposure was being tested - blind, if that
+# was the short end - so the restore must survive an interrupt. It cannot run on
+# the interrupted event loop: asyncio is already tearing it down and the await
+# fails silently. main() replays this on a FRESH loop instead.
+PENDING_RESTORE = {}
+
+
+async def restore_pending(host, port=5800):
+    """Put back anything a crash or Ctrl-C left changed. Safe to call twice."""
+    if not PENDING_RESTORE:
+        return []
+    done = []
+    async with Photon(host, port) as pv:
+        for unique, original in list(PENDING_RESTORE.items()):
+            try:
+                await pv.set_setting(unique, **original)
+                await asyncio.sleep(0.5)
+                done.append((unique, original))
+                PENDING_RESTORE.pop(unique, None)
+            except Exception:
+                pass
+    return done
+
+
 NETCFG_FIELDS = ["ntServerAddress", "connectionType", "staticIp", "hostname",
                  "runNTServer", "shouldManage", "shouldPublishProto",
                  "networkManagerIface", "setStaticCommand", "setDHCPcommand"]
@@ -1008,6 +1109,129 @@ class NTResults:
                         out["reproj"].append(float(mt.estimatedPose.bestReprojErr))
             time.sleep(0.002)
         return out
+
+
+# ─────────────────── settings photontune asserts ───────────────────
+#
+# The split matters more than the values. ALWAYS has one right answer and is
+# applied without argument. DEFAULT is a measured default for this class of
+# hardware which you may legitimately disagree with. Everything else - exposure,
+# gain, decisionMargin - is scene-dependent and gets TUNED, not asserted.
+#
+# Leaving these to a separate tool is what let a camera sit at brightness 67
+# while its neighbour sat at 40, producing two tunes that could not be compared.
+
+BASELINE_ALWAYS = {
+    "inputImageRotationMode": ("DEG_0", 0,
+        "Non-zero rotation corrupts the multi-tag pose by ~0.4 m while the "
+        "published corners stay correct - it fails silently. PhotonVision #2613. "
+        "A sideways mount belongs in robotToCamera, not here."),
+    "blur": (0.0, 0.0,
+        "Gaussian blur BEFORE detection. Any non-zero value softens the tag "
+        "edges the detector depends on; at 3.5 detection stops entirely and no "
+        "exposure or gain recovers it."),
+    "cameraAutoExposure": (False, False,
+        "Auto-exposure optimises for the whole scene, not the tags, and drifts. "
+        "It also makes tuning meaningless - the camera would fight every step."),
+    "cameraRedGain": (0, 0, "Mono sensor; white balance is meaningless."),
+    "cameraBlueGain": (0, 0, "Mono sensor; white balance is meaningless."),
+    "targetModel": ("kAprilTag6p5in_36h11", 7,
+        "Physical tag size. Sets the SCALE of every distance measured. Wrong "
+        "here and all ranges are proportionally wrong while looking perfectly "
+        "self-consistent. 6.5 in = 165.1 mm is the FRC standard."),
+    "tagFamily": ("kTag36h11", 0, "The family FRC uses."),
+}
+
+BASELINE_DEFAULT = {
+    "threads": (1, 1,
+        "PER CAMERA. Matching physical cores sounds right and is wrong: the "
+        "detector's pool competes with capture, streaming and the JVM. Measured "
+        "on a Pi 5 - one camera 14.90 ms at 1 vs 15.58 at 4; two cameras "
+        "84.0 fps total at 1 vs 73.7 at 4, and ~20 ms less latency on both."),
+    "decimate": (2, 2,
+        "Search-stage downsampling. Costs RANGE, not accuracy - corner "
+        "refinement always runs at full resolution. Measured: identical "
+        "reprojection at 1/2/3/4 but detection range ~18/9/6/4.6 m."),
+    "cameraBrightness": (40, 40,
+        "Sensor black level, NOT a scene property - which is why it is asserted "
+        "rather than tuned. Set low it crushes the image to black and nothing "
+        "downstream recovers it; a tuner will just answer with a long, blurry "
+        "exposure and report success. Adjust with --brightness if your sensor "
+        "differs, but do not leave it unowned."),
+    "numIterations": (40, 40,
+        "Single-tag pose refinement only - AprilTagPoseEstimatorPipe. "
+        "MultiTargetPNPPipe never reads it, so with multi-tag on it does not "
+        "touch the pose you actually use. A CPU knob, not an accuracy one."),
+    "refineEdges": (True, True,
+        "Sub-pixel corner refinement. A real accuracy-vs-CPU tradeoff, not a "
+        "constant - but off, corners land on whole pixels and pose precision "
+        "collapses. This is also what makes decimate cheap."),
+    "doMultiTarget": (True, True,
+        "Multi-tag PnP. THE fix for pose flipping - single-tag PnP on a face-on "
+        "tag is genuinely ambiguous. Needs a loaded AprilTagFieldLayout."),
+    "solvePNPEnabled": (True, True,
+        "3D pose output. With no calibration for the ACTIVE resolution this "
+        "throws every frame and emits nothing at all - not a 2D fallback."),
+}
+
+
+def _matches(have, expect):
+    try:
+        return abs(float(have) - float(expect)) < 1e-6
+    except (TypeError, ValueError):
+        return have == expect
+
+
+async def assert_baseline(pv, cam, args, log=print):
+    """Put the structural settings where they must be, before tuning anything.
+
+    Reports every change and its reason, so 'blindly applied' is visible rather
+    than implicit. Returns (changed, failed).
+    """
+    unique = cam["uniqueName"]
+    # send-form vs readback-form. PhotonVision accepts "DEG_0" and reports 0;
+    # comparing what we sent against what it reports made three settings look
+    # permanently failed, which re-ran the baseline on every gain escalation and
+    # corrupted the restore target with post-sweep state.
+    want = {}
+    expect = {}
+    for tbl in (BASELINE_ALWAYS, BASELINE_DEFAULT):
+        for k, (v, e, _why) in tbl.items():
+            want[k] = v
+            expect[k] = e
+    if getattr(args, "brightness", None) is not None:
+        want["cameraBrightness"] = int(args.brightness)
+        expect["cameraBrightness"] = int(args.brightness)
+
+    live = cam.get("settings", {})
+    todo = {}
+    for k, v in want.items():
+        if _matches(live.get(k), expect[k]):
+            continue
+        todo[k] = v
+    if not todo:
+        log("   baseline: already correct")
+        return [], []
+
+    for k, v in todo.items():
+        why = (BASELINE_ALWAYS.get(k) or BASELINE_DEFAULT.get(k))[2]
+        log("   baseline: %s %s -> %s" % (k, live.get(k), v))
+        log("             %s" % why.split(". ")[0] + ".")
+    await pv.set_setting(unique, **todo)
+    await asyncio.sleep(max(args.settle, 1.5))
+
+    after = await pv.cameras_fresh(timeout=8)
+    got = next((c for c in after if c["uniqueName"] == unique), None)
+    failed = []
+    if got is None:
+        log("   baseline: could not read back to confirm")
+    else:
+        for k, v in todo.items():
+            have = got["settings"].get(k)
+            if not _matches(have, expect[k]):
+                failed.append((k, expect[k], have))
+                log("   !! baseline %s did NOT take (wanted %s, camera has %s)" % (k, v, have))
+    return list(todo), failed
 
 
 def robot_is_enabled(inst):
@@ -1240,6 +1464,24 @@ def build_parser():
     p.add_argument("--nt-server", default=None, help="NT server host (daemon mode)")
     p.add_argument("--team", type=int, default=0, help="team number for NT (daemon mode)")
     p.add_argument("--nt-table", default="PhotonTune")
+    p.add_argument("--max-blur-px", type=float, default=10.0,
+                   help="blur budget in pixels at --blur-rate. If the chosen exposure "
+                        "exceeds it, raise gain and re-sweep rather than accept a "
+                        "blurry answer. JUDGEMENT, not a measurement - blurtest.py "
+                        "can measure the real tolerance on your rig.")
+    p.add_argument("--blur-rate", type=float, default=360.0,
+                   help="angular rate the blur budget is judged at, deg/s. 360 is what "
+                        "robots actually do while aiming (CTRE default 270, REV 360, "
+                        "Limelight rejects vision above 360); 900 is never-exceed.")
+    p.add_argument("--no-baseline", dest="baseline", action="store_false", default=True,
+                   help="do NOT assert the structural settings first. They are "
+                        "asserted by default: brightness, rotation, blur and the tag "
+                        "model have a right answer, and leaving them unowned is what "
+                        "lets a bad brightness silently ruin a tune.")
+    p.add_argument("--brightness", type=int, default=None,
+                   help="override the asserted cameraBrightness (default 40)")
+    p.add_argument("--baseline-only", action="store_true",
+                   help="assert the structural settings and stop - do not tune")
     p.add_argument("--no-nt", action="store_true",
                    help="always sample from the websocket, never NetworkTables")
     p.add_argument("--no-manage-nt-server", dest="manage_nt_server",
@@ -1274,6 +1516,17 @@ def main():
         results = asyncio.run(run(args))
     except (ConnectionError, LookupError) as exc:
         sys.exit("photontune: %s" % exc)
+    except KeyboardInterrupt:
+        # The interrupted loop could not complete the restore. Do it on a new one.
+        if PENDING_RESTORE:
+            print("\ninterrupted - putting camera settings back...")
+            try:
+                for unique, orig in asyncio.run(restore_pending(args.host, args.port)):
+                    print("  restored %s -> exposure %s"
+                          % (unique[:8], orig.get("cameraExposureRaw")))
+            except Exception as exc:
+                print("  !! COULD NOT RESTORE (%s). Check the exposure by hand." % exc)
+        sys.exit(130)
     if args.json:
         print(json.dumps(results, indent=2))
     else:
