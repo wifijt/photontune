@@ -696,6 +696,31 @@ async def optimise_gain(pv, cam, args, log=print, progress=None):
 
 
 async def run(args, log=print, progress=None, on_camera=None):
+    args._nt_we_started = False
+    args._nt_cfg = None
+    if not getattr(args, "no_nt", False) and getattr(args, "manage_nt_server", True):
+        # Must happen BEFORE the Photon websocket is opened. Toggling the NT
+        # server posts to /api/settings/general, which also calls
+        # NetworkManager.reinitialize() and bounces the interface - killing any
+        # connection we are already holding ("no close frame received or sent").
+        cfg = await read_network_config(args.host, args.port)
+        if cfg and not cfg.get("runNTServer"):
+            target = cfg.get("ntServerAddress") or args.host
+            if not nt_server_reachable(target):
+                log("no NetworkTables server at %s - starting PhotonVision's"
+                    " temporarily (stopped again afterwards)" % target)
+                await set_nt_server(args.host, cfg, True, args.port)
+                args._nt_cfg = cfg
+                args._nt_we_started = True
+    try:
+        return await _run_inner(args, log, progress, on_camera)
+    finally:
+        if args._nt_we_started:
+            log("stopping the NetworkTables server we started")
+            await set_nt_server(args.host, args._nt_cfg, False, args.port)
+
+
+async def _run_inner(args, log=print, progress=None, on_camera=None):
     async with Photon(args.host, args.port) as pv:
         cams = await pv.cameras()
         if not cams:
@@ -712,15 +737,29 @@ async def run(args, log=print, progress=None, on_camera=None):
         log("tuning %d camera(s): %s" % (len(cams), ", ".join(c["nickname"] for c in cams)))
         args._nt = {}
         if not getattr(args, "no_nt", False):
-            ntsrv = args.nt_server or args.host
-            for c in cams:
+            # Try the given server, then loopback. Running ON the coprocessor,
+            # --host defaults to photonvision.local, and resolving its own mDNS
+            # name does not connect - so a bare invocation silently fell back to
+            # the slow websocket path. 127.0.0.1 is harmless to try elsewhere:
+            # if nothing is listening, available() just returns False.
+            cands = [args.nt_server or args.host]
+            if "127.0.0.1" not in cands:
+                cands.append("127.0.0.1")
+            for ntsrv in cands:
                 try:
-                    r = NTResults(ntsrv, c["nickname"])
-                    if r.available():
-                        args._nt[c["nickname"]] = r
+                    readers = {}
+                    for c in cams:
+                        r = NTResults(ntsrv, c["nickname"])
+                        if not r.available():
+                            readers = {}
+                            break
+                        readers[c["nickname"]] = r
+                    if readers:
+                        args._nt = readers
+                        log("   NetworkTables server: %s" % ntsrv)
+                        break
                 except Exception as exc:
-                    log("   NT unavailable (%s)" % exc)
-                    break
+                    log("   NT unavailable via %s (%s)" % (ntsrv, exc))
         if args._nt:
             log("   sampling over NetworkTables (~4.8x the frames of the websocket)")
         else:
@@ -728,6 +767,10 @@ async def run(args, log=print, progress=None, on_camera=None):
             log("   sweep point is scored on ~30 frames. Run with an NT server"
                 " reachable for better data.")
         results = []
+        return await _tune_all(pv, cams, args, log, progress, on_camera, results)
+
+
+async def _tune_all(pv, cams, args, log, progress, on_camera, results):
         for idx, cam in enumerate(cams):   # sequential: avoids cameras perturbing each other
             def cam_progress(f, idx=idx):
                 if progress:
@@ -751,6 +794,74 @@ async def run(args, log=print, progress=None, on_camera=None):
 
 
 # ───────────────────────── B: NetworkTables trigger ─────────────────────────
+
+NETCFG_FIELDS = ["ntServerAddress", "connectionType", "staticIp", "hostname",
+                 "runNTServer", "shouldManage", "shouldPublishProto",
+                 "networkManagerIface", "setStaticCommand", "setDHCPcommand"]
+
+
+async def read_network_config(host, port=5800):
+    """PhotonVision's network settings, off the websocket broadcast."""
+    uri = "ws://%s:%d/websocket_data" % (host, port)
+    async with websockets.connect(uri, max_size=None, open_timeout=10) as ws:
+        for _ in range(60):
+            m = msgpack.unpackb(await asyncio.wait_for(ws.recv(), 10), raw=False)
+            if not isinstance(m, dict):
+                continue
+            st = m.get("settings")
+            if not isinstance(st, dict):
+                continue
+            nw = st.get("networkSettings") or st.get("network")
+            if nw:
+                return {k: nw[k] for k in NETCFG_FIELDS if k in nw}
+    return None
+
+
+async def set_nt_server(host, cfg, enabled, port=5800):
+    """Turn PhotonVision's own NT server on or off, live.
+
+    Applied by NetworkTablesManager.setConfig() without restarting PhotonVision.
+    Send the WHOLE config with one field changed - the endpoint also calls
+    NetworkManager.reinitialize(), and with shouldManage=true a partial body
+    would let Jackson default-fill fields and could take the coprocessor off the
+    network. Verified: posting the config back unchanged is a clean no-op.
+
+    The HTTP connection drops without a response while the network stack bounces,
+    so a failed read is expected and is NOT an error.
+    """
+    import urllib.request, urllib.error
+    body = dict(cfg)
+    body["runNTServer"] = bool(enabled)
+    req = urllib.request.Request(
+        "http://%s:%d/api/settings/general" % (host, port),
+        data=json.dumps(body).encode(), method="POST",
+        headers={"Content-Type": "application/json"})
+    def _post():
+        try:
+            urllib.request.urlopen(req, timeout=15).read()
+        except Exception:
+            pass                  # connection dropped as the stack restarts
+    await asyncio.get_event_loop().run_in_executor(None, _post)
+    await asyncio.sleep(4.0)
+
+
+def nt_server_reachable(server, wait=4.0):
+    """Is anything serving NetworkTables at `server`?"""
+    try:
+        import ntcore
+    except ImportError:
+        return False
+    inst = ntcore.NetworkTableInstance.getDefault()
+    if not inst.isConnected():
+        inst.startClient4("photontune-probe")
+        inst.setServer(server, ntcore.NetworkTableInstance.kDefaultPort4)
+    end = time.time() + wait
+    while time.time() < end:
+        if inst.isConnected():
+            return True
+        time.sleep(0.2)
+    return False
+
 
 class NTResults:
     """Read PhotonVision's detections off NetworkTables instead of its websocket.
@@ -1090,6 +1201,11 @@ def build_parser():
     p.add_argument("--nt-table", default="PhotonTune")
     p.add_argument("--no-nt", action="store_true",
                    help="always sample from the websocket, never NetworkTables")
+    p.add_argument("--no-manage-nt-server", dest="manage_nt_server",
+                   action="store_false", default=True,
+                   help="do NOT start PhotonVision's NT server when none is found. "
+                        "By default photontune starts it, tunes, and stops it again, "
+                        "so a stray server is never left to fight the roboRIO.")
     p.add_argument("--autorun", action="store_true",
                    help="daemon: tune once automatically after PhotonVision comes up")
     p.add_argument("--autorun-delay", type=float, default=5.0,
