@@ -102,6 +102,31 @@ class Sample:
         amb = self.med_ambiguity
         return amb is not None and amb <= max_ambiguity
 
+    def why_failed(self, min_tags, max_ambiguity, ref_tag=None, tag_target=None):
+        """One short phrase saying why this sample did not pass, or None.
+
+        The gain search reported EVERY outcome as "no passing exposure": a dead
+        connection, a calibration refusal, --baseline-only and a genuinely dark
+        room were indistinguishable, and six "sweeps" were seen completing in
+        0.00 s total with nothing noticing.
+        """
+        if self.passes(min_tags, max_ambiguity, ref_tag, tag_target):
+            return None
+        if self.frames < 3:
+            return "only %d frames arrived - nothing was being published" % self.frames
+        if tag_target is not None and self.mean_tags < tag_target:
+            return "saw %.2f tags, needed %.2f" % (self.mean_tags, tag_target)
+        if ref_tag is not None:
+            return "reference tag %d in only %.0f%% of frames" % (ref_tag, 100 * self.ref_rate)
+        if self.multitag_solves:
+            return "multi-tag solved in only %.0f%% of frames" % (100 * self.solve_rate)
+        if self.mean_tags < min_tags:
+            return "no multi-tag solve, and only %.2f tags" % self.mean_tags
+        amb = self.med_ambiguity
+        if amb is None:
+            return "no multi-tag solve and no usable ambiguity"
+        return "ambiguity %.3f, over the %.2f limit" % (amb, max_ambiguity)
+
     def summary(self, ref_tag=None):
         if ref_tag is not None:
             r = self.ref_range
@@ -1095,14 +1120,30 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
 
     steps = len(gains) + (1 if len(gains) > 1 else 0)
     trials = []
+    reasons = {}
     for i, gv in enumerate(gains):
         if progress:
             progress(0.55 + 0.45 * i / steps)
-        s = await _gain_trial(pv, cam, args, gv, exposure)
-        ok = s.passes(args.min_tags, args.max_ambiguity, args.reference_tag)
-        trials.append((gv, s.med_reproj if ok else None, s))
-        log("   %s gain %-5d  %s" % ("ok " if ok else "   ", gv,
-                                     s.summary(args.reference_tag)))
+        try:
+            s = await _gain_trial(pv, cam, args, gv, exposure)
+        except Exception as exc:
+            # Abort the SCAN, not the run. Running the remaining trials against a
+            # dead socket produced five more silent no-ops and then blamed the
+            # lighting; the sweep's own answer is still good and is kept.
+            log("       gain %-5d  ABORTED: %s (%s)"
+                % (gv, type(exc).__name__, exc or "no detail"))
+            log("   stopping the gain scan with %d candidate(s) untried - a dead "
+                "connection is not a dark room. Keeping the sweep's answer."
+                % (len(gains) - i))
+            r["gain_scan_error"] = "%s during the gain scan" % type(exc).__name__
+            break
+        why = s.why_failed(args.min_tags, args.max_ambiguity, args.reference_tag)
+        trials.append((gv, s.med_reproj if why is None else None, s))
+        if why is None:
+            log("   ok  gain %-5d  %s" % (gv, s.summary(args.reference_tag)))
+        else:
+            reasons[gv] = why
+            log("       gain %-5d  %s  - %s" % (gv, s.summary(args.reference_tag), why))
 
     # ---- phase 3: how much of that spread is just measurement noise? -----
     # Re-measure the FIRST candidate at the end of the scan. That is the honest
@@ -1115,13 +1156,20 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
     # was wasted, and the fallback band then picked gain 20 (reproj 2.052) over
     # gain 100 (1.597), calling a 28% difference insignificant.
     repeatable = next((g for g, rp, _ in trials if rp is not None), None)
-    if len(gains) > 1 and repeatable is not None:
+    if len(gains) > 1 and repeatable is not None and not r.get("gain_scan_error"):
         if progress:
             progress(0.55 + 0.45 * len(gains) / steps)
-        again = await _gain_trial(pv, cam, args, repeatable, exposure)
+        try:
+            again = await _gain_trial(pv, cam, args, repeatable, exposure)
+        except Exception as exc:
+            log("   repeat of gain %d failed: %s - no noise estimate this run"
+                % (repeatable, type(exc).__name__))
+            r["gain_scan_error"] = "%s during the repeat" % type(exc).__name__
+            again = None
         first_rp = next(rp for g, rp, _ in trials if g == repeatable)
         rp2 = (again.med_reproj
-               if again.passes(args.min_tags, args.max_ambiguity, args.reference_tag)
+               if (again is not None
+                   and again.passes(args.min_tags, args.max_ambiguity, args.reference_tag))
                else None)
         if first_rp and rp2:
             noise = abs(math.log(rp2 / first_rp))
@@ -1132,7 +1180,9 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
     good = [t for t in trials if t[1] is not None]
     if not good:
         log("   no gain in the scan measured usable reprojection - keeping the "
-            "sweep's own gain %g" % lo)
+            "sweep's own gain %g. Reasons: %s"
+            % (lo, "; ".join("gain %d: %s" % (g, w) for g, w in sorted(reasons.items()))
+               or r.get("gain_scan_error", "none recorded")))
         PENDING_RESTORE.pop(unique, None)
         return r
 
@@ -1169,7 +1219,8 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
             "sensor noise." % (100 * (band - 1)))
 
     r["gain_trials"] = [{"gain": g, "reproj": rp, "frames": s.frames,
-                         "mean_tags": s.mean_tags, "solve_rate": s.solve_rate}
+                         "mean_tags": s.mean_tags, "solve_rate": s.solve_rate,
+                         "why_failed": reasons.get(g)}
                         for g, rp, s in trials]
     r["gain_noise_pct"] = None if noise is None else round(100 * (math.exp(noise) - 1), 1)
     r["gain_significant"] = (pick[0] == best[0])
@@ -1177,13 +1228,24 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
     # Explicitly apply the winner. The scan leaves whichever gain was tried LAST
     # on the camera - the repeat, in fact - which is the winner only by luck.
     if not args.dry_run:
-        await pv.set_setting(unique, cameraAutoExposure=False,
-                             cameraGain=int(pick[0]), cameraExposureRaw=float(exposure))
-        await asyncio.sleep(max(args.settle, 1.5))
-        # cameraSettings lags a second or two, so a plain read here reports the
-        # PREVIOUS value and cries MISMATCH on a write that actually succeeded.
-        live = await pv.cameras_fresh(timeout=10)
-        got = next((c for c in live if c["uniqueName"] == unique), None)
+        # Guarded for the same reason as the trials: if the socket died during
+        # the scan, the apply cannot succeed, and a traceback out of here loses
+        # the whole run's result. PENDING_RESTORE is deliberately left in place
+        # on failure so the exit-path replay puts the camera back.
+        try:
+            await pv.set_setting(unique, cameraAutoExposure=False,
+                                 cameraGain=int(pick[0]), cameraExposureRaw=float(exposure))
+            await asyncio.sleep(max(args.settle, 1.5))
+            # cameraSettings lags a second or two, so a plain read here reports
+            # the PREVIOUS value and cries MISMATCH on a write that succeeded.
+            live = await pv.cameras_fresh(timeout=10)
+            got = next((c for c in live if c["uniqueName"] == unique), None)
+        except Exception as exc:
+            log("   could not apply gain %d / exposure %.0f: %s"
+                % (pick[0], exposure, type(exc).__name__))
+            r["error"] = "could not apply the tuned settings (%s)" % type(exc).__name__
+            r["applied"] = None
+            return r
         if got:
             gs = got["settings"]
             ok = (abs(float(gs["cameraGain"]) - pick[0]) < 0.51
