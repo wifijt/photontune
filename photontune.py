@@ -43,6 +43,37 @@ except ImportError:
 
 # ───────────────────────── scoring ─────────────────────────
 
+# One-sided 95% confidence. Used to ask "can this sample RULE OUT meeting the
+# threshold?" rather than "is the point estimate above it?".
+_RATE_Z = 1.645
+
+
+def rate_upper_bound(hits, n, z=_RATE_Z):
+    """Wilson upper confidence bound on a rate measured as hits out of n.
+
+    A rate measured over ~60 frames carries several points of sampling error, so
+    a hard cut on the point estimate decides on noise. MEASURED on this rig: 88%
+    at 748 us and 89% at 1000 us both produced "NOTHING PASSED... That is a
+    LIGHTING or CONFIG problem" on a camera seeing 3.5-3.7 tags, while two
+    independent 60 s measurements of the steady-state solve rate on the same rig
+    gave 93.5% and 82.9%. The 90% threshold sits INSIDE the normal operating
+    range, so a sample cannot be failed for landing just under it.
+
+    Wilson rather than the normal approximation because the interesting region is
+    near 1.0, where the normal approximation runs off the end of the scale. At
+    ~64 frames this turns a 90% floor into an effective ~85% floor; at 600 frames
+    it tightens back towards 90%, which is the correct behaviour - more evidence,
+    less benefit of the doubt.
+    """
+    if n <= 0:
+        return 1.0
+    p = float(hits) / n
+    denom = 1.0 + z * z / n
+    centre = p + z * z / (2.0 * n)
+    half = z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n))
+    return min(1.0, (centre + half) / denom)
+
+
 class Sample:
     """Detection quality at one exposure, for one camera."""
     def __init__(self, exposure):
@@ -92,10 +123,12 @@ class Sample:
         # ambiguity is dominated by viewing angle rather than exposure, so
         # detection RATE is the honest metric.
         if ref_tag is not None:
-            return self.ref_rate >= 0.95
+            return rate_upper_bound(self.ref_seen, self.frames) >= 0.95
         # Prefer the multi-tag criterion when multi-tag is actually running.
+        # Judged on the upper confidence bound, not the point estimate: a rate
+        # measured over ~60 frames cannot separate 88% from 90%.
         if self.multitag_solves:
-            return self.solve_rate >= 0.90
+            return rate_upper_bound(self.multitag_solves, self.frames) >= 0.90
         # Otherwise: enough tags, seen reliably, at trustworthy ambiguity.
         if self.mean_tags < min_tags:
             return False
@@ -117,9 +150,15 @@ class Sample:
         if tag_target is not None and self.mean_tags < tag_target:
             return "saw %.2f tags, needed %.2f" % (self.mean_tags, tag_target)
         if ref_tag is not None:
-            return "reference tag %d in only %.0f%% of frames" % (ref_tag, 100 * self.ref_rate)
+            return ("reference tag %d in %.0f%% of %d frames (at best %.0f%%, "
+                    "under the 95%% floor)"
+                    % (ref_tag, 100 * self.ref_rate, self.frames,
+                       100 * rate_upper_bound(self.ref_seen, self.frames)))
         if self.multitag_solves:
-            return "multi-tag solved in only %.0f%% of frames" % (100 * self.solve_rate)
+            return ("multi-tag solved in %.0f%% of %d frames (at best %.0f%%, "
+                    "under the 90%% floor)"
+                    % (100 * self.solve_rate, self.frames,
+                       100 * rate_upper_bound(self.multitag_solves, self.frames)))
         if self.mean_tags < min_tags:
             return "no multi-tag solve, and only %.2f tags" % self.mean_tags
         amb = self.med_ambiguity
