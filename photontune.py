@@ -503,6 +503,21 @@ def calibration_problem(cam):
     return None
 
 
+def _escalate_to(args, gain):
+    """Next gain to try, and whether that is the ONLY further try.
+
+    With a fixed-exposure gain scan following (--optimise-gain), jump straight to
+    the ceiling: the scan re-measures every gain from the bottom afterwards and
+    picks the lowest one that is statistically as good, so overshooting here
+    costs nothing and saves a whole exposure sweep per step skipped. Without a
+    scan to follow (--no-optimise-gain) the escalation IS the final answer, so it
+    must still climb gently and stop at the first gain that works.
+    """
+    if getattr(args, "_gain_scan_follows", False):
+        return float(args.max_gain), True
+    return min(float(args.max_gain), max(gain * 1.5, gain + 10)), False
+
+
 # Failures that must survive being handed up through a recursion or a search.
 #
 # Every one of these was recorded and then lost. tune_camera escalates gain with
@@ -759,11 +774,11 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
             # WITHOUT buying motion blur, so escalate gain rather than accept a
             # long exposure - which is what a naive tuner would do.
             if args.gain_steps and gain < args.max_gain:
-                nxt = min(args.max_gain, max(gain * 1.5, gain + 10))
+                nxt, one_jump = _escalate_to(args, gain)
                 log("   nothing passed at gain %g - retrying at gain %g" % (gain, nxt))
                 log("   (gain costs noise; exposure costs blur - prefer gain)")
                 args.gain = nxt
-                args.gain_steps -= 1
+                args.gain_steps = 0 if one_jump else args.gain_steps - 1
                 return await tune_camera(pv, cam, args, log, progress,
                                          original=original, skip_baseline=True,
                                          carry=result)
@@ -801,13 +816,30 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
         at_floor = shortest.exposure <= args.min_exposure * 1.25
         if predicted > args.max_blur_px * 1.15 and not at_floor:
             if args.gain_steps and gain < args.max_gain:
-                nxt = min(args.max_gain, max(gain * 1.5, gain + 10))
+                nxt, one_jump = _escalate_to(args, gain)
                 log("   %.0f px of blur at %.0f deg/s exceeds the %.0f px budget"
                     % (predicted, args.blur_rate, args.max_blur_px))
                 log("   raising gain %g -> %g and re-sweeping (gain costs noise, "
                     "exposure costs blur)" % (gain, nxt))
+                if one_jump:
+                    # Straight to the top, and only once. If the most gain
+                    # available cannot buy a shorter exposure then no value in
+                    # between can either, and each intermediate step costs a
+                    # whole sweep - measured 23 s. Climbing 0 -> 10 -> 20 cost
+                    # two extra sweeps per camera and ended at the same 1500 us.
+                    # Which gain is actually APPLIED is decided afterwards by the
+                    # fixed-exposure scan, so overshooting here is free.
+                    log("   (straight to the top of the range; the gain finally "
+                        "applied is chosen by the fixed-exposure scan)")
+                # More gain moves the cliff DOWN or leaves it - it can never need
+                # a LONGER exposure - so bracket the previous answer instead of
+                # re-exploring the whole range.
+                args.max_exposure = min(args.max_exposure,
+                                        max(args.min_exposure * 1.5,
+                                            shortest.exposure * 1.5))
+                args.steps = max(3, min(args.steps, 4))
                 args.gain = nxt
-                args.gain_steps -= 1
+                args.gain_steps = 0 if one_jump else args.gain_steps - 1
                 return await tune_camera(pv, cam, args, log, progress,
                                          original=original, skip_baseline=True,
                                          carry=result)
@@ -955,134 +987,210 @@ async def calibrate_reference_bias(args, log=print):
     return out
 
 
-async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=False):
-    """Find the (gain, exposure) pair giving the SHORTEST exposure that still sees
-    all the tags - because exposure costs motion blur and gain only costs noise.
+async def _gain_trial(pv, cam, args, gain, exposure, settle_extra=0.0):
+    """Detection quality at ONE gain, with the exposure held where it is."""
+    mark = capture_mark(args, cam)
+    await pv.set_setting(cam["uniqueName"], cameraAutoExposure=False,
+                         cameraGain=int(round(gain)),
+                         cameraExposureRaw=float(exposure))
+    await asyncio.sleep(args.settle + settle_extra)
+    raw = await sample(pv, cam, args, args.dwell, args.reference_tag, mark)
+    s = Sample(exposure)
+    s.frames = raw["frames"]
+    s.multitag_solves = raw["solves"]
+    s.reproj = raw["reproj"]
+    s.tag_counts = raw["tags"]
+    s.ambiguities = raw["amb"]
+    s.ref_seen = raw["ref_seen"]
+    s.ref_ranges = raw["ref_ranges"]
+    return s
 
-    Sweeping exposure at a fixed gain answers "what is the shortest exposure at THIS
-    gain", which is not the question. Raising gain lowers the exposure needed; the
-    limit is that noise eventually degrades corner precision, so we stop when
-    reprojection error starts getting worse rather than simply maximising gain.
+
+async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=False):
+    """ONE exposure sweep, then a gain scan with that exposure held fixed.
+
+    The old shape ran a whole tune_camera - a complete exposure sweep - once per
+    gain candidate, six times over. MEASURED on this rig: 91.6 s per camera, and
+    what it bought was a decision smaller than its own noise. Holding exposure
+    fixed and repeating the gain scan three times, reprojection at gain 40 read
+    1.100 / 0.683 / 0.431 px - a 2.55x spread at ONE gain - while the decision
+    the tool actually made was gain 80 (0.471) over gain 40 (0.563), a 1.19x
+    difference sitting well inside that spread. It chose 60, 80 and 100 on
+    different runs in the same room and the same light.
+
+    MEASURED costs of the two halves: one 8-step exposure sweep 23 s; a
+    fixed-exposure scan over all six gain candidates 13.2 s (three repeats:
+    13.3 / 13.2 / 13.2). 36 s per camera instead of 91.6 s.
+
+    Re-sweeping exposure per gain was never needed anyway: across every run on
+    this rig the cliff sat at 1500 us for every gain from 20 to 100.
     """
-    # same reasoning as tune_camera: a search must not start from its own last answer
-    start = (args.gain if args.gain is not None
-             else getattr(args, "start_gain", BASELINE_START_GAIN))
-    # Span start..max_gain evenly. The old rule stepped by max(g*1.7, g+8), which
-    # overshoots the ceiling near the top: starting at 60 with a max of 100, the
-    # next candidate was 102 and the "search" ran with a single value. It also
-    # sampled the low end finely, which is where the measurements say the answer
-    # is NOT - on an OV9281 in a dim room reprojection improved monotonically from
-    # gain 0 to 79, so the interesting region is the top.
+    unique = cam["uniqueName"]
+    nick = cam["nickname"]
+
+    # ---- phase 1: find the exposure, once, with the log VISIBLE ----------
+    # The old code passed log=lambda m: None here, which is why a connection
+    # death, a calibration refusal and a dark room all printed as the same
+    # "no passing exposure".
+    saved_gain, saved_steps = args.gain, args.gain_steps
+    saved_bounds = (args.min_exposure, args.max_exposure, args.steps)
+    saved_follows = getattr(args, "_gain_scan_follows", False)
+    args._gain_scan_follows = True      # lets phase 1 escalate in one jump
+    # Pin the starting gain explicitly. tune_camera's skip_baseline branch falls
+    # back to the camera's CURRENT gain, which is the ratchet this tool exists to
+    # avoid: measured, a first pass at a camera left on gain 100 swept at 100 and
+    # then scanned only [100], so the search could never go back down.
+    if args.gain is None:
+        args.gain = float(getattr(args, "start_gain", BASELINE_START_GAIN))
+    try:
+        r = await tune_camera(
+            pv, cam, args, log=log,
+            progress=(lambda f: progress(0.55 * f)) if progress else None,
+            skip_baseline=skip_baseline)
+    finally:
+        # tune_camera writes args.gain and narrows the sweep bounds during an
+        # escalation, and args is shared across cameras - camera 1's answer used
+        # to become camera 2's start.
+        args.gain, args.gain_steps = saved_gain, saved_steps
+        args.min_exposure, args.max_exposure, args.steps = saved_bounds
+        args._gain_scan_follows = saved_follows
+
+    exposure = r.get("applied")
+    if not exposure:
+        return r                 # the sweep already said why, in the real log
+
+    original = r.get("original") or {}
+
+    # ---- phase 2: scan gain with that exposure held ----------------------
+    # The FULL range, not "from whatever the sweep ended at". Phase 1 may have
+    # jumped to the ceiling just to find an exposure; the whole point of the scan
+    # is to walk that back down, and a trial that cannot see the tags at a low
+    # gain drops out on its own merits.
+    lo = float(saved_gain if saved_gain is not None
+               else getattr(args, "start_gain", BASELINE_START_GAIN))
+    hi = float(args.max_gain)
     n = max(1, int(args.gain_search_steps))
-    lo, hi = float(start), float(args.max_gain)
     if n == 1 or hi <= lo:
         gains = [lo]
     else:
         gains = [lo + (hi - lo) * i / float(n - 1) for i in range(n)]
-    gains = sorted({round(g) for g in gains})
-    log("── %s ──  gain search over %s" % (cam["nickname"], [round(x) for x in gains]))
+    gains = sorted({int(round(g)) for g in gains})
+    log("   gain scan at exposure %.0f over %s" % (exposure, gains))
 
+    # Phase 1 popped this on success, but the camera is about to be moved again.
+    if original:
+        PENDING_RESTORE[unique] = dict(original)
+
+    steps = len(gains) + (1 if len(gains) > 1 else 0)
     trials = []
-    saved_gain = args.gain
-    saved_steps, args.gain_steps = args.gain_steps, 0      # no escalation inside a trial
-    saved_min, saved_max, saved_n = args.min_exposure, args.max_exposure, args.steps
     for i, gv in enumerate(gains):
-        args.gain = gv
         if progress:
-            progress(i / float(len(gains)))
-        # After the first gain has located the cliff, stop re-sweeping the whole
-        # 1000-25000 range to rediscover it. Raising gain moves the cliff DOWN or
-        # leaves it alone - it cannot need a longer exposure - so a bracket around
-        # the previous answer is sufficient. Measured across every run on this rig:
-        # the cliff sat at 1500 us for every gain from 20 to 100. The full sweep was
-        # 8 steps; the bracket is 4, which is most of the runtime of a gain search.
-        if trials:
-            prev = min(t[1] for t in trials)
-            args.min_exposure = max(saved_min, prev / 2.5)
-            args.max_exposure = min(saved_max, prev * 2.5)
-            args.steps = max(3, min(saved_n, 4))
-        r = await tune_camera(pv, cam, args, log=lambda m: None, progress=None,
-                              skip_baseline=skip_baseline)
-        exp = r.get("applied") or (r.get("cliff") and None)
-        if r.get("applied") and r.get("samples"):
-            best = min((x for x in r["samples"] if x["passes"]),
-                       key=lambda x: x["exposure"], default=None)
-            rp = best.get("med_reproj") if best else None
-            trials.append((gv, r["applied"], rp, r))
-            log("   gain %-5.0f -> exposure %7.0f   reproj %s"
-                % (gv, r["applied"], ("%.3f" % rp) if rp else "n/a"))
-        else:
-            log("   gain %-5.0f -> no passing exposure" % gv)
-    args.gain_steps = saved_steps
-    args.gain = saved_gain
-    args.min_exposure, args.max_exposure, args.steps = saved_min, saved_max, saved_n
+            progress(0.55 + 0.45 * i / steps)
+        s = await _gain_trial(pv, cam, args, gv, exposure)
+        ok = s.passes(args.min_tags, args.max_ambiguity, args.reference_tag)
+        trials.append((gv, s.med_reproj if ok else None, s))
+        log("   %s gain %-5d  %s" % ("ok " if ok else "   ", gv,
+                                     s.summary(args.reference_tag)))
 
-    if not trials:
-        return None
-    good = [t for t in trials if t[2] is not None]
-    best_rp = min((t[2] for t in good), default=None)
-    if best_rp is not None:
-        # Reject gains where noise has visibly hurt the fit.
-        usable = [t for t in trials if t[2] is None or t[2] <= best_rp * args.reproj_tolerance]
+    # ---- phase 3: how much of that spread is just measurement noise? -----
+    # Re-measure the FIRST candidate at the end of the scan. That is the honest
+    # unit to compare the others against: it is the same quantity, measured
+    # twice, across exactly the interval the scan itself spans.
+    noise = None
+    # Repeat a gain that actually PASSED, not blindly the first candidate.
+    # Repeating a candidate that saw nothing yields no reprojection and so no
+    # noise estimate at all - measured: gain 0 failed on OV9281 (1), the repeat
+    # was wasted, and the fallback band then picked gain 20 (reproj 2.052) over
+    # gain 100 (1.597), calling a 28% difference insignificant.
+    repeatable = next((g for g, rp, _ in trials if rp is not None), None)
+    if len(gains) > 1 and repeatable is not None:
+        if progress:
+            progress(0.55 + 0.45 * len(gains) / steps)
+        again = await _gain_trial(pv, cam, args, repeatable, exposure)
+        first_rp = next(rp for g, rp, _ in trials if g == repeatable)
+        rp2 = (again.med_reproj
+               if again.passes(args.min_tags, args.max_ambiguity, args.reference_tag)
+               else None)
+        if first_rp and rp2:
+            noise = abs(math.log(rp2 / first_rp))
+            log("   repeat of gain %d: reproj %.3f then %.3f - this run's own "
+                "repeat noise is %.0f%%"
+                % (repeatable, first_rp, rp2, 100 * (math.exp(noise) - 1)))
+
+    good = [t for t in trials if t[1] is not None]
+    if not good:
+        log("   no gain in the scan measured usable reprojection - keeping the "
+            "sweep's own gain %g" % lo)
+        PENDING_RESTORE.pop(unique, None)
+        return r
+
+    best_rp = min(t[1] for t in good)
+    # --reproj-tolerance keeps its own job: REJECT a gain whose fit is clearly
+    # worse than the best. It is not a noise estimate and must not be used as
+    # one - at its 1.5 default it declares a 28% difference insignificant.
+    usable = [t for t in good if t[1] <= best_rp * float(args.reproj_tolerance)]
+    # One repeat is a crude estimate, so floor the band at 5%: a fluke pair of
+    # near-identical readings must not make every 1% difference "significant".
+    # With no repeat at all, 5% is also the fallback - claiming a wider band
+    # without having measured it is exactly the dishonesty this replaces.
+    band = max(math.exp(noise) if noise is not None else 1.0, 1.05)
+    contenders = [t for t in usable if t[1] <= best_rp * band]
+    pick = min(contenders, key=lambda t: t[0])       # LOWEST gain wins a tie
+    best = min(good, key=lambda t: t[1])
+
+    log("      %s" % ", ".join("gain %d -> %.3f" % (g, rp) for g, rp, _ in good))
+    if len(good) == 1:
+        log("   only gain %d measured usable reprojection (%.3f) at exposure %.0f"
+            % (pick[0], pick[1], exposure))
+    elif pick[0] == best[0]:
+        log("   chose gain %d at exposure %.0f - reproj %.3f, the best measured "
+            "and outside this run's %.0f%% noise band"
+            % (pick[0], exposure, pick[1], 100 * (band - 1)))
+        if pick[0] >= max(t[0] for t in trials) and len(trials) > 1:
+            log("      NOTE: that is the TOP of the search range - the optimum "
+                "may be higher. Raise --max-gain to find it.")
     else:
-        usable = trials
-    # Shortest exposure first - that is what buys motion tolerance. But among the
-    # gains that all reach that same exposure, take the one that REPROJECTS best,
-    # not the lowest number.
-    #
-    # Measured on an OV9281 in a dim room, every gain from 8 up reached 1500 us and
-    # reprojection improved the whole way: 1.225 -> 1.036 -> 0.841 px. Picking the
-    # lowest gain discarded a 32% better fit for no gain in shutter speed. "Gain
-    # only costs noise" is wrong at the dark end: too little gain means a
-    # low-contrast image, and corner refinement needs contrast more than it needs
-    # a low noise floor.
-    trials = [(round(g), e, rp, r) for (g, e, rp, r) in trials]
-    usable = [(round(g), e, rp, r) for (g, e, rp, r) in usable]
-    best_exp = min(t[1] for t in usable)
-    tied = [t for t in usable if t[1] <= best_exp * 1.05]
-    pick = min(tied, key=lambda t: (t[2] if t[2] is not None else float("inf")))
-    log("   chose gain %.0f with exposure %.0f "
-        "(shortest exposure; best reproj %s of %d gain(s) that reached it)"
-        % (pick[0], pick[1],
-           ("%.3f" % pick[2]) if pick[2] is not None else "n/a", len(tied)))
-    if len(tied) > 1:
-        log("      tied on exposure: %s"
-            % ", ".join("gain %.0f -> %s" % (t[0], ("%.3f" % t[2]) if t[2] else "n/a")
-                        for t in sorted(tied, key=lambda x: x[0])))
-    if pick[0] >= max(t[0] for t in trials) and len(trials) > 1:
-        log("      NOTE: the best gain is the TOP of the search range - the optimum "
-            "may be higher. Raise --gain-search-steps or --max-gain to find it.")
-    # Deliberately NOT written back into args.gain: this object is shared across
-    # cameras, and camera 1's answer became camera 2's search START - which made
-    # camera 2 "search" a single candidate and silently inherit camera 1's gain.
-    # Each camera gets its own light; each gets its own search.
+        log("   chose gain %d (reproj %.3f) over gain %d (reproj %.3f) at "
+            "exposure %.0f" % (pick[0], pick[1], best[0], best[1], exposure))
+        log("      the difference is INSIDE this run's %.0f%% measurement noise, "
+            "so it is NOT significant - and the lower gain is the one with less "
+            "sensor noise." % (100 * (band - 1)))
 
-    # Explicitly apply the winner. The trials leave whichever pair was tried LAST
-    # on the camera, which is only the winner by luck - so write it, then confirm
-    # the camera actually took it rather than assuming.
+    r["gain_trials"] = [{"gain": g, "reproj": rp, "frames": s.frames,
+                         "mean_tags": s.mean_tags, "solve_rate": s.solve_rate}
+                        for g, rp, s in trials]
+    r["gain_noise_pct"] = None if noise is None else round(100 * (math.exp(noise) - 1), 1)
+    r["gain_significant"] = (pick[0] == best[0])
+
+    # Explicitly apply the winner. The scan leaves whichever gain was tried LAST
+    # on the camera - the repeat, in fact - which is the winner only by luck.
     if not args.dry_run:
-        await pv.set_setting(cam["uniqueName"], cameraAutoExposure=False,
-                             cameraGain=int(round(pick[0])),
-                             cameraExposureRaw=float(pick[1]))
-        await asyncio.sleep(args.settle)
+        await pv.set_setting(unique, cameraAutoExposure=False,
+                             cameraGain=int(pick[0]), cameraExposureRaw=float(exposure))
+        await asyncio.sleep(max(args.settle, 1.5))
         # cameraSettings lags a second or two, so a plain read here reports the
         # PREVIOUS value and cries MISMATCH on a write that actually succeeded.
-        live = await (pv.cameras_fresh(timeout=10) if hasattr(pv, "cameras_fresh")
-                      else pv.cameras(timeout=8))
-        got = next((c for c in live if c["uniqueName"] == cam["uniqueName"]), None)
+        live = await pv.cameras_fresh(timeout=10)
+        got = next((c for c in live if c["uniqueName"] == unique), None)
         if got:
             gs = got["settings"]
-            ok = (abs(float(gs["cameraGain"]) - round(pick[0])) < 0.51
-                  and abs(float(gs["cameraExposureRaw"]) - pick[1]) < 1e-6)
-            log("   applied gain %.0f / exposure %.0f - camera reports %s / %s  %s"
-                % (pick[0], pick[1], gs["cameraGain"], gs["cameraExposureRaw"],
+            ok = (abs(float(gs["cameraGain"]) - pick[0]) < 0.51
+                  and abs(float(gs["cameraExposureRaw"]) - exposure) < 1e-6)
+            log("   applied gain %d / exposure %.0f - camera reports %s / %s  %s"
+                % (pick[0], exposure, gs["cameraGain"], gs["cameraExposureRaw"],
                    "confirmed" if ok else "*** MISMATCH ***"))
             if not ok:
-                pick[3]["apply_mismatch"] = {"wanted": [pick[0], pick[1]],
-                                             "got": [gs["cameraGain"], gs["cameraExposureRaw"]]}
-        pick[3]["applied"] = pick[1]
-        pick[3]["gain"] = pick[0]
-    return pick[3]
+                r["apply_mismatch"] = {"wanted": [pick[0], exposure],
+                                       "got": [gs["cameraGain"], gs["cameraExposureRaw"]]}
+        r["applied"] = exposure
+        r["gain"] = pick[0]
+        PENDING_RESTORE.pop(unique, None)
+    else:
+        await pv.set_setting(unique, **original)
+        PENDING_RESTORE.pop(unique, None)
+    if progress:
+        progress(1.0)
+    return r
 
 
 class AlreadyRunning(Exception):
