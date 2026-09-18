@@ -1085,7 +1085,125 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
     return pick[3]
 
 
+class AlreadyRunning(Exception):
+    """Another photontune already holds the run lock."""
+
+
+class RunLock:
+    """Advisory lock, so two photontunes cannot fight over the same cameras.
+
+    This ships as a daemon AND a CLI on the same box, so a human running the CLI
+    while the daemon's autorun fires is normal rather than exotic, and nothing
+    detected it. Overlapping runs are not merely wasteful: MEASURED on this rig,
+    the second run's NetworkTables-server toggle calls
+    NetworkManager.reinitialize(), which killed the first run's websocket with
+    "no close frame received or sent" and left the camera parked mid-sweep at
+    9966 us on gain 0.
+
+    Takes BOTH paths rather than the first one that works. /run is the
+    conventional home but is root-only here (drwxr-xr-x root root), and the
+    daemon runs as root while a human's CLI does not - so choosing one path by
+    availability would put the two parties on DIFFERENT files and exclude
+    nothing at all. /tmp is world-writable and is what actually guarantees
+    exclusion; /run is taken as well when we can get it, and created 0666 so the
+    unprivileged side can lock it too.
+    """
+    PATHS = ("/run/photontune.lock", "/tmp/photontune.lock")
+
+    def __init__(self):
+        self._held = []
+        self.holder = None
+
+    @staticmethod
+    def _open(path):
+        import os
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+        except OSError:
+            try:
+                # flock() works on a read-only descriptor, unlike fcntl.lockf -
+                # so an unprivileged run can still contend for a root-owned file.
+                fd = os.open(path, os.O_RDONLY)
+            except OSError:
+                return None
+        try:
+            os.fchmod(fd, 0o666)
+        except OSError:
+            pass
+        return fd
+
+    @staticmethod
+    def _who(fd):
+        import os
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            return os.read(fd, 400).decode("utf-8", "replace").strip()
+        except OSError:
+            return ""
+
+    def acquire(self):
+        import fcntl, os
+        got = []
+        for path in self.PATHS:
+            fd = self._open(path)
+            if fd is None:
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                self.holder = self._who(fd) or "pid unknown"
+                os.close(fd)
+                for f in got:
+                    try:
+                        fcntl.flock(f, fcntl.LOCK_UN)
+                        os.close(f)
+                    except OSError:
+                        pass
+                return False
+            try:
+                os.ftruncate(fd, 0)
+                os.write(fd, ("pid %d: %s\n"
+                              % (os.getpid(), " ".join(sys.argv[1:]))).encode())
+            except OSError:
+                pass              # read-only descriptor; the lock still holds
+            got.append(fd)
+        self._held = got
+        return True
+
+    def release(self):
+        import fcntl, os
+        for fd in self._held:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._held = []
+
+    def message(self):
+        return ("another photontune is already running (%s).\n"
+                "  Two at once fight over the same cameras: the second one's "
+                "NetworkTables-server\n"
+                "  toggle bounces the network stack and kills the first one's "
+                "websocket mid-sweep,\n"
+                "  leaving a camera at whatever exposure it was testing. Wait "
+                "for it, or stop it." % (self.holder or "pid unknown"))
+
+
 async def run(args, log=print, progress=None, on_camera=None):
+    lock = RunLock()
+    if not lock.acquire():
+        raise AlreadyRunning(lock.message())
+    try:
+        return await _run_locked(args, log, progress, on_camera)
+    finally:
+        lock.release()
+
+
+async def _run_locked(args, log=print, progress=None, on_camera=None):
     args._nt_we_started = False
     args._nt_cfg = None
     if not getattr(args, "no_nt", False) and getattr(args, "manage_nt_server", True):
@@ -1820,6 +1938,16 @@ async def daemon(args, log=print):
                     result_entry.setString(json.dumps(res))
                     progress_e.setDouble(1.0)
                     log("done: " + line)
+                except AlreadyRunning as exc:
+                    # SKIP the trigger, do not fail it. A human at the CLI while
+                    # the daemon's autorun fires is the ordinary case, and the
+                    # human's run is the one that should win - they are standing
+                    # there watching it. A failed boot tune would also latch
+                    # bootTuneOk=false for the rest of the session.
+                    run_ok["summary"] = "skipped: %s" % str(exc).splitlines()[0]
+                    summary.setString(run_ok["summary"])
+                    status.setString(run_ok["summary"])
+                    log(run_ok["summary"])
                 except Exception as exc:
                     run_ok["value"] = False
                     run_ok["summary"] = "error: %s" % exc
@@ -2071,7 +2199,7 @@ def main():
     if args.calibrate_reference_bias:
         try:
             asyncio.run(calibrate_reference_bias(args))
-        except (ConnectionError, LookupError) as exc:
+        except (AlreadyRunning, ConnectionError, LookupError) as exc:
             sys.exit("photontune: %s" % exc)
         return
     if args.daemon:
@@ -2103,7 +2231,7 @@ def main():
     try:
         try:
             results = asyncio.run(_guard_signals(run(args)))
-        except (ConnectionError, LookupError) as exc:
+        except (AlreadyRunning, ConnectionError, LookupError) as exc:
             sys.exit("photontune: %s" % exc)
         except (KeyboardInterrupt, Terminated):
             # The interrupted loop could not complete the restore. Do it on a new one.
