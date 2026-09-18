@@ -498,17 +498,116 @@ def camera_fx(cam, fallback=None):
     return fallback
 
 
-def calibration_problem(cam):
+def calibrated_modes(cam):
+    """[(videoFormatList index, format, calibration)] for every calibrated mode."""
+    fmts = cam.get("formats") or {}
+    items = list(fmts.items()) if isinstance(fmts, dict) else list(enumerate(fmts))
+    out = []
+    for idx, fmt in items:
+        if not isinstance(fmt, dict):
+            continue
+        w, h = fmt.get("width"), fmt.get("height")
+        for cal in cam.get("calibrations") or []:
+            res = cal.get("resolution") or {}
+            try:
+                if abs(float(res.get("width", -1)) - float(w)) < 1 and \
+                   abs(float(res.get("height", -1)) - float(h)) < 1:
+                    out.append((int(idx), fmt, cal))
+                    break
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+async def ensure_calibrated_mode(pv, cam, args, log=print):
+    """Move the camera onto a calibrated video mode if it is not on one.
+
+    Returns (cam, problem). When a calibrated resolution EXISTS in
+    videoFormatList but the active one is uncalibrated, switching to it is the
+    difference between a tool that tells a human what to do and a tool that just
+    works - which is the whole point of running unattended. Only refuses when no
+    calibrated mode exists at all, because then there is genuinely nothing to do
+    but calibrate.
+
+    Picks the calibrated mode closest in pixel count to the one in use, so the
+    switch changes the camera's CPU cost and framerate as little as possible.
+    """
+    problem = calibration_problem(cam, assume_solvepnp=True)
+    if not problem:
+        return cam, None
+    options = calibrated_modes(cam)
+    fmt = active_format(cam) or {}
+    if not options:
+        return cam, problem
+    now_px = float(fmt.get("width") or 0) * float(fmt.get("height") or 0)
+
+    def closeness(o):
+        px = float(o[1].get("width", 0)) * float(o[1].get("height", 0))
+        return (abs(math.log(px / now_px)) if now_px and px else 0.0, -px)
+
+    idx, newfmt, cal = min(options, key=closeness)
+    log("   !! the active video mode %gx%g has NO calibration. With solvePNP on,"
+        % (fmt.get("width", 0), fmt.get("height", 0)))
+    log("   !! PhotonVision publishes NOTHING in this state, so every exposure")
+    log("   !! would look equally dead and the tune would blame the lighting.")
+    log("   !! SWITCHING the pipeline to video mode %d (%gx%g), which IS "
+        "calibrated." % (idx, newfmt.get("width", 0), newfmt.get("height", 0)))
+    log("   !! That is a real change to your pipeline, made deliberately: it is "
+        "the difference between a camera that works and one that needs a human.")
+    bad = await pv.set_and_verify(cam["uniqueName"], settle=max(args.settle, 2.0),
+                                  cameraVideoModeIndex=int(idx))
+    fresh = await pv.cameras_fresh(timeout=8)
+    newer = next((c for c in fresh if c["uniqueName"] == cam["uniqueName"]), None)
+    if newer:
+        cam = dict(cam)
+        cam["settings"] = newer["settings"]
+    problem = calibration_problem(cam, assume_solvepnp=True)
+    if problem:
+        log("   !! the switch did not take (%s) - %s"
+            % ([b for b in bad if b[0]] or "no rejection reported", problem))
+        return cam, problem
+    ci = (cal.get("cameraIntrinsics") or {})
+    data = ci.get("data") or ci.get("dataValue") or []
+    log("   now on a calibrated mode: %gx%g, fx %s"
+        % (newfmt.get("width", 0), newfmt.get("height", 0),
+           ("%.1f" % float(data[0])) if data else "?"))
+    # A resolution change restarts the capture pipeline, and the settings
+    # read-back comes back long before the frames do. MEASURED: sweeping
+    # immediately after the switch read 0.00 tags at EVERY exposure on a camera
+    # that sees 2.00 at the same settings once settled, so the tune reported a
+    # lighting problem it had caused itself. Wait for detections to come back.
+    t0 = time.time()
+    while time.time() - t0 < 20:
+        raw = await sample(pv, cam, args, 1.0, args.reference_tag)
+        if raw["tags"] and (sum(raw["tags"]) / len(raw["tags"])) > 0:
+            log("   detections resumed %.0f s after the mode change" % (time.time() - t0))
+            break
+        await asyncio.sleep(1.0)
+    else:
+        log("   NOTE: no tags seen in the %.0f s after the mode change - "
+            "continuing anyway, but the sweep below may be measuring a camera "
+            "that is still restarting." % (time.time() - t0))
+    return cam, None
+
+
+def calibration_problem(cam, assume_solvepnp=False):
     """Why this camera cannot produce a 3D pose, or None if it can.
 
-    Checked BEFORE tuning because the failure is otherwise indistinguishable
-    from darkness: with solvePNP on and no calibration for the active
-    resolution, PhotonVision publishes nothing at all, so every exposure scores
-    zero, gain escalates to the ceiling, and the tool blames the lighting. The
-    one config problem it actually is never gets named.
+    assume_solvepnp: judge as though solvePNP were on. The gate used to return
+    None whenever solvePNPEnabled was false - which is PhotonVision's DEFAULT -
+    and was then checked BEFORE the baseline turned solvePNP on, so on a
+    genuinely fresh camera it saw nothing wrong and six fake "no passing
+    exposure" lines printed before the real message. photontune's own baseline
+    asserts solvePNPEnabled=True, so when the baseline is going to run, the
+    honest question is whether the camera will work AFTER it.
+
+    With solvePNP on and no calibration for the active resolution, PhotonVision
+    publishes nothing at all, so every exposure scores zero, gain escalates to
+    the ceiling, and the tool blames the lighting. The one config problem it
+    actually is never gets named.
     """
     st = cam.get("settings", {})
-    if not st.get("solvePNPEnabled"):
+    if not (assume_solvepnp or st.get("solvePNPEnabled")):
         return None
     fmt = active_format(cam)
     if fmt is None:
@@ -620,13 +719,6 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
         if (carry or {}).get(_k):
             result[_k] = carry[_k]
 
-    problem = calibration_problem(cam)
-    if problem:
-        log("   !! CALIBRATION: %s" % problem)
-        result["error"] = "no calibration for the active resolution"
-        result["calibration_problem"] = problem
-        return result
-
     try:
         # Structural settings FIRST. Tuning exposure against a crushed brightness
         # just answers with a long, blurry exposure and calls it a success.
@@ -641,6 +733,19 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
             result["baseline_changed"] = list(_changed)
             if _failed:
                 result["baseline_failed"] = [list(map(str, f)) for f in _failed]
+        # AFTER the baseline: solvePNPEnabled is PhotonVision's default-off, and
+        # checking first meant the gate was blind on exactly the fresh camera it
+        # exists for. Judge on what the camera will be, not what it was.
+        _was = (cam.get("settings") or {}).get("cameraVideoModeIndex")
+        cam, problem = await ensure_calibrated_mode(pv, cam, args, log)
+        if (cam.get("settings") or {}).get("cameraVideoModeIndex") != _was:
+            result["video_mode_switched"] = [_was,
+                                             cam["settings"].get("cameraVideoModeIndex")]
+        if problem:
+            log("   !! CALIBRATION: %s" % problem)
+            result["error"] = "no calibration for the active resolution"
+            result["calibration_problem"] = problem
+            return result
         if getattr(args, "baseline_only", False):
             result["applied"] = None
             result["error"] = "baseline only - not tuned"
@@ -1484,14 +1589,6 @@ async def _tune_all(pv, cams, args, log, progress, on_camera, results):
             rec = {"camera": cam["nickname"], "uniqueName": cam["uniqueName"],
                    "applied": None}
             if args.optimise_gain:
-                _prob = calibration_problem(cam)
-                if _prob:
-                    log("── %s ──" % cam["nickname"])
-                    log("   !! CALIBRATION: %s" % _prob)
-                    rec["error"] = "no calibration for the active resolution"
-                    rec["calibration_problem"] = _prob
-                    results.append(rec)
-                    continue
                 # Structural settings BEFORE the gain search, not inside it.
                 # optimise_gain runs tune_camera with its logging discarded, so a
                 # baseline failure was both invisible and too late: measured, a
@@ -1514,6 +1611,19 @@ async def _tune_all(pv, cams, args, log, progress, on_camera, results):
                             % ", ".join(str(f[0]) for f in _fl))
                         log("   !! tuning on top of settings that are still wrong")
                         rec["baseline_failed"] = [list(map(str, f)) for f in _fl]
+                # AFTER the baseline, because the baseline is what turns solvePNP
+                # on, and the gate was silent while it was off.
+                was = (cam.get("settings") or {}).get("cameraVideoModeIndex")
+                cam, _prob = await ensure_calibrated_mode(pv, cam, args, log)
+                if (cam.get("settings") or {}).get("cameraVideoModeIndex") != was:
+                    rec["video_mode_switched"] = [was,
+                                                  cam["settings"].get("cameraVideoModeIndex")]
+                if _prob:
+                    log("   !! CALIBRATION: %s" % _prob)
+                    rec["error"] = "no calibration for the active resolution"
+                    rec["calibration_problem"] = _prob
+                    results.append(rec)
+                    continue
                 r = await optimise_gain(pv, cam, args, log, cam_progress,
                                         skip_baseline=True)
                 if r is not None:
