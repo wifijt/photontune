@@ -413,7 +413,18 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
         }
     log("── %s ──  current exposure %s, gain %s" % (name, original["cameraExposureRaw"], original["cameraGain"]))
 
-    gain = args.gain if args.gain is not None else original["cameraGain"]
+    # Start from the BASELINE gain, not from whatever the last run left behind.
+    # `original` stays the restore target - a failure must put back what the user
+    # had - but it must not be the starting point, or tuning is a ratchet.
+    if args.gain is not None:
+        gain = args.gain
+    elif skip_baseline:
+        gain = original["cameraGain"]          # a re-sweep, already reset
+    else:
+        gain = getattr(args, "start_gain", BASELINE_START_GAIN)
+        if abs(float(original["cameraGain"]) - float(gain)) > 1e-6:
+            log("   gain: resetting to baseline %g (camera was at %g)"
+                % (gain, original["cameraGain"]))
     result = {"camera": name, "uniqueName": unique, "original": original,
               "applied": None, "samples": [], "cliff": None, "gain": gain}
 
@@ -460,6 +471,7 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
 
         PENDING_RESTORE[unique] = dict(original)
         samples = []
+        blanks = 0
         sweep = geometric_sweep(args.min_exposure, args.max_exposure, args.steps)
         for step_i, exposure in enumerate(sweep):
             if progress:
@@ -478,8 +490,30 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
             s.ref_seen = raw["ref_seen"]
             s.ref_ranges = raw["ref_ranges"]
             samples.append(s)
-            mark = "ok " if s.passes(args.min_tags, args.max_ambiguity, args.reference_tag) else "   "
+            ok = s.passes(args.min_tags, args.max_ambiguity, args.reference_tag)
+            mark = "ok " if ok else "   "
             log("   %s exposure %8.0f   %s" % (mark, exposure, s.summary(args.reference_tag)))
+
+            # Overexposure is monotonic: once the image is too bright to detect a
+            # tag, every LONGER exposure is worse. The sweep climbs, so a run of
+            # dead steps at the top is physics, not information. Stop after two
+            # consecutive blanks - two rather than one, so a single dropped frame
+            # or a hand passing the lens cannot truncate the sweep.
+            # Count FAILING steps, not blank ones. A dying exposure usually still
+            # reports 1 tag rather than 0, so gating on "no tags at all" almost
+            # never fires and the sweep runs to the top anyway.
+            if not ok:
+                blanks += 1
+                if blanks >= 2 and any(x.passes(args.min_tags, args.max_ambiguity,
+                                                args.reference_tag) for x in samples):
+                    skipped = len(sweep) - step_i - 1
+                    if skipped > 0:
+                        log("   (stopping: 2 failed steps, %d longer exposure%s skipped "
+                            "- they can only be worse)"
+                            % (skipped, "" if skipped == 1 else "s"))
+                    break
+            else:
+                blanks = 0
 
         result["samples"] = [
             {"exposure": s.exposure, "frames": s.frames, "solve_rate": s.solve_rate,
@@ -747,19 +781,43 @@ async def optimise_gain(pv, cam, args, log=print, progress=None):
     limit is that noise eventually degrades corner precision, so we stop when
     reprojection error starts getting worse rather than simply maximising gain.
     """
-    start = args.gain if args.gain is not None else cam["settings"]["cameraGain"]
-    gains, g = [], float(start)
-    while len(gains) < args.gain_search_steps and g <= args.max_gain:
-        gains.append(g)
-        g = max(g * 1.7, g + 8)
+    # same reasoning as tune_camera: a search must not start from its own last answer
+    start = (args.gain if args.gain is not None
+             else getattr(args, "start_gain", BASELINE_START_GAIN))
+    # Span start..max_gain evenly. The old rule stepped by max(g*1.7, g+8), which
+    # overshoots the ceiling near the top: starting at 60 with a max of 100, the
+    # next candidate was 102 and the "search" ran with a single value. It also
+    # sampled the low end finely, which is where the measurements say the answer
+    # is NOT - on an OV9281 in a dim room reprojection improved monotonically from
+    # gain 0 to 79, so the interesting region is the top.
+    n = max(1, int(args.gain_search_steps))
+    lo, hi = float(start), float(args.max_gain)
+    if n == 1 or hi <= lo:
+        gains = [lo]
+    else:
+        gains = [lo + (hi - lo) * i / float(n - 1) for i in range(n)]
+    gains = sorted({round(g) for g in gains})
     log("── %s ──  gain search over %s" % (cam["nickname"], [round(x) for x in gains]))
 
     trials = []
+    saved_gain = args.gain
     saved_steps, args.gain_steps = args.gain_steps, 0      # no escalation inside a trial
+    saved_min, saved_max, saved_n = args.min_exposure, args.max_exposure, args.steps
     for i, gv in enumerate(gains):
         args.gain = gv
         if progress:
             progress(i / float(len(gains)))
+        # After the first gain has located the cliff, stop re-sweeping the whole
+        # 1000-25000 range to rediscover it. Raising gain moves the cliff DOWN or
+        # leaves it alone - it cannot need a longer exposure - so a bracket around
+        # the previous answer is sufficient. Measured across every run on this rig:
+        # the cliff sat at 1500 us for every gain from 20 to 100. The full sweep was
+        # 8 steps; the bracket is 4, which is most of the runtime of a gain search.
+        if trials:
+            prev = min(t[1] for t in trials)
+            args.min_exposure = max(saved_min, prev / 2.5)
+            args.max_exposure = min(saved_max, prev * 2.5)
+            args.steps = max(3, min(saved_n, 4))
         r = await tune_camera(pv, cam, args, log=lambda m: None, progress=None)
         exp = r.get("applied") or (r.get("cliff") and None)
         if r.get("applied") and r.get("samples"):
@@ -772,9 +830,10 @@ async def optimise_gain(pv, cam, args, log=print, progress=None):
         else:
             log("   gain %-5.0f -> no passing exposure" % gv)
     args.gain_steps = saved_steps
+    args.gain = saved_gain
+    args.min_exposure, args.max_exposure, args.steps = saved_min, saved_max, saved_n
 
     if not trials:
-        args.gain = start
         return None
     good = [t for t in trials if t[2] is not None]
     best_rp = min((t[2] for t in good), default=None)
@@ -783,23 +842,53 @@ async def optimise_gain(pv, cam, args, log=print, progress=None):
         usable = [t for t in trials if t[2] is None or t[2] <= best_rp * args.reproj_tolerance]
     else:
         usable = trials
-    pick = min(usable, key=lambda t: t[1])
-    log("   chose gain %.0f with exposure %.0f (shortest exposure with acceptable reproj)"
-        % (pick[0], pick[1]))
-    args.gain = pick[0]
+    # Shortest exposure first - that is what buys motion tolerance. But among the
+    # gains that all reach that same exposure, take the one that REPROJECTS best,
+    # not the lowest number.
+    #
+    # Measured on an OV9281 in a dim room, every gain from 8 up reached 1500 us and
+    # reprojection improved the whole way: 1.225 -> 1.036 -> 0.841 px. Picking the
+    # lowest gain discarded a 32% better fit for no gain in shutter speed. "Gain
+    # only costs noise" is wrong at the dark end: too little gain means a
+    # low-contrast image, and corner refinement needs contrast more than it needs
+    # a low noise floor.
+    trials = [(round(g), e, rp, r) for (g, e, rp, r) in trials]
+    usable = [(round(g), e, rp, r) for (g, e, rp, r) in usable]
+    best_exp = min(t[1] for t in usable)
+    tied = [t for t in usable if t[1] <= best_exp * 1.05]
+    pick = min(tied, key=lambda t: (t[2] if t[2] is not None else float("inf")))
+    log("   chose gain %.0f with exposure %.0f "
+        "(shortest exposure; best reproj %s of %d gain(s) that reached it)"
+        % (pick[0], pick[1],
+           ("%.3f" % pick[2]) if pick[2] is not None else "n/a", len(tied)))
+    if len(tied) > 1:
+        log("      tied on exposure: %s"
+            % ", ".join("gain %.0f -> %s" % (t[0], ("%.3f" % t[2]) if t[2] else "n/a")
+                        for t in sorted(tied, key=lambda x: x[0])))
+    if pick[0] >= max(t[0] for t in trials) and len(trials) > 1:
+        log("      NOTE: the best gain is the TOP of the search range - the optimum "
+            "may be higher. Raise --gain-search-steps or --max-gain to find it.")
+    # Deliberately NOT written back into args.gain: this object is shared across
+    # cameras, and camera 1's answer became camera 2's search START - which made
+    # camera 2 "search" a single candidate and silently inherit camera 1's gain.
+    # Each camera gets its own light; each gets its own search.
 
     # Explicitly apply the winner. The trials leave whichever pair was tried LAST
     # on the camera, which is only the winner by luck - so write it, then confirm
     # the camera actually took it rather than assuming.
     if not args.dry_run:
         await pv.set_setting(cam["uniqueName"], cameraAutoExposure=False,
-                             cameraGain=pick[0], cameraExposureRaw=float(pick[1]))
+                             cameraGain=int(round(pick[0])),
+                             cameraExposureRaw=float(pick[1]))
         await asyncio.sleep(args.settle)
-        live = await pv.cameras(timeout=8)
+        # cameraSettings lags a second or two, so a plain read here reports the
+        # PREVIOUS value and cries MISMATCH on a write that actually succeeded.
+        live = await (pv.cameras_fresh(timeout=10) if hasattr(pv, "cameras_fresh")
+                      else pv.cameras(timeout=8))
         got = next((c for c in live if c["uniqueName"] == cam["uniqueName"]), None)
         if got:
             gs = got["settings"]
-            ok = (abs(float(gs["cameraGain"]) - pick[0]) < 1e-6
+            ok = (abs(float(gs["cameraGain"]) - round(pick[0])) < 0.51
                   and abs(float(gs["cameraExposureRaw"]) - pick[1]) < 1e-6)
             log("   applied gain %.0f / exposure %.0f - camera reports %s / %s  %s"
                 % (pick[0], pick[1], gs["cameraGain"], gs["cameraExposureRaw"],
@@ -1142,6 +1231,28 @@ BASELINE_ALWAYS = {
     "tagFamily": ("kTag36h11", 0, "The family FRC uses."),
 }
 
+# The gain a tune STARTS from, unless --gain says otherwise.
+#
+# ZERO, deliberately. Gain is not a setting with a good value - it is a cost you
+# pay to buy a SHORTER exposure, and you should only pay it when the exposure the
+# scene wants would smear more than the blur budget allows. So the tune starts at
+# the bottom and climbs only when the blur budget forces it. Whatever it lands on
+# is then the least noise that meets the budget, which is the actual goal.
+#
+# Two things this fixes. Starting from the camera's CURRENT gain made the tool
+# non-deterministic and, because escalation is one-way, a ratchet: observed on one
+# rig, same room and same light, one camera starting at 28 and the other at 100
+# purely from run history - and the noisy one reprojected at 1.8-2.1 px against
+# the other's 0.5. Running unattended at boot, that walks toward maximum gain over
+# a season with nothing reporting it. Starting from a fixed GUESS (this was 25 for
+# one revision) is better but still wrong: it silently pays for noise the scene may
+# not need, and it cannot be justified from a measurement.
+#
+# The cost of starting at 0 is an extra sweep in a genuinely dark venue, where the
+# first pass finds nothing and escalation raises gain. That path is loop-guarded
+# and it is the correct answer arrived at honestly.
+BASELINE_START_GAIN = 0
+
 BASELINE_DEFAULT = {
     "threads": (1, 1,
         "PER CAMERA. Matching physical cores sounds right and is wrong: the "
@@ -1423,22 +1534,49 @@ def build_parser():
     p.add_argument("--steps", type=int, default=8)
     p.add_argument("--bias", type=float, default=1.5,
                    help="safety factor above the shortest passing exposure (default 1.5)")
-    p.add_argument("--gain", type=float, default=None, help="starting gain (default: leave as-is)")
+    p.add_argument("--gain", type=float, default=None,
+                   help="force this exact starting gain, overriding the baseline")
+    p.add_argument("--start-gain", type=float, default=BASELINE_START_GAIN,
+                   help="gain every tune STARTS from (default %(default)g). A tune must "
+                        "not start from the previous tune's answer: escalation is one-way, "
+                        "so that ratchets gain upward a little more on every run.")
     p.add_argument("--gain-steps", type=int, default=3,
                    help="how many times to escalate gain if no exposure passes (0 = never)")
     p.add_argument("--max-gain", type=float, default=100.0,
                    help="ceiling for gain escalation")
+    p.add_argument("--no-optimise-gain", "--no-optimize-gain", dest="optimise_gain",
+                   action="store_false", default=True,
+                   help="skip the gain search and sweep exposure at a single gain. "
+                        "Faster, but gain is venue-dependent: measured on an OV9281 "
+                        "in a dim room, reprojection improved monotonically from "
+                        "1.231 px at gain 0 to 0.496 px at gain 100, all at the same "
+                        "1500 us exposure. A constant cannot be right in both a dim "
+                        "workshop and a lit field.")
     p.add_argument("--optimise-gain", "--optimize-gain", dest="optimise_gain",
                    action="store_true",
                    help="search gain AND exposure together for the shortest exposure that "
                         "still sees all the tags (slower, but exposure is the costly one)")
-    p.add_argument("--gain-search-steps", type=int, default=4,
+    p.add_argument("--gain-search-steps", type=int, default=6,
                    help="how many gain values to try with --optimise-gain")
     p.add_argument("--reproj-tolerance", type=float, default=1.5,
                    help="reject a gain whose reprojection exceeds this multiple of the "
                         "best seen - stops noise being traded for exposure indefinitely")
-    p.add_argument("--dwell", type=float, default=2.5, help="seconds of data per candidate")
-    p.add_argument("--settle", type=float, default=1.5, help="seconds to wait after changing a setting")
+    p.add_argument("--fast", action="store_true",
+                   help="shorter settle and dwell. Over NetworkTables the default 2.5 s "
+                        "dwell is ~100 results per candidate, which is far more than is "
+                        "needed to tell a pass from a blank.")
+    p.add_argument("--dwell", type=float, default=1.5,
+                   help="seconds of data per candidate (default %(default)s). Over "
+                        "NetworkTables that is ~60 results, well past what is needed "
+                        "to separate a pass from a failure.")
+    p.add_argument("--settle", type=float, default=0.7,
+                   help="seconds to wait after changing a setting (default %(default)s). "
+                        "MEASURED on a Pi 5 / OV9281: the pipeline reflects a new "
+                        "exposure in 0.25-0.36 s, worst case 0.36 s over six trials, "
+                        "timed on the coprocessor against PhotonVision's own capture "
+                        "timestamps. This is that worst case roughly doubled. The old "
+                        "1.5 s default was 4x the measurement and was multiplied by "
+                        "every step of every sweep.")
     p.add_argument("--min-tags", type=float, default=2.0,
                    help="mean tags per frame required when multi-tag is unavailable")
     p.add_argument("--max-ambiguity", type=float, default=0.20)
@@ -1500,6 +1638,9 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    if getattr(args, "fast", False):
+        args.dwell = min(args.dwell, 0.9)
+        args.settle = min(args.settle, 0.5)
     if args.min_exposure <= 0 or args.max_exposure <= args.min_exposure:
         sys.exit("--max-exposure must exceed --min-exposure, both > 0")
     if args.calibrate_reference_bias:
