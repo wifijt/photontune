@@ -1548,15 +1548,25 @@ async def _run_locked(args, log=print, progress=None, on_camera=None):
             if not nt_server_reachable(target):
                 log("no NetworkTables server at %s - starting PhotonVision's"
                     " temporarily (stopped again afterwards)" % target)
-                await set_nt_server(args.host, cfg, True, args.port)
                 args._nt_cfg = cfg
+                # Record that we ASKED before checking whether it worked: if it
+                # half-worked we still own turning it off again.
                 args._nt_we_started = True
+                if not await set_nt_server(args.host, cfg, True, args.port, log):
+                    log("   continuing without it; sampling will fall back to "
+                        "the throttled websocket")
     try:
         return await _run_inner(args, log, progress, on_camera)
     finally:
         if args._nt_we_started:
-            log("stopping the NetworkTables server we started")
-            await set_nt_server(args.host, args._nt_cfg, False, args.port)
+            # Log AFTER the read-back, not before it. This line used to print
+            # unconditionally and was the only record anyone had.
+            if await set_nt_server(args.host, args._nt_cfg, False, args.port, log):
+                log("stopped the NetworkTables server we started")
+            else:
+                log("!! COULD NOT STOP the NetworkTables server we started - "
+                    "PhotonVision is still serving NetworkTables and will fight "
+                    "the roboRIO. Turn runNTServer off in the dashboard.")
 
 
 async def _run_inner(args, log=print, progress=None, on_camera=None):
@@ -1787,8 +1797,8 @@ async def read_network_config(host, port=5800):
     return None
 
 
-async def set_nt_server(host, cfg, enabled, port=5800):
-    """Turn PhotonVision's own NT server on or off, live.
+async def set_nt_server(host, cfg, enabled, port=5800, log=None, timeout=20.0):
+    """Turn PhotonVision's own NT server on or off, live, and CONFIRM it.
 
     Applied by NetworkTablesManager.setConfig() without restarting PhotonVision.
     Send the WHOLE config with one field changed - the endpoint also calls
@@ -1796,8 +1806,16 @@ async def set_nt_server(host, cfg, enabled, port=5800):
     would let Jackson default-fill fields and could take the coprocessor off the
     network. Verified: posting the config back unchanged is a clean no-op.
 
-    The HTTP connection drops without a response while the network stack bounces,
-    so a failed read is expected and is NOT an error.
+    The POST's own reply proves nothing either way: the HTTP connection drops
+    without a response while the network stack bounces, so a failed read is
+    expected. That was used as licence to swallow EVERY exception and return, and
+    the caller then logged "stopping the NetworkTables server we started"
+    unconditionally - while runNTServer has been found left True after runs that
+    all claimed to have stopped it. Read the config back instead, and say what it
+    actually says. Returns True only if the observed state is the one asked for.
+
+    The wait is polled rather than two hard-coded 4 s sleeps - 8 s of every run
+    spent whether or not anything had happened yet.
     """
     import urllib.request, urllib.error
     body = dict(cfg)
@@ -1806,13 +1824,37 @@ async def set_nt_server(host, cfg, enabled, port=5800):
         "http://%s:%d/api/settings/general" % (host, port),
         data=json.dumps(body).encode(), method="POST",
         headers={"Content-Type": "application/json"})
+
     def _post():
         try:
             urllib.request.urlopen(req, timeout=15).read()
+            return None
+        except Exception as exc:
+            return exc            # expected: the stack restarts under the reply
+
+    posted = await asyncio.get_event_loop().run_in_executor(None, _post)
+    t0 = time.time()
+    seen = None
+    while time.time() - t0 < timeout:
+        await asyncio.sleep(0.5)
+        try:
+            cur = await asyncio.wait_for(read_network_config(host, port), 8)
         except Exception:
-            pass                  # connection dropped as the stack restarts
-    await asyncio.get_event_loop().run_in_executor(None, _post)
-    await asyncio.sleep(4.0)
+            continue              # websocket is down while the stack bounces
+        if not cur:
+            continue
+        seen = cur.get("runNTServer")
+        if bool(seen) == bool(enabled):
+            if log:
+                log("   PhotonVision's NT server is %s - confirmed after %.1f s"
+                    % ("ON" if enabled else "OFF", time.time() - t0))
+            return True
+    if log:
+        log("   !! PhotonVision's NT server did NOT go %s: runNTServer still "
+            "reads %r after %.0f s%s"
+            % ("on" if enabled else "off", seen, time.time() - t0,
+               " (POST raised %s)" % type(posted).__name__ if posted else ""))
+    return False
 
 
 def nt_server_reachable(server, wait=4.0):
@@ -2552,8 +2594,10 @@ def main():
                     if getattr(args, "_nt_we_started", False):
                         cfg = asyncio.run(read_network_config(args.host, args.port))
                         if cfg:
-                            asyncio.run(set_nt_server(args.host, cfg, False, args.port))
-                            print("  turned PhotonVision's NT server back off")
+                            ok = asyncio.run(set_nt_server(args.host, cfg, False,
+                                                           args.port, print))
+                            print("  turned PhotonVision's NT server back off" if ok
+                                  else "  !! PhotonVision's NT server is STILL ON")
                 except Exception:
                     pass
                 sys.exit(0)
