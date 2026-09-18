@@ -1259,15 +1259,23 @@ async def restore_pending(host, port=5800):
             except Exception:
                 continue
             ok = False
-            try:
-                await asyncio.sleep(0.5)
-                live = await pv.cameras_fresh(timeout=8)
-                got = next((c for c in live if c["uniqueName"] == unique), None)
-                if got:
-                    ok = all(_matches(got["settings"].get(k), v)
-                             for k, v in original.items())
-            except Exception:
-                ok = False
+            # Read back more than once. PhotonVision's cameraSettings broadcast
+            # lags a second or two behind a write, so a single look 0.5 s later
+            # reports the PREVIOUS value: measured on a systemctl stop mid-sweep,
+            # this logged "!! UNVERIFIED ... check these by hand" while the camera
+            # was in fact already back at 1500 us / gain 100. A restore that cries
+            # wolf is worse than no check at all.
+            for _try in range(3):
+                try:
+                    await asyncio.sleep(1.5)
+                    live = await pv.cameras_fresh(timeout=8)
+                    got = next((c for c in live if c["uniqueName"] == unique), None)
+                    if got and all(_matches(got["settings"].get(k), v)
+                                   for k, v in original.items()):
+                        ok = True
+                        break
+                except Exception:
+                    pass
             done.append((unique, dict(original), ok))
             if ok:
                 PENDING_RESTORE.pop(unique, None)
@@ -1989,6 +1997,69 @@ def _install_signal_handlers():
             pass          # not the main thread, or not supported here
 
 
+async def _guard_signals(coro):
+    """Run `coro` with SIGTERM/SIGHUP cancelling it ON the event loop.
+
+    signal.signal() is kept as the fallback for the window before the loop
+    exists and for the restore afterwards, but it is not the mechanism: its
+    handler raises from whatever bytecode the main thread happens to be running,
+    which can be inside websockets' own cleanup or inside a `finally`.
+    loop.add_signal_handler is the documented asyncio path - the callback runs
+    between loop callbacks and cancels the task at an await point, so
+    tune_camera's handler gets a LIVE loop to restore on rather than one that is
+    already unwinding.
+
+    MEASURED, because the bug report for this was wrong and the wrong diagnosis
+    is worth recording. signal.signal was not broken: kill -TERM to the PYTHON
+    process restored the camera 14 times out of 14 on this rig (8 different kill
+    positions through a sweep, 4 on the --optimise-gain path, 2 repeats), on both
+    this revision and dc49bcd. The reported "exit 143, no INTERRUPTED line,
+    camera left at 6292 us" is a different failure, and it reproduces on demand:
+    if photontune is launched under a shell wrapper - `sh -c "python3
+    photontune.py ..." &` - and the WRAPPER is killed, the wrapper exits 143
+    (default disposition, no Python involved at all), python is never signalled,
+    survives as an orphan, and abandons the sweep mid-flight. Verified: wrapper
+    EXIT=143, `pgrep` still listing the python pid afterwards, log ending at
+    "exposure 6292". Nothing inside the process can fix that; kill the python
+    process, or use `systemctl stop`, which does.
+    The missing INTERRUPTED line has its own separate explanation: on the
+    --optimise-gain path tune_camera is called with log=lambda m: None, so that
+    line is suppressed even when the restore works perfectly.
+    """
+    import signal
+    loop = asyncio.get_event_loop()
+    task = asyncio.ensure_future(coro)
+    hit = {}
+
+    def _cancel(signum):
+        hit["sig"] = signum
+        task.cancel()
+
+    installed = []
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            loop.add_signal_handler(sig, _cancel, sig)
+            installed.append(sig)
+        except (NotImplementedError, RuntimeError, ValueError, AttributeError, OSError):
+            pass                  # Windows, or not the main thread
+    try:
+        return await task
+    except asyncio.CancelledError:
+        if hit:
+            raise Terminated("signal %d" % hit["sig"]) from None
+        raise
+    finally:
+        for sig in installed:
+            try:
+                loop.remove_signal_handler(sig)
+            except Exception:
+                pass
+        # remove_signal_handler puts the disposition back to SIG_DFL, not back to
+        # ours - so without this the restore that runs AFTER the loop would die
+        # on a second SIGTERM with no cleanup at all.
+        _install_signal_handlers()
+
+
 def main():
     _install_signal_handlers()
     args = build_parser().parse_args()
@@ -2006,7 +2077,7 @@ def main():
     if args.daemon:
         try:
             try:
-                asyncio.run(daemon(args))
+                asyncio.run(_guard_signals(daemon(args)))
             except (KeyboardInterrupt, Terminated):
                 # systemd stops the daemon with SIGTERM, and the daemon is the
                 # DEPLOYED mode. Without this the signal unwound to the top with a
@@ -2031,7 +2102,7 @@ def main():
     # the restore has to hang off the exit, not off an exception.
     try:
         try:
-            results = asyncio.run(run(args))
+            results = asyncio.run(_guard_signals(run(args)))
         except (ConnectionError, LookupError) as exc:
             sys.exit("photontune: %s" % exc)
         except (KeyboardInterrupt, Terminated):
