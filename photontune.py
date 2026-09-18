@@ -772,7 +772,7 @@ async def calibrate_reference_bias(args, log=print):
     return out
 
 
-async def optimise_gain(pv, cam, args, log=print, progress=None):
+async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=False):
     """Find the (gain, exposure) pair giving the SHORTEST exposure that still sees
     all the tags - because exposure costs motion blur and gain only costs noise.
 
@@ -818,7 +818,8 @@ async def optimise_gain(pv, cam, args, log=print, progress=None):
             args.min_exposure = max(saved_min, prev / 2.5)
             args.max_exposure = min(saved_max, prev * 2.5)
             args.steps = max(3, min(saved_n, 4))
-        r = await tune_camera(pv, cam, args, log=lambda m: None, progress=None)
+        r = await tune_camera(pv, cam, args, log=lambda m: None, progress=None,
+                              skip_baseline=skip_baseline)
         exp = r.get("applied") or (r.get("cliff") and None)
         if r.get("applied") and r.get("samples"):
             best = min((x for x in r["samples"] if x["passes"]),
@@ -984,7 +985,28 @@ async def _tune_all(pv, cams, args, log, progress, on_camera, results):
             if on_camera:
                 on_camera(cam["nickname"], idx, len(cams))
             if args.optimise_gain:
-                r = await optimise_gain(pv, cam, args, log, cam_progress)
+                # Structural settings BEFORE the gain search, not inside it.
+                # optimise_gain runs tune_camera with its logging discarded, so a
+                # baseline failure was both invisible and too late: measured, a
+                # camera left at inputImageRotationMode=1 made all six gain trials
+                # report "no passing exposure" - six full sweeps burned against a
+                # camera that was broken in a way the tool already knew how to fix,
+                # and the fix only landed afterwards in the fallback path.
+                if getattr(args, "baseline", True):
+                    _ch, _fl = await assert_baseline(pv, cam, args, log)
+                    if _ch:
+                        fresh = await pv.cameras_fresh(timeout=8)
+                        newer = next((c for c in fresh
+                                      if c["uniqueName"] == cam["uniqueName"]), None)
+                        if newer:
+                            cam = dict(cam)
+                            cam["settings"] = newer["settings"]
+                    if _fl:
+                        log("   !! baseline did not fully apply: %s"
+                            % ", ".join(str(f[0]) for f in _fl))
+                        log("   !! tuning on top of settings that are still wrong")
+                r = await optimise_gain(pv, cam, args, log, cam_progress,
+                                        skip_baseline=True)
                 if r is not None:
                     results.append(r)
                     continue
@@ -1211,7 +1233,7 @@ class NTResults:
 # while its neighbour sat at 40, producing two tunes that could not be compared.
 
 BASELINE_ALWAYS = {
-    "inputImageRotationMode": ("DEG_0", 0,
+    "inputImageRotationMode": (0, 0,
         "Non-zero rotation corrupts the multi-tag pose by ~0.4 m while the "
         "published corners stay correct - it fails silently. PhotonVision #2613. "
         "A sideways mount belongs in robotToCamera, not here."),
@@ -1224,11 +1246,11 @@ BASELINE_ALWAYS = {
         "It also makes tuning meaningless - the camera would fight every step."),
     "cameraRedGain": (0, 0, "Mono sensor; white balance is meaningless."),
     "cameraBlueGain": (0, 0, "Mono sensor; white balance is meaningless."),
-    "targetModel": ("kAprilTag6p5in_36h11", 7,
+    "targetModel": (7, 7,
         "Physical tag size. Sets the SCALE of every distance measured. Wrong "
         "here and all ranges are proportionally wrong while looking perfectly "
         "self-consistent. 6.5 in = 165.1 mm is the FRC standard."),
-    "tagFamily": ("kTag36h11", 0, "The family FRC uses."),
+    "tagFamily": (0, 0, "The family FRC uses."),
 }
 
 # The gain a tune STARTS from, unless --gain says otherwise.
