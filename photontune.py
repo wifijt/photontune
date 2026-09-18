@@ -1097,6 +1097,9 @@ async def _run_inner(args, log=print, progress=None, on_camera=None):
                     for c in cams:
                         r = NTResults(ntsrv, c["nickname"])
                         if not r.available():
+                            r.close()
+                            for done in readers.values():
+                                done.close()
                             readers = {}
                             break
                         readers[c["nickname"]] = r
@@ -1257,15 +1260,27 @@ def nt_server_reachable(server, wait=4.0):
         import ntcore
     except ImportError:
         return False
-    inst = ntcore.NetworkTableInstance.getDefault()
-    if not inst.isConnected():
+    # A PRIVATE instance. This used to call startClient4 on the DEFAULT instance -
+    # the same singleton the daemon publishes its status table on - under a
+    # different identity, which orphaned the daemon's publishers. Measured: after
+    # a clean tune the daemon's own log said ok=True while the NT table a team
+    # reads still said "running..." and ok=False, forever. Only `heartbeat`, which
+    # is written every loop, kept moving.
+    inst = ntcore.NetworkTableInstance.create()
+    try:
         inst.startClient4("photontune-probe")
         inst.setServer(server, ntcore.NetworkTableInstance.kDefaultPort4)
-    end = time.time() + wait
-    while time.time() < end:
-        if inst.isConnected():
-            return True
-        time.sleep(0.2)
+        end = time.time() + wait
+        while time.time() < end:
+            if inst.isConnected():
+                return True
+            time.sleep(0.2)
+    finally:
+        try:
+            inst.stopClient()
+            ntcore.NetworkTableInstance.destroy(inst)
+        except Exception:
+            pass
     return False
 
 
@@ -1295,14 +1310,26 @@ class NTResults:
         from photonlibpy.targeting.photonPipelineResult import PhotonPipelineResult
         self._Packet = Packet
         self._Result = PhotonPipelineResult
-        self.inst = ntcore.NetworkTableInstance.getDefault()
-        if not self.inst.isConnected():
-            self.inst.startClient4("photontune-nt")
-            self.inst.setServer(server, ntcore.NetworkTableInstance.kDefaultPort4)
+        # Private instance, for the same reason as nt_server_reachable: sampling
+        # must not re-point or re-identify the connection the daemon publishes on.
+        self.inst = ntcore.NetworkTableInstance.create()
+        self._own_inst = True
+        self.inst.startClient4("photontune-nt")
+        self.inst.setServer(server, ntcore.NetworkTableInstance.kDefaultPort4)
+        self._tbl_name = nickname
         tbl = self.inst.getTable("photonvision").getSubTable(nickname)
         self.sub = tbl.getRawTopic("rawBytes").subscribe(
             "rawBytes", b"", ntcore.PubSubOptions(periodic=0.005, sendAll=True,
                                                   keepDuplicates=True))
+
+    def close(self):
+        """Release the private NT client. Without this every reader leaks one."""
+        try:
+            self.inst.stopClient()
+            import ntcore as _nt
+            _nt.NetworkTableInstance.destroy(self.inst)
+        except Exception:
+            pass
 
     def newest_capture(self):
         """captureTimestampMicros of the latest frame, or None."""
