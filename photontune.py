@@ -552,6 +552,11 @@ def tune_failed(r, args=None):
         return True
     if getattr(args, "baseline_only", False):
         return bool(r.get("error")) and "baseline only" not in str(r.get("error"))
+    if getattr(args, "dry_run", False):
+        # --dry-run applies nothing by design, so `applied` cannot be the test.
+        # It used to skip the check altogether, which is how a dry run that
+        # measured nothing at all still exited 0.
+        return not r.get("would_apply")
     return not r.get("applied")
 
 
@@ -859,7 +864,14 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
             result["over_blur_budget"] = round(predicted, 1)
 
         if args.dry_run:
-            log("   dry run - restoring original")
+            log("   dry run - would set exposure %.0f at gain %g; restoring original"
+                % (chosen, gain))
+            # Record the choice where the harvester looks. The gain search
+            # harvested on r["applied"], which dry-run never sets, so
+            # --optimise-gain --dry-run logged "no passing exposure" for every
+            # candidate while the suppressed trial log showed each one
+            # succeeding, then fell through to yet another full sweep.
+            result["would_apply"] = chosen
             await pv.set_setting(unique, **original)
         else:
             mark = capture_mark(args, cam)
@@ -1055,7 +1067,7 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
         args.min_exposure, args.max_exposure, args.steps = saved_bounds
         args._gain_scan_follows = saved_follows
 
-    exposure = r.get("applied")
+    exposure = r.get("applied") or r.get("would_apply")
     if not exposure:
         return r                 # the sweep already said why, in the real log
 
@@ -1186,7 +1198,12 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
         r["gain"] = pick[0]
         PENDING_RESTORE.pop(unique, None)
     else:
+        log("   dry run - would set gain %d at exposure %.0f; restoring original"
+            % (pick[0], exposure))
+        r["would_apply"] = exposure
+        r["would_gain"] = pick[0]
         await pv.set_setting(unique, **original)
+        await asyncio.sleep(0.4)
         PENDING_RESTORE.pop(unique, None)
     if progress:
         progress(1.0)
@@ -2353,6 +2370,10 @@ def main():
                 if r.get("applied"):
                     print("  %-14s exposure -> %.0f%s" % (r["camera"], r["applied"],
                                                           "  (fallback)" if r.get("fellback") else ""))
+                elif r.get("would_apply"):
+                    print("  %-14s would set exposure -> %.0f, gain %s  (dry run)"
+                          % (r["camera"], r["would_apply"],
+                             r.get("would_gain", r.get("gain"))))
                 else:
                     print("  %-14s unchanged (%s)" % (r["camera"], r.get("error", "dry run")))
         # --baseline-only never sets `applied` by design, so "no applied" cannot
