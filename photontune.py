@@ -253,7 +253,7 @@ class Photon:
         if self.ws:
             await self.ws.close()
 
-    async def _pump(self, seconds, on_message):
+    async def _pump(self, seconds, on_message, stop_when=None):
         t0 = time.time()
         while time.time() - t0 < seconds:
             remaining = seconds - (time.time() - t0)
@@ -266,9 +266,22 @@ class Photon:
             msg = msgpack.unpackb(raw, raw=False)
             if isinstance(msg, dict):
                 on_message(msg)
+            if stop_when is not None and stop_when():
+                return
 
     async def cameras(self, timeout=12):
-        """[{uniqueName, nickname, settings}] - PhotonVision may have several."""
+        """[{uniqueName, nickname, settings, calibrations, formats, bounds}].
+
+        Returns as soon as the first cameraSettings arrives - PhotonVision sends
+        it on connect (measured ~0.14 s). Without the early exit this waited out
+        the whole 12 s timeout on every single run, because updatePipelineResult
+        keeps arriving so the recv never times out.
+
+        Keeps the calibration and bounds data. It costs nothing to retain - it is
+        in the same message - and discarding it was why the tool could not warn
+        about a missing calibration, and why it guessed fx from a CLI default
+        instead of reading the camera's own intrinsics.
+        """
         found = {}
         def handle(msg):
             for cam in msg.get("cameraSettings", []) or []:
@@ -276,12 +289,20 @@ class Photon:
                     "uniqueName": cam["uniqueName"],
                     "nickname": cam.get("nickname", "?"),
                     "settings": cam["currentPipelineSettings"],
+                    "calibrations": cam.get("calibrations") or [],
+                    "formats": cam.get("videoFormatList") or [],
+                    "minExposureRaw": cam.get("minExposureRaw"),
+                    "maxExposureRaw": cam.get("maxExposureRaw"),
                 }
-        await self._pump(timeout, handle)
+        await self._pump(timeout, handle, stop_when=lambda: bool(found))
         return list(found.values())
 
-    # PhotonVision SILENTLY DISCARDS a float sent to an integer-typed setting.
-    # No error, no log line - the write simply does not happen. Coerce them.
+    # PhotonVision discards a float sent to an integer-typed setting: setProperty
+    # does propField.setInt(settings, (Integer) value), so a Double raises
+    # ClassCastException and the write does not happen. It is NOT silent - it is
+    # logged at ERROR in PhotonVision's journal ("Unknown exception when setting
+    # PSC prop!") - but the websocket API returns nothing, so the only way a
+    # client learns of it is to read the coprocessor's log. Coerce them.
     INT_SETTINGS = {"cameraGain", "cameraBrightness", "decimate", "numIterations",
                     "threads", "decisionMargin", "cameraRedGain", "cameraBlueGain",
                     "cameraVideoModeIndex", "pipelineIndex"}
@@ -398,6 +419,90 @@ def capture_mark(args, cam):
     return reader.newest_capture() if reader is not None else None
 
 
+
+def active_format(cam):
+    """The {width,height,fps} PhotonVision is currently running on this camera."""
+    fmts = cam.get("formats") or {}
+    idx = cam.get("settings", {}).get("cameraVideoModeIndex")
+    if idx is None:
+        return None
+    for key in (idx, str(idx), int(idx) if str(idx).lstrip("-").isdigit() else idx):
+        if isinstance(fmts, dict) and key in fmts:
+            return fmts[key]
+    if isinstance(fmts, list):
+        try:
+            return fmts[int(idx)]
+        except (IndexError, ValueError, TypeError):
+            return None
+    return None
+
+
+def calibration_for(cam):
+    """The calibration matching the ACTIVE resolution, or None.
+
+    PhotonVision stores a calibration per resolution. Having "a calibration" is
+    not enough - it has to be for the mode the camera is actually running.
+    """
+    fmt = active_format(cam)
+    if not fmt:
+        return None
+    w, h = fmt.get("width"), fmt.get("height")
+    for cal in cam.get("calibrations") or []:
+        res = cal.get("resolution") or {}
+        if abs(float(res.get("width", -1)) - float(w)) < 1 and \
+           abs(float(res.get("height", -1)) - float(h)) < 1:
+            return cal
+    return None
+
+
+def camera_fx(cam, fallback=None):
+    """Focal length in pixels from the camera's OWN intrinsics.
+
+    The blur budget is blur_px = omega * t * fx, so fx sets the whole scale of
+    it. A hard-coded default is only right for one camera at one resolution -
+    on this rig 1105.9 at 1280x800 becomes 570.5 at 640x400, so a default
+    carried across a resolution change overstates blur by 1.94x and buys gain
+    nobody needed.
+    """
+    cal = calibration_for(cam)
+    if cal:
+        ci = cal.get("cameraIntrinsics") or {}
+        data = ci.get("data") or ci.get("dataValue")
+        if data and len(data) >= 1 and data[0]:
+            return float(data[0])
+    return fallback
+
+
+def calibration_problem(cam):
+    """Why this camera cannot produce a 3D pose, or None if it can.
+
+    Checked BEFORE tuning because the failure is otherwise indistinguishable
+    from darkness: with solvePNP on and no calibration for the active
+    resolution, PhotonVision publishes nothing at all, so every exposure scores
+    zero, gain escalates to the ceiling, and the tool blames the lighting. The
+    one config problem it actually is never gets named.
+    """
+    st = cam.get("settings", {})
+    if not st.get("solvePNPEnabled"):
+        return None
+    fmt = active_format(cam)
+    if fmt is None:
+        return ("cannot tell which video mode is active (cameraVideoModeIndex=%r)"
+                % st.get("cameraVideoModeIndex"))
+    if calibration_for(cam) is None:
+        have = ["%gx%g" % ((c.get("resolution") or {}).get("width", 0),
+                           (c.get("resolution") or {}).get("height", 0))
+                for c in (cam.get("calibrations") or [])]
+        return ("no calibration for the active mode %gx%g (calibrated: %s). "
+                "With solvePNP enabled PhotonVision emits NOTHING in this state - "
+                "not a 2D fallback - so every exposure will look equally dead and "
+                "no amount of tuning can help. Calibrate this resolution, or "
+                "switch to one that is calibrated."
+                % (fmt.get("width", 0), fmt.get("height", 0),
+                   ", ".join(have) if have else "none"))
+    return None
+
+
 async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
                       skip_baseline=False):
     name = cam["nickname"]
@@ -427,6 +532,13 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
                 % (gain, original["cameraGain"]))
     result = {"camera": name, "uniqueName": unique, "original": original,
               "applied": None, "samples": [], "cliff": None, "gain": gain}
+
+    problem = calibration_problem(cam)
+    if problem:
+        log("   !! CALIBRATION: %s" % problem)
+        result["error"] = "no calibration for the active resolution"
+        result["calibration_problem"] = problem
+        return result
 
     try:
         # Structural settings FIRST. Tuning exposure against a crushed brightness
@@ -472,7 +584,20 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
         PENDING_RESTORE[unique] = dict(original)
         samples = []
         blanks = 0
-        sweep = geometric_sweep(args.min_exposure, args.max_exposure, args.steps)
+        # Clamp to the camera's OWN reported bounds. PhotonVision clamps the
+        # hardware call but stores the unclamped value, so a sweep past the limit
+        # reads back "verified" while every step sits at the same real exposure
+        # and scores identically. Bounds differ per model: this CSI OV9281 reports
+        # 7-80000 us, while USB variants report entirely different ranges.
+        lo, hi = args.min_exposure, args.max_exposure
+        cmin, cmax = cam.get("minExposureRaw"), cam.get("maxExposureRaw")
+        if cmin is not None and lo < float(cmin):
+            log("   raising sweep floor %.0f -> %.0f (camera minimum)" % (lo, float(cmin)))
+            lo = float(cmin)
+        if cmax is not None and hi > float(cmax):
+            log("   lowering sweep ceiling %.0f -> %.0f (camera maximum)" % (hi, float(cmax)))
+            hi = float(cmax)
+        sweep = geometric_sweep(lo, hi, args.steps)
         for step_i, exposure in enumerate(sweep):
             if progress:
                 progress(step_i / float(len(sweep)))
@@ -612,7 +737,11 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
         result["cliff"] = cliff
         log("   cliff ~%.0f (bracketed), shortest verified pass %.0f, bias %.2f  ->  %.0f"
             % (cliff, shortest.exposure, bias, chosen))
-        blur = lambda deg: math.radians(deg) * (chosen / 1e6) * args.fx
+        fx = camera_fx(cam, args.fx)
+        if abs(fx - args.fx) > 1.0:
+            log("   fx %.1f from this camera's calibration (default was %.1f)"
+                % (fx, args.fx))
+        blur = lambda deg: math.radians(deg) * (chosen / 1e6) * fx
         log("   predicted blur: %.1f px @90deg/s, %.1f px @%.0fdeg/s"
             % (blur(90), blur(args.blur_rate), args.blur_rate))
 
@@ -687,15 +816,25 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
         # asyncio.CancelledError is the same family. Restore, then re-raise those
         # two so the interrupt still ends the program.
         log("   %s (%s) - restoring original settings"
-            % ("INTERRUPTED" if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError))
+            % ("INTERRUPTED" if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError, Terminated))
                else "ERROR", exc or type(exc).__name__))
+        restored = False
         try:
             await pv.set_setting(unique, **original)
             await asyncio.sleep(0.4)          # let the write reach PhotonVision
+            restored = True
         except BaseException:
             pass
-        PENDING_RESTORE.pop(unique, None)
-        if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
+        if restored:
+            PENDING_RESTORE.pop(unique, None)
+        else:
+            # The socket is gone, so nothing was restored - keep the record so
+            # main() can replay it on a fresh connection. Dropping it here meant
+            # a dropped websocket mid-sweep left the camera parked at whatever
+            # exposure was being tested, while the log claimed a restore.
+            PENDING_RESTORE[unique] = dict(original)
+            log("   restore did NOT reach the camera - will retry on a fresh connection")
+        if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError, Terminated)):
             PENDING_RESTORE[unique] = dict(original)   # loop is dying; main() retries
             raise
         result["error"] = str(exc)
@@ -992,6 +1131,16 @@ async def _tune_all(pv, cams, args, log, progress, on_camera, results):
                 # report "no passing exposure" - six full sweeps burned against a
                 # camera that was broken in a way the tool already knew how to fix,
                 # and the fix only landed afterwards in the fallback path.
+                _prob = calibration_problem(cam)
+                if _prob:
+                    log("── %s ──" % cam["nickname"])
+                    log("   !! CALIBRATION: %s" % _prob)
+                    results.append({"camera": cam["nickname"],
+                                    "uniqueName": cam["uniqueName"],
+                                    "applied": None,
+                                    "error": "no calibration for the active resolution",
+                                    "calibration_problem": _prob})
+                    continue
                 if getattr(args, "baseline", True):
                     _ch, _fl = await assert_baseline(pv, cam, args, log)
                     if _ch:
@@ -1022,6 +1171,10 @@ async def _tune_all(pv, cams, args, log, progress, on_camera, results):
 
 
 # ───────────────────────── B: NetworkTables trigger ─────────────────────────
+
+class Terminated(BaseException):
+    """SIGTERM arrived. BaseException so it unwinds like KeyboardInterrupt does."""
+
 
 # Cameras whose settings we have changed and not yet put back. Ctrl-C during a
 # sweep leaves the camera at whatever exposure was being tested - blind, if that
@@ -1276,6 +1429,15 @@ BASELINE_ALWAYS = {
 BASELINE_START_GAIN = 0
 
 BASELINE_DEFAULT = {
+    "decisionMargin": (35, 35,
+        "Detection confidence floor - the goal's 'cutoff'. PhotonVision drops any "
+        "detection below it before anything else runs, so a human who sets it to "
+        "100 makes every tag vanish and the tuner reports a lighting problem. 50 "
+        "was measured rejecting a valid tag that 35 recovered; lower admits false "
+        "positives, which multi-tag rejects anyway."),
+    "hammingDist": (0, 0,
+        "Bit errors tolerated when decoding. Above 0 admits misreads, and a "
+        "misread tag poisons the multi-tag solve with a confident wrong position."),
     "threads": (1, 1,
         "PER CAMERA. Matching physical cores sounds right and is wrong: the "
         "detector's pool competes with capture, streaming and the JVM. Measured "
@@ -1477,6 +1639,7 @@ async def daemon(args, log=print):
                 args.reference_tag = nt_tag if nt_tag >= 0 else None
                 args.reference_range = nt_range if nt_range > 0 else None
 
+                run_ok = {"value": False, "summary": ""}
                 busy.setBoolean(True)
                 ok_entry.setBoolean(False)
                 progress_e.setDouble(0.0)
@@ -1515,6 +1678,8 @@ async def daemon(args, log=print):
                         line += ("; FAILED: " + ", ".join(
                             "%s (%s)" % (r["camera"], r.get("error", "?")) for r in failed))
                     every_camera_ok = bool(applied) and not failed
+                    run_ok["value"] = every_camera_ok
+                    run_ok["summary"] = line or "no cameras tuned"
                     ok_entry.setBoolean(every_camera_ok)
                     summary.setString(line or "no cameras tuned")
                     status.setString(("DONE - " if every_camera_ok else "DONE WITH ERRORS - ") + line)
@@ -1522,10 +1687,20 @@ async def daemon(args, log=print):
                     progress_e.setDouble(1.0)
                     log("done: " + line)
                 except Exception as exc:
+                    run_ok["value"] = False
+                    run_ok["summary"] = "error: %s" % exc
                     ok_entry.setBoolean(False)
                     summary.setString("error: %s" % exc)
                     status.setString("error: %s" % exc)
                     log("error: %s" % exc)
+                    # The daemon is the DEPLOYED mode, and it never replayed the
+                    # restore - so a tune that died mid-sweep left the camera at
+                    # whatever exposure was being tested until a human noticed.
+                    try:
+                        for unique, orig in await restore_pending(args.host, args.port):
+                            log("restored %s to %s" % (unique, orig))
+                    except Exception as rexc:
+                        log("restore after error also failed: %s" % rexc)
                 finally:
                     busy.setBoolean(False)
                     hold_e.setBoolean(False)
@@ -1534,10 +1709,16 @@ async def daemon(args, log=print):
                     run_entry.setBoolean(False)
                     if boot_fire:
                         boot_ran.setBoolean(True)
-                        boot_ok.setBoolean(ok_entry.getBoolean(False))
-                        boot_sum.setString(summary.getString("")[:200])
+                        # Publish what we COMPUTED. Reading it back through NT
+                        # here returned the default False, because the run has
+                        # already stopped PhotonVision's NT server by this point
+                        # and this client has disconnected - so a tune where every
+                        # camera succeeded still reported ok=False at boot, which
+                        # is the one signal a team would actually trust.
+                        boot_ok.setBoolean(bool(run_ok["value"]))
+                        boot_sum.setString(str(run_ok["summary"])[:200])
                         log("autorun done: ok=%s %s"
-                            % (ok_entry.getBoolean(False), summary.getString("")))
+                            % (run_ok["value"], run_ok["summary"]))
         last = trigger
         await asyncio.sleep(0.2)
 
@@ -1658,7 +1839,29 @@ def build_parser():
     return p
 
 
+def _install_signal_handlers():
+    """Turn SIGTERM into an exception so `finally` blocks actually run.
+
+    systemd stops a unit with SIGTERM. Python's default handler exits the
+    interpreter immediately - no `finally`, no restore - so under the deployed
+    systemd configuration the camera was left at whatever exposure the sweep was
+    testing, which can be the blind end of the range. Raising instead lets the
+    same unwinding that Ctrl-C already used do its job.
+    """
+    import signal
+
+    def _raise(signum, _frame):
+        raise Terminated("signal %d" % signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _raise)
+        except (ValueError, OSError, AttributeError):
+            pass          # not the main thread, or not supported here
+
+
 def main():
+    _install_signal_handlers()
     args = build_parser().parse_args()
     if getattr(args, "fast", False):
         args.dwell = min(args.dwell, 0.9)
@@ -1672,14 +1875,35 @@ def main():
             sys.exit("photontune: %s" % exc)
         return
     if args.daemon:
-        asyncio.run(daemon(args))
+        try:
+            asyncio.run(daemon(args))
+        except (KeyboardInterrupt, Terminated):
+            # systemd stops the daemon with SIGTERM, and the daemon is the
+            # DEPLOYED mode. Without this the signal unwound to the top with a
+            # traceback and, worse, any camera left mid-sweep stayed there.
+            print("photontune: stopping - restoring any camera left mid-tune")
+            try:
+                for unique, orig in asyncio.run(restore_pending(args.host, args.port)):
+                    print("  restored %s to %s" % (unique, orig))
+            except Exception as exc:
+                print("  restore failed: %s" % exc)
+            # and never leave PhotonVision's NT server running behind us
+            try:
+                if getattr(args, "_nt_we_started", False):
+                    cfg = asyncio.run(read_network_config(args.host, args.port))
+                    if cfg:
+                        asyncio.run(set_nt_server(args.host, cfg, False, args.port))
+                        print("  turned PhotonVision's NT server back off")
+            except Exception:
+                pass
+            sys.exit(0)
         return
     t0 = time.time()
     try:
         results = asyncio.run(run(args))
     except (ConnectionError, LookupError) as exc:
         sys.exit("photontune: %s" % exc)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, Terminated):
         # The interrupted loop could not complete the restore. Do it on a new one.
         if PENDING_RESTORE:
             print("\ninterrupted - putting camera settings back...")
@@ -1701,7 +1925,24 @@ def main():
             else:
                 print("  %-14s unchanged (%s)" % (r["camera"], r.get("error", "dry run")))
     if not args.dry_run:
-        failed = [r for r in results if not r.get("applied")]
+        # --baseline-only never sets `applied` by design, so "no applied" cannot
+        # mean failure in that mode. A baseline that did NOT take, or a rejected
+        # setting, MUST mean failure in every mode - previously both were recorded
+        # and never consulted, so the tool reported success with a 90-degree
+        # rotated image and a gain that never applied.
+        def _bad(r):
+            if r.get("calibration_problem") or r.get("baseline_failed") \
+                    or r.get("setting_rejected"):
+                return True
+            if getattr(args, "baseline_only", False):
+                return bool(r.get("error")) and "baseline only" not in str(r.get("error"))
+            return not r.get("applied")
+        failed = [r for r in results if _bad(r)]
+        if failed:
+            for r in failed:
+                why = (r.get("calibration_problem") or r.get("error")
+                       or ("baseline did not apply: %s" % r.get("baseline_failed")))
+                print("FAILED %s: %s" % (r.get("camera"), why))
         sys.exit(1 if (failed or not results) else 0)
 
 
