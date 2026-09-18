@@ -1241,7 +1241,14 @@ PENDING_RESTORE = {}
 
 
 async def restore_pending(host, port=5800):
-    """Put back anything a crash or Ctrl-C left changed. Safe to call twice."""
+    """Put back anything a crash or Ctrl-C left changed. Safe to call twice.
+
+    Returns [(uniqueName, original, verified)]. The read-back is the point: the
+    failure this exists for is a DEAD websocket, and set_setting on a socket that
+    is already dying returns without raising - so "we sent it" was never evidence
+    the camera took it, and the log said "restored" either way. Only a verified
+    entry is forgotten, so a caller that runs again still retries the rest.
+    """
     if not PENDING_RESTORE:
         return []
     done = []
@@ -1249,11 +1256,50 @@ async def restore_pending(host, port=5800):
         for unique, original in list(PENDING_RESTORE.items()):
             try:
                 await pv.set_setting(unique, **original)
-                await asyncio.sleep(0.5)
-                done.append((unique, original))
-                PENDING_RESTORE.pop(unique, None)
             except Exception:
-                pass
+                continue
+            ok = False
+            try:
+                await asyncio.sleep(0.5)
+                live = await pv.cameras_fresh(timeout=8)
+                got = next((c for c in live if c["uniqueName"] == unique), None)
+                if got:
+                    ok = all(_matches(got["settings"].get(k), v)
+                             for k, v in original.items())
+            except Exception:
+                ok = False
+            done.append((unique, dict(original), ok))
+            if ok:
+                PENDING_RESTORE.pop(unique, None)
+    return done
+
+
+def replay_pending(host, port=5800, log=print):
+    """Replay PENDING_RESTORE on a FRESH event loop. Never raises.
+
+    Belongs in a `finally`, not in an interrupt handler. The commonest way to
+    leave a camera mid-sweep is not an interrupt at all: a websocket death inside
+    tune_camera is caught, records PENDING_RESTORE, logs "will retry on a fresh
+    connection" and then returns NORMALLY - so the ordinary exit path ran, nobody
+    retried, and the camera sat at whatever exposure was being tested, which can
+    be the blind end of the range. Observed in 4 of 8 runs on this rig and in
+    both of the daemon's production boot runs.
+    """
+    if not PENDING_RESTORE:
+        return []
+    log("restoring %d camera(s) left mid-tune" % len(PENDING_RESTORE))
+    try:
+        done = asyncio.run(restore_pending(host, port))
+    except BaseException as exc:
+        log("  !! COULD NOT RESTORE (%s). Check the exposure by hand." % exc)
+        return []
+    for unique, orig, ok in done:
+        log("  %s %s -> exposure %s, gain %s"
+            % ("restored" if ok else "!! UNVERIFIED", unique[:8],
+               orig.get("cameraExposureRaw"), orig.get("cameraGain")))
+    if PENDING_RESTORE:
+        log("  !! still not put back: %s - check these by hand"
+            % ", ".join(u[:8] for u in PENDING_RESTORE))
     return done
 
 
@@ -1773,15 +1819,18 @@ async def daemon(args, log=print):
                     summary.setString("error: %s" % exc)
                     status.setString("error: %s" % exc)
                     log("error: %s" % exc)
-                    # The daemon is the DEPLOYED mode, and it never replayed the
-                    # restore - so a tune that died mid-sweep left the camera at
-                    # whatever exposure was being tested until a human noticed.
-                    try:
-                        for unique, orig in await restore_pending(args.host, args.port):
-                            log("restored %s to %s" % (unique, orig))
-                    except Exception as rexc:
-                        log("restore after error also failed: %s" % rexc)
                 finally:
+                    # The daemon is the DEPLOYED mode, and the replay used to sit
+                    # in the `except` branch only - which is the branch a dropped
+                    # websocket does NOT take, because tune_camera swallows it and
+                    # returns normally. Every exit path, or it is not a restore.
+                    try:
+                        for unique, orig, ok in await restore_pending(args.host, args.port):
+                            log("%s %s to %s"
+                                % ("restored" if ok else "UNVERIFIED restore of",
+                                   unique, orig))
+                    except Exception as rexc:
+                        log("restore replay failed: %s" % rexc)
                     busy.setBoolean(False)
                     hold_e.setBoolean(False)
                     hold_for_e.setString("")
@@ -1956,66 +2005,64 @@ def main():
         return
     if args.daemon:
         try:
-            asyncio.run(daemon(args))
-        except (KeyboardInterrupt, Terminated):
-            # systemd stops the daemon with SIGTERM, and the daemon is the
-            # DEPLOYED mode. Without this the signal unwound to the top with a
-            # traceback and, worse, any camera left mid-sweep stayed there.
-            print("photontune: stopping - restoring any camera left mid-tune")
             try:
-                for unique, orig in asyncio.run(restore_pending(args.host, args.port)):
-                    print("  restored %s to %s" % (unique, orig))
-            except Exception as exc:
-                print("  restore failed: %s" % exc)
-            # and never leave PhotonVision's NT server running behind us
-            try:
-                if getattr(args, "_nt_we_started", False):
-                    cfg = asyncio.run(read_network_config(args.host, args.port))
-                    if cfg:
-                        asyncio.run(set_nt_server(args.host, cfg, False, args.port))
-                        print("  turned PhotonVision's NT server back off")
-            except Exception:
-                pass
-            sys.exit(0)
+                asyncio.run(daemon(args))
+            except (KeyboardInterrupt, Terminated):
+                # systemd stops the daemon with SIGTERM, and the daemon is the
+                # DEPLOYED mode. Without this the signal unwound to the top with a
+                # traceback and, worse, any camera left mid-sweep stayed there.
+                print("photontune: stopping - restoring any camera left mid-tune")
+                # and never leave PhotonVision's NT server running behind us
+                try:
+                    if getattr(args, "_nt_we_started", False):
+                        cfg = asyncio.run(read_network_config(args.host, args.port))
+                        if cfg:
+                            asyncio.run(set_nt_server(args.host, cfg, False, args.port))
+                            print("  turned PhotonVision's NT server back off")
+                except Exception:
+                    pass
+                sys.exit(0)
+        finally:
+            replay_pending(args.host, args.port)
         return
     t0 = time.time()
+    # The `finally` is the whole fix. An interrupt was never the common case -
+    # a websocket death is caught inside tune_camera and returns NORMALLY, so
+    # the restore has to hang off the exit, not off an exception.
     try:
-        results = asyncio.run(run(args))
-    except (ConnectionError, LookupError) as exc:
-        sys.exit("photontune: %s" % exc)
-    except (KeyboardInterrupt, Terminated):
-        # The interrupted loop could not complete the restore. Do it on a new one.
-        if PENDING_RESTORE:
+        try:
+            results = asyncio.run(run(args))
+        except (ConnectionError, LookupError) as exc:
+            sys.exit("photontune: %s" % exc)
+        except (KeyboardInterrupt, Terminated):
+            # The interrupted loop could not complete the restore. Do it on a new one.
             print("\ninterrupted - putting camera settings back...")
-            try:
-                for unique, orig in asyncio.run(restore_pending(args.host, args.port)):
-                    print("  restored %s -> exposure %s"
-                          % (unique[:8], orig.get("cameraExposureRaw")))
-            except Exception as exc:
-                print("  !! COULD NOT RESTORE (%s). Check the exposure by hand." % exc)
-        sys.exit(130)
-    if args.json:
-        print(json.dumps(results, indent=2))
-    else:
-        print("\ncompleted in %.0f s" % (time.time() - t0))
-        for r in results:
-            if r.get("applied"):
-                print("  %-14s exposure -> %.0f%s" % (r["camera"], r["applied"],
-                                                      "  (fallback)" if r.get("fellback") else ""))
-            else:
-                print("  %-14s unchanged (%s)" % (r["camera"], r.get("error", "dry run")))
-    # --baseline-only never sets `applied` by design, so "no applied" cannot
-    # mean failure in that mode. A baseline that did NOT take, or a rejected
-    # setting, MUST mean failure in every mode - previously both were recorded
-    # and never consulted, so the tool reported success with a 90-degree
-    # rotated image and a gain that never applied.
-    failed = [r for r in results if tune_failed(r, args)]
-    if failed:
-        for r in failed:
-            why = (r.get("calibration_problem") or r.get("error")
-                   or ("baseline did not apply: %s" % r.get("baseline_failed")))
-            print("FAILED %s: %s" % (r.get("camera"), why))
-    sys.exit(1 if (failed or not results) else 0)
+            sys.exit(130)
+        if args.json:
+            print(json.dumps(results, indent=2))
+        else:
+            print("\ncompleted in %.0f s" % (time.time() - t0))
+            for r in results:
+                if r.get("applied"):
+                    print("  %-14s exposure -> %.0f%s" % (r["camera"], r["applied"],
+                                                          "  (fallback)" if r.get("fellback") else ""))
+                else:
+                    print("  %-14s unchanged (%s)" % (r["camera"], r.get("error", "dry run")))
+        # --baseline-only never sets `applied` by design, so "no applied" cannot
+        # mean failure in that mode. A baseline that did NOT take, or a rejected
+        # setting, MUST mean failure in every mode - previously both were recorded
+        # and never consulted, so the tool reported success with a 90-degree
+        # rotated image and a gain that never applied.
+        failed = [r for r in results if tune_failed(r, args)]
+        if failed:
+            for r in failed:
+                why = (r.get("calibration_problem") or r.get("error")
+                       or ("baseline did not apply: %s" % r.get("baseline_failed")))
+                print("FAILED %s: %s" % (r.get("camera"), why))
+        sys.exit(1 if (failed or not results) else 0)
+    finally:
+        # EVERY exit path, including the ordinary one and sys.exit above.
+        replay_pending(args.host, args.port)
 
 
 if __name__ == "__main__":
