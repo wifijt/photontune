@@ -503,8 +503,45 @@ def calibration_problem(cam):
     return None
 
 
+# Failures that must survive being handed up through a recursion or a search.
+#
+# Every one of these was recorded and then lost. tune_camera escalates gain with
+# `return await tune_camera(...)`, which discards the outer frame's dict, and the
+# gain search calls tune_camera with skip_baseline=True, so the frame that ran the
+# baseline is not the frame that returns. The record therefore belongs to the
+# CALLER, which is the only party present for the whole camera.
+FAILURE_KEYS = ("baseline_failed", "setting_rejected", "calibration_problem")
+
+
+def merge_failures(rec, r):
+    """Fold a tune result into the caller's per-camera record, keeping failures.
+
+    A plain dict.update() is not enough in either direction: the callee may know
+    about a rejected setting the caller does not, and the caller may know about a
+    baseline failure the callee (skip_baseline=True) never saw.
+    """
+    keep = {k: rec[k] for k in FAILURE_KEYS if rec.get(k)}
+    rec.update(r or {})
+    rec.update(keep)
+    return rec
+
+
+def tune_failed(r, args=None):
+    """Did this camera's tune fail? One definition, used by the CLI and the daemon.
+
+    The daemon used to judge on `applied` alone, so a camera that came back
+    rotated 90 degrees with a gain that never took still reported ok=true to the
+    dashboard - the one signal a team actually trusts.
+    """
+    if any(r.get(k) for k in FAILURE_KEYS):
+        return True
+    if getattr(args, "baseline_only", False):
+        return bool(r.get("error")) and "baseline only" not in str(r.get("error"))
+    return not r.get("applied")
+
+
 async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
-                      skip_baseline=False):
+                      skip_baseline=False, carry=None):
     name = cam["nickname"]
     unique = cam["uniqueName"]
     # `original` is threaded through gain re-sweeps. Re-deriving it there read
@@ -532,6 +569,11 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
                 % (gain, original["cameraGain"]))
     result = {"camera": name, "uniqueName": unique, "original": original,
               "applied": None, "samples": [], "cliff": None, "gain": gain}
+    # A gain escalation re-enters here and RETURNS the inner dict, so anything the
+    # outer frame had already recorded has to be carried in explicitly.
+    for _k in FAILURE_KEYS:
+        if (carry or {}).get(_k):
+            result[_k] = carry[_k]
 
     problem = calibration_problem(cam)
     if problem:
@@ -723,7 +765,8 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
                 args.gain = nxt
                 args.gain_steps -= 1
                 return await tune_camera(pv, cam, args, log, progress,
-                                         original=original, skip_baseline=True)
+                                         original=original, skip_baseline=True,
+                                         carry=result)
             log("   NOTHING PASSED even at gain %g." % gain)
             log("   That is a LIGHTING or CONFIG problem, not an exposure one:")
             log("     - check cameraBrightness (a low value crushes the image to black)")
@@ -766,7 +809,8 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
                 args.gain = nxt
                 args.gain_steps -= 1
                 return await tune_camera(pv, cam, args, log, progress,
-                                         original=original, skip_baseline=True)
+                                         original=original, skip_baseline=True,
+                                         carry=result)
             log("   !! %.1f px of blur at %.0f deg/s, over the %.0f px budget, and"
                 % (predicted, args.blur_rate, args.max_blur_px))
             log("   !! gain is already at %g. Works on a BENCH; will smear on a"
@@ -1126,7 +1170,23 @@ async def _tune_all(pv, cams, args, log, progress, on_camera, results):
                     progress((idx + f) / float(len(cams)))
             if on_camera:
                 on_camera(cam["nickname"], idx, len(cams))
+            # THE per-camera record. It is built here and not by tune_camera,
+            # because this frame is the only one present for the whole camera:
+            # the gain search calls tune_camera with skip_baseline=True and a gain
+            # escalation returns a fresh inner dict, so a failure recorded down
+            # there had no way back up. Measured: a run whose baseline did not
+            # apply exited 0.
+            rec = {"camera": cam["nickname"], "uniqueName": cam["uniqueName"],
+                   "applied": None}
             if args.optimise_gain:
+                _prob = calibration_problem(cam)
+                if _prob:
+                    log("── %s ──" % cam["nickname"])
+                    log("   !! CALIBRATION: %s" % _prob)
+                    rec["error"] = "no calibration for the active resolution"
+                    rec["calibration_problem"] = _prob
+                    results.append(rec)
+                    continue
                 # Structural settings BEFORE the gain search, not inside it.
                 # optimise_gain runs tune_camera with its logging discarded, so a
                 # baseline failure was both invisible and too late: measured, a
@@ -1134,16 +1194,6 @@ async def _tune_all(pv, cams, args, log, progress, on_camera, results):
                 # report "no passing exposure" - six full sweeps burned against a
                 # camera that was broken in a way the tool already knew how to fix,
                 # and the fix only landed afterwards in the fallback path.
-                _prob = calibration_problem(cam)
-                if _prob:
-                    log("── %s ──" % cam["nickname"])
-                    log("   !! CALIBRATION: %s" % _prob)
-                    results.append({"camera": cam["nickname"],
-                                    "uniqueName": cam["uniqueName"],
-                                    "applied": None,
-                                    "error": "no calibration for the active resolution",
-                                    "calibration_problem": _prob})
-                    continue
                 if getattr(args, "baseline", True):
                     _ch, _fl = await assert_baseline(pv, cam, args, log)
                     if _ch:
@@ -1153,21 +1203,24 @@ async def _tune_all(pv, cams, args, log, progress, on_camera, results):
                         if newer:
                             cam = dict(cam)
                             cam["settings"] = newer["settings"]
+                        rec["baseline_changed"] = list(_ch)
                     if _fl:
                         log("   !! baseline did not fully apply: %s"
                             % ", ".join(str(f[0]) for f in _fl))
                         log("   !! tuning on top of settings that are still wrong")
+                        rec["baseline_failed"] = [list(map(str, f)) for f in _fl]
                 r = await optimise_gain(pv, cam, args, log, cam_progress,
                                         skip_baseline=True)
                 if r is not None:
-                    results.append(r)
+                    results.append(merge_failures(rec, r))
                     continue
             # Held-card mode: the card is only visible to one camera at a time,
             # so give whoever is holding it a chance to move before we sweep.
             if args.reference_tag is not None and idx > 0 and args.move_pause > 0:
                 log("   move the card to '%s' - %.0fs" % (cam["nickname"], args.move_pause))
                 await asyncio.sleep(args.move_pause)
-            results.append(await tune_camera(pv, cam, args, log, cam_progress))
+            results.append(merge_failures(
+                rec, await tune_camera(pv, cam, args, log, cam_progress, carry=rec)))
         if progress:
             progress(1.0)
         return results
@@ -1696,8 +1749,8 @@ async def daemon(args, log=print):
                 try:
                     res = await run(args, log=cap, progress=lambda f: progress_e.setDouble(f),
                                     on_camera=announce)
-                    applied = [r for r in res if r.get("applied")]
-                    failed = [r for r in res if not r.get("applied")]
+                    failed = [r for r in res if tune_failed(r, args)]
+                    applied = [r for r in res if r not in failed and r.get("applied")]
                     line = "; ".join(
                         "%s=%.0f%s" % (r["camera"], r["applied"], " (fallback)" if r.get("fellback") else "")
                         for r in applied)
@@ -1951,26 +2004,18 @@ def main():
                                                       "  (fallback)" if r.get("fellback") else ""))
             else:
                 print("  %-14s unchanged (%s)" % (r["camera"], r.get("error", "dry run")))
-    if not args.dry_run:
-        # --baseline-only never sets `applied` by design, so "no applied" cannot
-        # mean failure in that mode. A baseline that did NOT take, or a rejected
-        # setting, MUST mean failure in every mode - previously both were recorded
-        # and never consulted, so the tool reported success with a 90-degree
-        # rotated image and a gain that never applied.
-        def _bad(r):
-            if r.get("calibration_problem") or r.get("baseline_failed") \
-                    or r.get("setting_rejected"):
-                return True
-            if getattr(args, "baseline_only", False):
-                return bool(r.get("error")) and "baseline only" not in str(r.get("error"))
-            return not r.get("applied")
-        failed = [r for r in results if _bad(r)]
-        if failed:
-            for r in failed:
-                why = (r.get("calibration_problem") or r.get("error")
-                       or ("baseline did not apply: %s" % r.get("baseline_failed")))
-                print("FAILED %s: %s" % (r.get("camera"), why))
-        sys.exit(1 if (failed or not results) else 0)
+    # --baseline-only never sets `applied` by design, so "no applied" cannot
+    # mean failure in that mode. A baseline that did NOT take, or a rejected
+    # setting, MUST mean failure in every mode - previously both were recorded
+    # and never consulted, so the tool reported success with a 90-degree
+    # rotated image and a gain that never applied.
+    failed = [r for r in results if tune_failed(r, args)]
+    if failed:
+        for r in failed:
+            why = (r.get("calibration_problem") or r.get("error")
+                   or ("baseline did not apply: %s" % r.get("baseline_failed")))
+            print("FAILED %s: %s" % (r.get("camera"), why))
+    sys.exit(1 if (failed or not results) else 0)
 
 
 if __name__ == "__main__":
