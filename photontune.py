@@ -509,20 +509,12 @@ class Photon:
                     break
         return list(found.values())
 
-    async def set_and_verify(self, unique_name, settle=1.5, **kw):
-        """Write settings and confirm the camera took them. Returns list of failures."""
-        await self.set_setting(unique_name, **kw)
-        await asyncio.sleep(settle)
-        cams = await self.cameras_fresh(timeout=8)
-        got = next((c for c in cams if c["uniqueName"] == unique_name), None)
-        if not got:
-            # Could not read the camera back at all - that is NOT the same as a
-            # setting being rejected, and must not raise the "unreliable" banner.
-            return [(None, None, None)]
-        live = got["settings"]
+    @classmethod
+    def _diff(cls, live, expect):
+        """[(key, wanted, have)] for every expectation the camera disagrees with."""
         bad = []
-        for k, want in kw.items():
-            if k in self.INT_SETTINGS and isinstance(want, float):
+        for k, want in expect.items():
+            if k in cls.INT_SETTINGS and isinstance(want, float):
                 want = int(round(want))
             have = live.get(k)
             try:
@@ -746,7 +738,7 @@ def calibrated_modes(cam):
 async def ensure_calibrated_mode(pv, cam, args, log=print):
     """Move the camera onto a calibrated video mode if it is not on one.
 
-    Returns (cam, problem). When a calibrated resolution EXISTS in
+    Returns (cam, problem, would_switch). When a calibrated resolution EXISTS in
     videoFormatList but the active one is uncalibrated, switching to it is the
     difference between a tool that tells a human what to do and a tool that just
     works - which is the whole point of running unattended. Only refuses when no
@@ -758,11 +750,11 @@ async def ensure_calibrated_mode(pv, cam, args, log=print):
     """
     problem = calibration_problem(cam, assume_solvepnp=True)
     if not problem:
-        return cam, None
+        return cam, None, None
     options = calibrated_modes(cam)
     fmt = active_format(cam) or {}
     if not options:
-        return cam, problem
+        return cam, problem, None
     now_px = float(fmt.get("width") or 0) * float(fmt.get("height") or 0)
 
     def closeness(o):
@@ -778,8 +770,23 @@ async def ensure_calibrated_mode(pv, cam, args, log=print):
         "calibrated." % (idx, newfmt.get("width", 0), newfmt.get("height", 0)))
     log("   !! That is a real change to your pipeline, made deliberately: it is "
         "the difference between a camera that works and one that needs a human.")
+    if getattr(args, "dry_run", False):
+        # --dry-run changed the video mode anyway and left it changed. It is a
+        # PERMANENT change to which resolution the camera runs at, which is
+        # exactly the kind of thing the flag exists to promise it will not do.
+        was = (cam.get("settings") or {}).get("cameraVideoModeIndex")
+        log("   dry run - the mode switch above was NOT made.")
+        log("   With solvePNP on and no calibration for the mode it is actually "
+            "running, PhotonVision publishes nothing, so there is no honest "
+            "measurement to report for this camera without making the change.")
+        return cam, ("--dry-run: the active mode %gx%g has no calibration. "
+                     "Re-run without --dry-run to switch to video mode %d "
+                     "(%gx%g), which is calibrated."
+                     % (fmt.get("width", 0), fmt.get("height", 0), idx,
+                        newfmt.get("width", 0), newfmt.get("height", 0))), \
+               [was, int(idx)]
     bad = await pv.set_and_verify(cam["uniqueName"], settle=max(args.settle, 2.0),
-                                  cameraVideoModeIndex=int(idx))
+                                  log=log, cameraVideoModeIndex=int(idx))
     fresh = await pv.cameras_fresh(timeout=8)
     newer = next((c for c in fresh if c["uniqueName"] == cam["uniqueName"]), None)
     if newer:
@@ -789,7 +796,7 @@ async def ensure_calibrated_mode(pv, cam, args, log=print):
     if problem:
         log("   !! the switch did not take (%s) - %s"
             % ([b for b in bad if b[0]] or "no rejection reported", problem))
-        return cam, problem
+        return cam, problem, None
     ci = (cal.get("cameraIntrinsics") or {})
     data = ci.get("data") or ci.get("dataValue") or []
     log("   now on a calibrated mode: %gx%g, fx %s"
@@ -811,7 +818,7 @@ async def ensure_calibrated_mode(pv, cam, args, log=print):
         log("   NOTE: no tags seen in the %.0f s after the mode change - "
             "continuing anyway, but the sweep below may be measuring a camera "
             "that is still restarting." % (time.time() - t0))
-    return cam, None
+    return cam, None, None
 
 
 def calibration_problem(cam, assume_solvepnp=False):
@@ -1087,7 +1094,10 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
         # Structural settings FIRST. Tuning exposure against a crushed brightness
         # just answers with a long, blurry exposure and calls it a success.
         if getattr(args, "baseline", True) and not skip_baseline:
-            _changed, _failed = await assert_baseline(pv, cam, args, log)
+            _changed, _failed, _unconfirmed, _would_base = await assert_baseline(
+                pv, cam, args, log)
+            if _would_base:
+                note_problem(result, "would_baseline", _would_base)
             if _changed:
                 fresh = await pv.cameras_fresh(timeout=8)
                 newer = next((c for c in fresh if c["uniqueName"] == unique), None)
@@ -1096,15 +1106,20 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
                     cam["settings"] = newer["settings"]
             result["baseline_changed"] = list(_changed)
             if _failed:
-                result["baseline_failed"] = [list(map(str, f)) for f in _failed]
+                note_problem(result, "baseline_failed",
+                             [list(map(str, f)) for f in _failed])
+            if _unconfirmed:
+                note_problem(result, "baseline_unconfirmed", _unconfirmed)
         # AFTER the baseline: solvePNPEnabled is PhotonVision's default-off, and
         # checking first meant the gate was blind on exactly the fresh camera it
         # exists for. Judge on what the camera will be, not what it was.
         _was = (cam.get("settings") or {}).get("cameraVideoModeIndex")
-        cam, problem = await ensure_calibrated_mode(pv, cam, args, log)
+        cam, problem, would_switch = await ensure_calibrated_mode(pv, cam, args, log)
         if (cam.get("settings") or {}).get("cameraVideoModeIndex") != _was:
-            result["video_mode_switched"] = [_was,
-                                             cam["settings"].get("cameraVideoModeIndex")]
+            note_problem(result, "video_mode_switched",
+                         [_was, cam["settings"].get("cameraVideoModeIndex")])
+        if would_switch:
+            note_problem(result, "would_switch_video_mode", would_switch)
         if problem:
             log("   !! CALIBRATION: %s" % problem)
             result["error"] = "no calibration for the active resolution"
@@ -1116,6 +1131,7 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
             return result
 
         bad = await pv.set_and_verify(unique, settle=max(args.settle, 1.5),
+                                      log=log,
                                       cameraAutoExposure=False, cameraGain=gain)
         rejected = [b for b in bad if b[0] is not None]
         unverified = [b for b in bad if b[0] is None]
@@ -1713,32 +1729,55 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
         # the scan, the apply cannot succeed, and a traceback out of here loses
         # the whole run's result. PENDING_RESTORE is deliberately left in place
         # on failure so the exit-path replay puts the camera back.
+        want = {"cameraGain": int(pick[0]), "cameraExposureRaw": float(exposure)}
         try:
-            await pv.set_setting(unique, cameraAutoExposure=False,
-                                 cameraGain=int(pick[0]), cameraExposureRaw=float(exposure))
-            await asyncio.sleep(max(args.settle, 1.5))
+            await pv.set_setting(unique, cameraAutoExposure=False, **want)
             # cameraSettings lags a second or two, so a plain read here reports
-            # the PREVIOUS value and cries MISMATCH on a write that succeeded.
-            live = await pv.cameras_fresh(timeout=10)
-            got = next((c for c in live if c["uniqueName"] == unique), None)
+            # the PREVIOUS value and cries MISMATCH on a write that succeeded -
+            # poll until it agrees or the timeout expires.
+            bad, read_ok = await pv.confirm(unique, want,
+                                            settle=max(args.settle, 1.5), log=log)
         except Exception as exc:
             log("   could not apply gain %d / exposure %.0f: %s"
                 % (pick[0], exposure, type(exc).__name__))
             r["error"] = "could not apply the tuned settings (%s)" % type(exc).__name__
             r["applied"] = None
             return r
-        if got:
-            gs = got["settings"]
-            ok = (abs(float(gs["cameraGain"]) - pick[0]) < 0.51
-                  and abs(float(gs["cameraExposureRaw"]) - exposure) < 1e-6)
-            log("   applied gain %d / exposure %.0f - camera reports %s / %s  %s"
-                % (pick[0], exposure, gs["cameraGain"], gs["cameraExposureRaw"],
-                   "confirmed" if ok else "*** MISMATCH ***"))
-            if not ok:
-                r["apply_mismatch"] = {"wanted": [pick[0], exposure],
-                                       "got": [gs["cameraGain"], gs["cameraExposureRaw"]]}
-        r["applied"] = exposure
         r["gain"] = pick[0]
+        if not read_ok or bad:
+            # THE defect this tool most needed to stop doing. It already
+            # detected this, logged "*** MISMATCH ***" - and then set
+            # r["applied"] = exposure on the next line regardless, so the CLI
+            # exited 0 and the daemon published ok=true for a write the tool had
+            # just proved did not take.
+            #
+            # applied stays None: the camera is NOT at the settings this run
+            # chose, and saying "exposure -> 1500" about a camera that is not at
+            # 1500 is the lie. PENDING_RESTORE is deliberately left in place, so
+            # the exit path puts the camera back where the user had it rather
+            # than leaving it in a state nobody chose.
+            if not read_ok:
+                log("   !! applied gain %d / exposure %.0f but the camera never "
+                    "reported back - the write is UNCONFIRMED."
+                    % (pick[0], exposure))
+                note_problem(r, "apply_unconfirmed",
+                             "no cameraSettings for %.0f s after the final write"
+                             % CONFIRM_TIMEOUT_S)
+                r["error"] = "could not confirm the final write"
+            else:
+                got = {k: h for k, _w, h in bad}
+                log("   *** MISMATCH *** wanted gain %d / exposure %.0f, camera "
+                    "reports %s" % (pick[0], exposure,
+                                    ", ".join("%s=%s" % (k, v) for k, v in got.items())))
+                note_problem(r, "apply_mismatch",
+                             {"wanted": [pick[0], exposure],
+                              "got": [got.get("cameraGain", pick[0]),
+                                      got.get("cameraExposureRaw", exposure)]})
+                r["error"] = "the final write did not take"
+            r["applied"] = None
+            return r
+        log("   applied gain %d / exposure %.0f - confirmed" % (pick[0], exposure))
+        r["applied"] = exposure
         PENDING_RESTORE.pop(unique, None)
     else:
         log("   dry run - would set gain %d at exposure %.0f; restoring original"
@@ -1751,6 +1790,55 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
     if progress:
         progress(1.0)
     return r
+
+
+async def verify_final_state(pv, cam, rec, args, log):
+    """Re-read the camera AFTER its tune and check it is where we left it.
+
+    Every read-back before this one was a snapshot taken seconds before the run
+    ended, and a snapshot only proves the value was right at that instant.
+    MEASURED: photontune's own NetworkTables-server toggle bounced a competing
+    writer offline inside the baseline read-back window; the read-back saw the
+    value it wanted, recorded no failure, the run exited 0 - and the camera
+    ended that run with cameraRedGain=50, which the baseline exists to set to 0.
+    Nothing in the tool looked again.
+
+    Only runs when something was actually applied: on a failure path the camera
+    is deliberately put back to the user's own settings, which legitimately do
+    not match the baseline.
+    """
+    if getattr(args, "dry_run", False):
+        return
+    baseline_only = getattr(args, "baseline_only", False)
+    if not rec.get("applied") and not baseline_only:
+        return
+    expect = {}
+    if getattr(args, "baseline", True):
+        for tbl in (BASELINE_ALWAYS, BASELINE_DEFAULT):
+            for k, (_v, e, _why) in tbl.items():
+                expect[k] = e
+        if getattr(args, "brightness", None) is not None:
+            expect["cameraBrightness"] = int(args.brightness)
+    if rec.get("applied"):
+        expect["cameraExposureRaw"] = float(rec["applied"])
+        if rec.get("gain") is not None:
+            expect["cameraGain"] = int(round(float(rec["gain"])))
+    if not expect:
+        return
+    bad, read_ok = await pv.confirm(cam["uniqueName"], expect, settle=0.6, log=log)
+    if not read_ok:
+        log("   !! could not read %s back at the end of its tune - the state it "
+            "is in is unknown." % cam["nickname"])
+        note_problem(rec, "apply_unconfirmed",
+                     "no cameraSettings at the end of the tune")
+    elif bad:
+        log("   !! the camera is NOT in the state this tune left it in:")
+        for k, want, have in bad:
+            log("      %s is %s, should be %s" % (k, have, want))
+        log("   !! something else is writing to this camera, or a write was "
+            "rolled back after it was confirmed.")
+        note_problem(rec, "final_state_wrong",
+                     [[k, want, have] for k, want, have in bad])
 
 
 class AlreadyRunning(Exception):
@@ -2015,7 +2103,9 @@ async def _tune_all(pv, cams, outer_args, log, progress, on_camera, results):
                 # camera that was broken in a way the tool already knew how to fix,
                 # and the fix only landed afterwards in the fallback path.
                 if getattr(args, "baseline", True):
-                    _ch, _fl = await assert_baseline(pv, cam, args, log)
+                    _ch, _fl, _un, _wb = await assert_baseline(pv, cam, args, log)
+                    if _wb:
+                        note_problem(rec, "would_baseline", _wb)
                     if _ch:
                         fresh = await pv.cameras_fresh(timeout=8)
                         newer = next((c for c in fresh
@@ -2028,14 +2118,19 @@ async def _tune_all(pv, cams, outer_args, log, progress, on_camera, results):
                         log("   !! baseline did not fully apply: %s"
                             % ", ".join(str(f[0]) for f in _fl))
                         log("   !! tuning on top of settings that are still wrong")
-                        rec["baseline_failed"] = [list(map(str, f)) for f in _fl]
+                        note_problem(rec, "baseline_failed",
+                                     [list(map(str, f)) for f in _fl])
+                    if _un:
+                        note_problem(rec, "baseline_unconfirmed", _un)
                 # AFTER the baseline, because the baseline is what turns solvePNP
                 # on, and the gate was silent while it was off.
                 was = (cam.get("settings") or {}).get("cameraVideoModeIndex")
-                cam, _prob = await ensure_calibrated_mode(pv, cam, args, log)
+                cam, _prob, _would = await ensure_calibrated_mode(pv, cam, args, log)
                 if (cam.get("settings") or {}).get("cameraVideoModeIndex") != was:
-                    rec["video_mode_switched"] = [was,
-                                                  cam["settings"].get("cameraVideoModeIndex")]
+                    note_problem(rec, "video_mode_switched",
+                                 [was, cam["settings"].get("cameraVideoModeIndex")])
+                if _would:
+                    note_problem(rec, "would_switch_video_mode", _would)
                 if _prob:
                     log("   !! CALIBRATION: %s" % _prob)
                     rec["error"] = "no calibration for the active resolution"
@@ -2045,15 +2140,19 @@ async def _tune_all(pv, cams, outer_args, log, progress, on_camera, results):
                 r = await optimise_gain(pv, cam, args, log, cam_progress,
                                         skip_baseline=True)
                 if r is not None:
-                    results.append(merge_failures(rec, r))
+                    merge_failures(rec, r)
+                    await verify_final_state(pv, cam, rec, args, log)
+                    results.append(rec)
                     continue
             # Held-card mode: the card is only visible to one camera at a time,
             # so give whoever is holding it a chance to move before we sweep.
             if args.reference_tag is not None and idx > 0 and args.move_pause > 0:
                 log("   move the card to '%s' - %.0fs" % (cam["nickname"], args.move_pause))
                 await asyncio.sleep(args.move_pause)
-            results.append(merge_failures(
-                rec, await tune_camera(pv, cam, args, log, cam_progress, carry=rec)))
+            merge_failures(rec, await tune_camera(pv, cam, args, log,
+                                                  cam_progress, carry=rec))
+            await verify_final_state(pv, cam, rec, args, log)
+            results.append(rec)
         if progress:
             progress(1.0)
         return results
@@ -2486,7 +2585,12 @@ async def assert_baseline(pv, cam, args, log=print):
     """Put the structural settings where they must be, before tuning anything.
 
     Reports every change and its reason, so 'blindly applied' is visible rather
-    than implicit. Returns (changed, failed).
+    than implicit. Returns (changed, failed, unconfirmed, would_change).
+
+    Under --dry-run it writes NOTHING and returns what it would have changed.
+    It used to write regardless: seeded numIterations=222, decisionMargin=100,
+    cameraRedGain=50, a --dry-run left them at 40 / 35 / 0 - permanently. "Change
+    nothing" is the entire contract of the flag.
     """
     unique = cam["uniqueName"]
     # send-form vs readback-form. PhotonVision accepts "DEG_0" and reports 0;
@@ -2511,27 +2615,36 @@ async def assert_baseline(pv, cam, args, log=print):
         todo[k] = v
     if not todo:
         log("   baseline: already correct")
-        return [], []
+        return [], [], None, []
 
     for k, v in todo.items():
         why = (BASELINE_ALWAYS.get(k) or BASELINE_DEFAULT.get(k))[2]
-        log("   baseline: %s %s -> %s" % (k, live.get(k), v))
+        log("   baseline: %s %s -> %s%s"
+            % (k, live.get(k), v, "  (WOULD - dry run)" if args.dry_run else ""))
         log("             %s" % why.split(". ")[0] + ".")
-    await pv.set_setting(unique, **todo)
-    await asyncio.sleep(max(args.settle, 1.5))
+    if getattr(args, "dry_run", False):
+        log("   dry run - the %d baseline change(s) above were NOT made." % len(todo))
+        return [], [], None, sorted(todo)
 
-    after = await pv.cameras_fresh(timeout=8)
-    got = next((c for c in after if c["uniqueName"] == unique), None)
-    failed = []
-    if got is None:
-        log("   baseline: could not read back to confirm")
+    await pv.set_setting(unique, **todo)
+    # Poll, do not snapshot. A single look 1.5 s later saw a value that a
+    # competing writer then took back, and reported it as applied.
+    bad, read_ok = await pv.confirm(unique, {k: expect[k] for k in todo},
+                                    settle=max(args.settle, 1.5), log=log)
+    failed, unconfirmed = [], None
+    if not read_ok:
+        # NOT silence. This used to log one line, record nothing, and let the
+        # run continue and exit 0 while the baseline state was unknown.
+        log("   !! baseline: could not read the camera back to confirm, after "
+            "polling %.0f s. The baseline state is UNKNOWN." % CONFIRM_TIMEOUT_S)
+        unconfirmed = ("no cameraSettings for %.0f s after writing %s"
+                       % (CONFIRM_TIMEOUT_S, ", ".join(sorted(todo))))
     else:
-        for k, v in todo.items():
-            have = got["settings"].get(k)
-            if not _matches(have, expect[k]):
-                failed.append((k, expect[k], have))
-                log("   !! baseline %s did NOT take (wanted %s, camera has %s)" % (k, v, have))
-    return list(todo), failed
+        for k, want, have in bad:
+            failed.append((k, want, have))
+            log("   !! baseline %s did NOT take (wanted %s, camera has %s)"
+                % (k, want, have))
+    return list(todo), failed, unconfirmed, []
 
 
 def robot_is_enabled(inst):
