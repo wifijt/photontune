@@ -170,6 +170,13 @@ gain-0 trial read 1.000-1.054 tags at a 0.00-0.05 solve rate in seven runs and
 **1.892 tags at 0.892** in run 6 - 0.9 tags apart, far outside sampling error on
 37 frames. The scene genuinely changed: the second tag became detectable at
 gain 0 for that run. The walk then correctly picked gain 0 and applied 20.
+
+It is not a leak in the new gate either, and the frame count is what rules that
+out: contamination INFLATES the count (79 against 41-48 before the fix), and
+camera 2's gain-0 trial collected 37 frames in run 6 - the same 37 it collected
+in runs 1-5 and 8, and 38 in run 7. A sample cannot be 89% borrowed from the
+previous setting and still be exactly the right size.
+
 **Do not make this stickier.** The fragility is in the scene - one tag sits at
 the edge of detectability at gain 0 - not in the tool.
 
