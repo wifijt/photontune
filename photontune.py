@@ -16,24 +16,36 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
-photontune - find a safe exposure for PhotonVision AprilTag pipelines, fast.
+photontune - set PhotonVision AprilTag exposure and gain from a blur budget.
 
-Scores each candidate on DETECTION QUALITY (multi-tag solve rate, reprojection,
-ambiguity) rather than image brightness, then deliberately picks the SHORTEST
-exposure that clears the failure cliff.
+THE LEAST GAIN THAT STILL SEES EVERY TAG, AT THE EXPOSURE A SPINNING ROBOT
+ALLOWS.
 
-Why shortest: this tool measures a stationary camera, so motion blur is zero in
-everything it can observe. On a moving robot blur scales linearly with exposure
-(blur_px = omega * t * fx), and at 360 deg/s with fx=1100 a 12 ms exposure smears
-a corner ~100 px across a ~70 px tag. The plateau this tool measures is real but
-it is a plateau in the one condition that does not matter, so we bias short.
+Exposure is not searched for. This tool measures a STATIONARY camera, so
+motion blur is zero in everything it can observe, and every plateau it can
+find is a plateau in the one condition that does not matter. On a moving robot
+blur is blur_px = omega * t * fx, so the exposure follows from a budget:
+
+    t_budget = max_blur_px / (radians(blur_rate) * fx)
+
+At 6 px, 360 deg/s and fx 1105.9 that is 864 us. Gain is then the only free
+variable, and the answer is the least of it that still sees every tag the
+scene can offer - measured by walking a six-point grid upward and stopping at
+the first point that passes, plus one grid step of margin.
+
+Reprojection is REPORTED and never used to choose. It is OpenCV's RMS residual
+over the corners of the multi-tag fit: it measures internal consistency of a
+fit, not pose accuracy, and it IMPROVES when distant tags drop out of the
+solve. Optimising it rewards losing tags, which is why a tag-count guard had
+to be bolted on to stop it, and why six identical runs on one camera chose
+gain 60, 80, 60, 80, 100, 100.
 
 Modes:
   CLI     python photontune.py --host photonvision.local
   Daemon  python photontune.py --daemon --nt-server 10.TE.AM.2
+          (asserts the baseline at boot; tunes only when told to)
 """
-import argparse, asyncio, copy, json, math, sys, time
-from collections import defaultdict
+import argparse, asyncio, dataclasses, json, math, sys, time
 
 try:
     import msgpack, websockets
@@ -100,24 +112,43 @@ MIN_SAMPLE_FRAMES = 20
 # is why the extension also requires at least one frame to have arrived.
 SAMPLE_EXTEND_S = 4.0
 
+# Exposure bounds to use when a camera does not report its own. Only a
+# fallback: every camera on this rig reports 7-80000 us and those numbers are
+# what get used. A camera that reports nothing is rare enough that guessing a
+# wide, safe range beats refusing to tune it.
+EXPOSURE_FLOOR_FALLBACK = 100.0
+EXPOSURE_CEILING_FALLBACK = 25000.0
+
 # How long a read-back may poll for the camera to agree before it is called a
 # failure. PhotonVision's cameraSettings broadcast lags a write by 1-2 s, so
 # anything under a few seconds cries wolf; 12 s is long enough that "still not
 # agreeing" means it never will.
 CONFIRM_TIMEOUT_S = 12.0
 
-# Extra measurements of the gain that is about to win, to estimate the noise
-# WHERE THE DECISION IS MADE. Two, for three readings in total: one repeat gives
-# a spread that is itself a coin toss, and the audit's three runs of the same
-# gain (0.378 / 0.393 / 0.510) show the outlier need not be adjacent. Costs
-# 2 x (settle + dwell) ~ 4.4 s per camera.
-GAIN_REPEATS = 2
+# How many standard errors of a candidate's OWN tag count it may fall below the
+# reference count before we call it a real loss of tags. See
+# Sample.tags_significantly_below for the measured table this is set from.
+TAG_DROP_Z = 3.0
+
+# The gain grid. Six points, evenly spaced from 0 to --max-gain, which is the
+# grid the deleted gain scan used and the grid every gain measurement in this
+# file was taken on. The walk stops at the first point that passes and then
+# adds ONE more step as margin, so the grid spacing IS the margin: at the
+# default --max-gain 100 that is 20.
+GAIN_GRID_STEPS = 6
+
+# How many points the exposure walks may try before giving up. Both walks are
+# exceptional paths - the scene is saturated, or too dark to work inside the
+# blur budget - and both must stay bounded, because an unbounded walk is how
+# the old escalation turned a 25 s tune into a two-minute one.
+EXPOSURE_WALK_STEPS = 5
 
 
 class Sample:
-    """Detection quality at one exposure, for one camera."""
-    def __init__(self, exposure):
+    """Detection quality at one (gain, exposure), for one camera."""
+    def __init__(self, exposure, gain=None):
         self.exposure = exposure
+        self.gain = gain
         self.frames = 0
         self.multitag_solves = 0
         self.reproj = []
@@ -140,14 +171,67 @@ class Sample:
     def med_ambiguity(self):
         return _median([a for a in self.ambiguities if a >= 0])
 
-    def passes(self, min_tags, max_ambiguity, tag_target=None):
+    def tag_standard_error(self):
+        """Sampling error of this sample's own mean tag count, or None."""
+        n = len(self.tag_counts)
+        if n < 2:
+            return None
+        m = self.mean_tags
+        var = sum((t - m) ** 2 for t in self.tag_counts) / float(n - 1)
+        return math.sqrt(var / n)
+
+    def tags_significantly_below(self, reference, z=TAG_DROP_Z):
+        """Is this sample missing tags the reference found, beyond noise?
+
+        A FRACTION cannot do this job, and trying one failed twice in opposite
+        directions on the same rig:
+
+          - at 0.85, a reference of 4.00 tags sets the floor at 3.40, so 3.50,
+            3.73 and 3.80 all pass. Live runs marked "tags 3.73" and "tags
+            3.81" as ok. That is the case the tag guard was written for, and it
+            never caught it.
+          - at 0.96, a reference of 2.00 tags sets the floor at 1.92 - and a
+            re-measurement reading exactly 1.92 tags, one frame in 25 short,
+            disqualified the winning gain and changed the answer.
+
+        The scale-free question is whether the shortfall is bigger than the
+        SAMPLING ERROR of this sample's own tag count, which we can measure
+        from the per-frame counts we already have. At the 30-60 frames a dwell
+        carries, 3 sigma separates the two cases cleanly on every real example
+        from this rig:
+
+            ref    this   short   3 sigma   verdict
+            4.00   3.50    0.50     0.21    reject - half a tag gone
+            4.00   3.73    0.27     0.19    reject
+            4.00   3.80    0.20     0.17    reject
+            4.00   3.93    0.07     0.11    keep   - 7% of frames, noise
+            2.00   1.92    0.08     0.12    keep
+            2.00   1.52    0.48     0.21    reject - a real dropout
+
+        It tightens with more evidence rather than loosening, which is the same
+        behaviour rate_upper_bound() has and for the same reason.
+        """
+        if reference is None or len(self.tag_counts) < 2:
+            return False
+        short = reference - self.mean_tags
+        if short <= 0:
+            return False
+        se = self.tag_standard_error()
+        if not se:
+            # Every frame is short by the same amount. That is not sampling
+            # error, it is the tag being gone.
+            return True
+        return short > z * se
+
+    def passes(self, min_tags, max_ambiguity, tag_reference=None,
+               tag_z=TAG_DROP_Z):
         if self.frames < MIN_SAMPLE_FRAMES:
             return False
-        # Multi-tag solves happily on a subset, so "it solved" is not the same as
-        # "it saw everything available". Require most of the tags that the best
-        # exposure in this sweep managed to find - otherwise we settle for a short
-        # exposure that quietly drops the hardest (usually farthest) tags.
-        if tag_target is not None and self.mean_tags < tag_target:
+        # Multi-tag solves happily on a subset, so "it solved" is not the same
+        # as "it saw everything available". A gain that loses tags buys nothing
+        # at all - the exposure is fixed, so there is no blur being traded for
+        # them - which is why this is a significance test and not a fraction.
+        if self.tags_significantly_below(tag_reference, tag_z):
             return False
         # Prefer the multi-tag criterion when multi-tag is actually running.
         # Judged on the upper confidence bound, not the point estimate: a rate
@@ -160,7 +244,8 @@ class Sample:
         amb = self.med_ambiguity
         return amb is not None and amb <= max_ambiguity
 
-    def why_failed(self, min_tags, max_ambiguity, tag_target=None):
+    def why_failed(self, min_tags, max_ambiguity, tag_reference=None,
+                   tag_z=TAG_DROP_Z):
         """One short phrase saying why this sample did not pass, or None.
 
         The gain search reported EVERY outcome as "no passing exposure": a dead
@@ -168,18 +253,23 @@ class Sample:
         room were indistinguishable, and six "sweeps" were seen completing in
         0.00 s total with nothing noticing.
         """
-        if self.passes(min_tags, max_ambiguity, tag_target):
+        if self.passes(min_tags, max_ambiguity, tag_reference, tag_z):
             return None
         if self.frames == 0:
             return "no frames arrived - nothing was being published"
         if self.frames < MIN_SAMPLE_FRAMES:
             return ("only %d frames - under the %d needed to classify (at %d "
                     "frames the 90%% gate lets %.0f%% through, so a 'pass' here "
-                    "would be noise). Raise --dwell, or drop --fast."
+                    "would be noise). Raise --dwell."
                     % (self.frames, MIN_SAMPLE_FRAMES, self.frames,
                        100 * _effective_floor(self.frames)))
-        if tag_target is not None and self.mean_tags < tag_target:
-            return "saw %.2f tags, needed %.2f" % (self.mean_tags, tag_target)
+        if self.tags_significantly_below(tag_reference, tag_z):
+            return ("saw %.2f tags against the reference's %.2f - %.2f short, "
+                    "over the %.2f that %g sigma of this sample's own scatter "
+                    "allows, so it is a real loss and not noise"
+                    % (self.mean_tags, tag_reference,
+                       tag_reference - self.mean_tags,
+                       tag_z * (self.tag_standard_error() or 0.0), tag_z))
         if self.multitag_solves:
             return ("multi-tag solved in %.0f%% of %d frames (at best %.0f%%, "
                     "under the 90%% floor)"
@@ -212,51 +302,32 @@ def _effective_floor(n, threshold=0.90):
     return 1.0
 
 
-# The noise band never goes below this. One set of near-identical readings must
-# not make every 1% difference "significant".
-GAIN_BAND_FLOOR = 1.05
-
-
-def gain_decision(good, repeats, leader_gain, reproj_tolerance,
-                  band_floor=GAIN_BAND_FLOOR):
-    """Which gain wins, given [(gain, reproj)] and repeat readings of the leader.
-
-    Pure arithmetic, deliberately separated from the measuring so it can be
-    driven with recorded numbers - see sabotage_test.py --gain-decision, which
-    replays the audit's own three runs (gain 100 read 0.378 / 0.393 / 0.510 and
-    gain 60 read 0.478 / 0.479 / 0.478) and shows the old rule choosing 100,
-    100, 60 while this one chooses the same gain all three times.
-
-    Returns (pick, best, band, noise, good) where pick and best are (gain,
-    reproj) pairs and `good` is the input with the leader's reprojection
-    replaced by the median of its repeats.
-    """
-    noise = None
-    if len(repeats) > 1:
-        # The spread OBSERVED AT THE DECIDING POINT, not at the quietest gain in
-        # the scan. And the median of the repeats, so one lucky reading cannot
-        # win the scan on its own.
-        noise = abs(math.log(max(repeats) / min(repeats)))
-        leader_rp = _median(repeats)
-        good = [(g, leader_rp if g == leader_gain else rp) for g, rp in good]
-    best_rp = min(rp for _g, rp in good)
-    # --reproj-tolerance keeps its own job: REJECT a gain whose fit is clearly
-    # worse than the best. It is not a noise estimate and must not be used as
-    # one - at its 1.5 default it declares a 28% difference insignificant.
-    usable = [t for t in good if t[1] <= best_rp * float(reproj_tolerance)]
-    band = max(math.exp(noise) if noise is not None else 1.0, band_floor)
-    contenders = [t for t in usable if t[1] <= best_rp * band]
-    pick = min(contenders, key=lambda t: t[0])       # LOWEST gain wins a tie
-    best = min(good, key=lambda t: t[1])
-    return pick, best, band, noise, good
-
-
 def _median(xs):
     xs = sorted(xs)
     if not xs:
         return None
     n = len(xs)
     return xs[n // 2] if n % 2 else 0.5 * (xs[n // 2 - 1] + xs[n // 2])
+
+
+# ───────────────────────── the blur budget ─────────────────────────
+#
+# This is the one thing in the tool that knows about the robot rather than
+# about the bench, and it is now what SETS the exposure rather than what
+# comments on it.
+#
+# A camera rotating at omega smears a point across blur_px = omega * t * fx.
+# Turn that around and the exposure is not a thing to search for at all: it is
+# whatever the blur budget allows, and the only free variable left is gain.
+
+def blur_px(exposure_us, blur_rate_deg_s, fx):
+    """Motion smear, in pixels, at this exposure and angular rate."""
+    return math.radians(blur_rate_deg_s) * (exposure_us / 1e6) * fx
+
+
+def blur_budget_exposure(max_blur_px, blur_rate_deg_s, fx):
+    """The longest exposure that stays inside the budget, in microseconds."""
+    return 1e6 * max_blur_px / (math.radians(blur_rate_deg_s) * fx)
 
 
 def geometric_sweep(lo, hi, steps):
@@ -266,98 +337,30 @@ def geometric_sweep(lo, hi, steps):
     return [lo * (r ** i) for i in range(steps)]
 
 
-def sweep_holes(samples):
-    """Find physically impossible gaps in an exposure sweep.
+def gain_with_margin(picked, margin_step, max_gain):
+    """One grid step above the lowest gain that works, capped at the ceiling.
 
-    Brightness rises monotonically with exposure, so detection cannot come back
-    after vanishing. A sample with tags, then one with none, then tags again, is
-    a measurement artefact - not a property of the scene. Seen in the wild when
-    another process was reading PhotonVision's websocket concurrently and
-    starving individual samples: tags went 0.25, 0, 0.03, 0, 0, 1.08, 3.00 and
-    the cliff estimate landed 4x too long.
-
-    Catches a STRONG detection, then none, then strong again. Note it does NOT
-    catch every corrupted sweep: a run starved by a competing websocket reader
-    produced 0.25, 0, 0.03, 0, 0, 1.08, 3.00 - wrong at specific points but
-    still rising, so nothing here fires. baseline_contradiction() is the check
-    for that.
-
-    Returns the list of (exposure, mean_tags) that sit in a hole.
+    A field is not the pit. The light changes, the tags get further away, and
+    the cost of one step is sensor noise on a solve that is already passing -
+    while the cost of being one step short is a camera that stops seeing tags
+    in the middle of a match.
     """
-    seq = sorted(samples, key=lambda s: s.exposure)
-    holes = []
-    for j in range(1, len(seq) - 1):
-        if seq[j].mean_tags > 0.5:
-            continue
-        before = any(s.mean_tags > 0.5 for s in seq[:j])
-        after = any(s.mean_tags > 0.5 for s in seq[j + 1:])
-        if before and after:
-            holes.append((seq[j].exposure, seq[j].mean_tags))
-    return holes
+    return int(min(float(max_gain), picked + margin_step))
 
 
-def baseline_contradiction(samples, base_exposure, base_tags):
-    """Does the sweep contradict what the camera was already doing?
+def gain_grid(max_gain, steps=GAIN_GRID_STEPS):
+    """The gains the walk visits, lowest first, and the margin step.
 
-    Before sweeping we record detection at the exposure the camera came in on.
-    If the sweep then claims a NEARBY exposure sees far fewer tags, the sweep is
-    wrong - the scene did not change, the measurement did. This is what catches a
-    sweep starved by another process reading PhotonVision's websocket, where the
-    numbers stay plausibly ordered but are individually false.
-
-    Returns (exposure, swept_tags) of the worst contradicting sample, or None.
+    Returns (gains, step). Integers, deduplicated, so the walk cannot visit the
+    same operating point twice and read two different answers for it.
     """
-    if base_tags < 1.0 or base_exposure <= 0:
-        return None                      # nothing to contradict
-    worst = None
-    for s in samples:
-        # Asymmetric on purpose. A SHORTER exposure seeing fewer tags is just the
-        # detection cliff - that is the whole point of the sweep. A LONGER one
-        # seeing fewer is impossible until over-exposure, so cap the window
-        # rather than flag the bright tail.
-        if not (0.95 * base_exposure <= s.exposure <= 2.5 * base_exposure):
-            continue
-        if s.mean_tags < 0.4 * base_tags:
-            if worst is None or s.mean_tags < worst[1]:
-                worst = (s.exposure, s.mean_tags)
-    return worst
-
-
-def choose_exposure(samples, bias, min_tags, max_ambiguity, tag_fraction=0.85):
-    """Estimate where detection actually fails, then sit a safety factor above it.
-
-    Biasing off the shortest *tested* passing value double-counts margin: with a
-    geometric sweep, adjacent points differ by the step ratio, so that value is
-    already up to one full step above the true cliff. Instead we bracket the cliff
-    between the highest failing and lowest passing sample and take the geometric
-    mean, which is the best single estimate from a log-spaced sweep.
-
-    Returns (chosen, shortest_passing_sample, cliff_estimate, tag_target).
-    All four are returned on every path - the caller unpacks four, and a
-    3-tuple here silently killed the gain-escalation path for dark rooms.
-    """
-    # How many tags did the BEST exposure in this sweep see? Anything much below
-    # that is leaving detections on the table.
-    best_tags = max((s.mean_tags for s in samples), default=0.0)
-    tag_target = best_tags * tag_fraction if best_tags >= 2 else None
-    passing = [s for s in samples
-               if s.passes(min_tags, max_ambiguity, tag_target)]
-    if not passing:
-        # chosen=None tells the caller to escalate gain. tag_target still comes
-        # back so it can say WHY nothing passed.
-        return None, None, None, tag_target
-    shortest = min(passing, key=lambda s: s.exposure)
-    failing_below = [s for s in samples
-                     if s.exposure < shortest.exposure
-                     and not s.passes(min_tags, max_ambiguity, tag_target)]
-    if failing_below:
-        highest_fail = max(failing_below, key=lambda s: s.exposure).exposure
-        cliff = math.sqrt(highest_fail * shortest.exposure)
-    else:
-        # Everything we tested passed - the cliff is at or below our range.
-        cliff = shortest.exposure
-    ceiling = max(s.exposure for s in samples)
-    return min(cliff * bias, ceiling), shortest, cliff, tag_target
+    hi = float(max_gain)
+    n = max(2, int(steps))
+    if hi <= 0:
+        return [0], 0
+    step = hi / float(n - 1)
+    gains = sorted({int(round(step * i)) for i in range(n)})
+    return gains, int(round(step))
 
 
 # ───────────────────────── PhotonVision link ─────────────────────────
@@ -608,11 +611,11 @@ class Photon:
         return out
 
 
-# ───────────────────────── the sweep ─────────────────────────
+# ──────────────────── sampling and the camera ────────────────────
 
-async def sample(pv, cam, args, seconds, after_capture=None):
+async def sample(pv, cam, cfg, seconds, after_capture=None):
     """Collect detections, preferring NetworkTables over the throttled websocket."""
-    reader = getattr(args, "_nt", {}).get(cam["nickname"])
+    reader = cfg.readers.get(cam["nickname"])
     if reader is not None:
         # ntcore blocks; keep the event loop free so nothing else stalls.
         return await asyncio.get_event_loop().run_in_executor(
@@ -621,9 +624,9 @@ async def sample(pv, cam, args, seconds, after_capture=None):
                             min_frames=MIN_SAMPLE_FRAMES)
 
 
-def capture_mark(args, cam):
+def capture_mark(cfg, cam):
     """Newest capture timestamp right now, to gate out pre-change frames."""
-    reader = getattr(args, "_nt", {}).get(cam["nickname"])
+    reader = cfg.readers.get(cam["nickname"])
     return reader.newest_capture() if reader is not None else None
 
 
@@ -702,7 +705,7 @@ def calibrated_modes(cam):
     return out
 
 
-async def ensure_calibrated_mode(pv, cam, args, log=print):
+async def ensure_calibrated_mode(pv, cam, cfg, log=print):
     """Move the camera onto a calibrated video mode if it is not on one.
 
     Returns (cam, problem). When a calibrated resolution EXISTS in
@@ -737,7 +740,7 @@ async def ensure_calibrated_mode(pv, cam, args, log=print):
         "calibrated." % (idx, newfmt.get("width", 0), newfmt.get("height", 0)))
     log("   !! That is a real change to your pipeline, made deliberately: it is "
         "the difference between a camera that works and one that needs a human.")
-    bad = await pv.set_and_verify(cam["uniqueName"], settle=max(args.settle, 2.0),
+    bad = await pv.set_and_verify(cam["uniqueName"], settle=max(cfg.settle, 2.0),
                                   log=log, cameraVideoModeIndex=int(idx))
     fresh = await pv.cameras_fresh(timeout=8)
     newer = next((c for c in fresh if c["uniqueName"] == cam["uniqueName"]), None)
@@ -761,7 +764,7 @@ async def ensure_calibrated_mode(pv, cam, args, log=print):
     # lighting problem it had caused itself. Wait for detections to come back.
     t0 = time.time()
     while time.time() - t0 < 20:
-        raw = await sample(pv, cam, args, 1.0)
+        raw = await sample(pv, cam, cfg, 1.0)
         if raw["tags"] and (sum(raw["tags"]) / len(raw["tags"])) > 0:
             log("   detections resumed %.0f s after the mode change" % (time.time() - t0))
             break
@@ -810,21 +813,6 @@ def calibration_problem(cam, assume_solvepnp=False):
     return None
 
 
-def _escalate_to(args, gain):
-    """Next gain to try, and whether that is the ONLY further try.
-
-    With a fixed-exposure gain scan following (--optimise-gain), jump straight to
-    the ceiling: the scan re-measures every gain from the bottom afterwards and
-    picks the lowest one that is statistically as good, so overshooting here
-    costs nothing and saves a whole exposure sweep per step skipped. Without a
-    scan to follow (--no-optimise-gain) the escalation IS the final answer, so it
-    must still climb gently and stop at the first gain that works.
-    """
-    if getattr(args, "_gain_scan_follows", False):
-        return float(args.max_gain), True
-    return min(float(args.max_gain), max(gain * 1.5, gain + 10)), False
-
-
 # ───────────────── every problem the tool can record ─────────────────
 #
 # THE REGISTRY IS THE VERDICT. There is no other list.
@@ -866,18 +854,21 @@ PROBLEMS = {
         lambda v: "the camera did not END the run in the state we set: %s"
                   % ", ".join("%s is %s, should be %s" % (k, h, w)
                               for k, w, h in v)),
-    "gain_scan_error": (HARD, lambda v: "the gain scan did not finish: %s" % v),
+    "search_error": (HARD, lambda v: "the gain walk did not finish: %s" % v),
+    "no_workable_settings": (HARD, lambda v: str(v)),
+    "robot_enabled_midrun": (HARD,
+        lambda v: "the robot was ENABLED during the tune (%s) - aborted and put "
+                  "the camera back. A match must never be interrupted." % v),
     # ---- warn ----
     "video_mode_switched": (WARN,
         lambda v: "VIDEO MODE CHANGED %s -> %s - this camera is now running a "
                   "different RESOLUTION than it was. It had no calibration for "
                   "the old one." % (v[0], v[1])),
     "over_blur_budget": (WARN,
-        lambda v: "%.1f px of motion blur, over the budget - fine on a bench, "
-                  "smeared on a moving robot. Add light, or raise --max-gain." % v),
-    "fellback": (WARN,
-        lambda v: "the chosen exposure failed its own verification; fell back to "
-                  "the shortest exposure that had already passed"),
+        lambda v: "%.1f px of motion blur at --blur-rate, over the budget - "
+                  "fine on a bench, smeared on a moving robot. The scene needed "
+                  "a longer exposure than the budget allows even at maximum "
+                  "gain. Add light." % v),
 }
 
 HARD_KEYS = tuple(k for k, (sev, _) in PROBLEMS.items() if sev == HARD)
@@ -915,32 +906,17 @@ def problem_notes(rec, severity=None):
     return out
 
 
-# Problems must survive being handed up through a recursion or a search.
-#
-# Every one of these was recorded and then lost. tune_camera escalates gain with
-# `return await tune_camera(...)`, which discards the outer frame's dict, and the
-# gain search calls tune_camera with skip_baseline=True, so the frame that ran the
-# baseline is not the frame that returns. The record therefore belongs to the
-# CALLER, which is the only party present for the whole camera.
-FAILURE_KEYS = tuple(PROBLEMS)
+# There is no merge_failures and no FAILURE_KEYS any more, and that is the
+# point. They existed because tune_camera escalated with
+# `return await tune_camera(...)`, discarding the outer frame's dict, and
+# because the gain search re-entered it with skip_baseline=True - so the frame
+# that ran the baseline was not the frame that returned, and four layers
+# (`carry`, merge_failures, save/restore and copy.copy) existed to carry
+# problems back across that gap. tune_camera is now a LOOP that builds one
+# record and returns it, so there is no gap to carry anything across.
 
 
-def merge_failures(rec, r):
-    """Fold a tune result into the caller's per-camera record, keeping problems.
-
-    A plain dict.update() is not enough in either direction: the callee may know
-    about a rejected setting the caller does not, and the caller may know about a
-    baseline failure the callee (skip_baseline=True) never saw. Warnings need the
-    same protection as failures - video_mode_switched is recorded by the caller
-    and would otherwise be overwritten by a callee that never saw the switch.
-    """
-    keep = {k: rec[k] for k in FAILURE_KEYS if rec.get(k)}
-    rec.update(r or {})
-    rec.update(keep)
-    return rec
-
-
-def tune_failed(r, args=None):
+def tune_failed(r, cfg=None):
     """Did this camera's tune fail? One definition, used by the CLI and the daemon.
 
     The daemon used to judge on `applied` alone, so a camera that came back
@@ -949,426 +925,162 @@ def tune_failed(r, args=None):
     """
     if any(r.get(k) for k in HARD_KEYS):
         return True
-    if getattr(args, "baseline_only", False):
+    if cfg is not None and cfg.baseline_only:
+        # --baseline-only never sets `applied`, by design, so "no applied"
+        # cannot be the test in that mode. A baseline that did NOT take is
+        # caught by HARD_KEYS above, in every mode.
         return bool(r.get("error")) and "baseline only" not in str(r.get("error"))
     return not r.get("applied")
 
 
-def run_problems(args):
-    """Problems that belong to the RUN rather than to any one camera.
-
-    A problem with no camera to hang off used to be printed and then dropped -
-    the run exited 0 having reported it. Anything that is true of the whole run
-    lives here so the verdict can still see it.
-    """
-    return dict(getattr(args, "_run_problems", {}) or {})
-
-
-def note_run_problem(args, key, value=True):
-    if not hasattr(args, "_run_problems") or args._run_problems is None:
-        args._run_problems = {}
-    note_problem(args._run_problems, key, value)
-    return args._run_problems
-
-
-def run_verdict(results, args):
+def run_verdict(results, cfg=None):
     """(failed, warnings, exit_code) for a whole run. The CLI and daemon agree.
 
     Factored out of main() so the verdict can be tested directly - see
     sabotage_test.py --verdict-matrix, which asserts the exit code for every key
     in PROBLEMS one at a time.
+
+    No results at all is a FAILURE. The tool was asked to tune something and
+    tuned nothing; exiting 0 on that is how six "sweeps" were once seen
+    completing in 0.00 s with nothing noticing.
     """
-    rp = run_problems(args)
-    failed = [r for r in (results or []) if tune_failed(r, args)]
+    failed = [r for r in (results or []) if tune_failed(r, cfg)]
     warnings = []
     for r in (results or []):
         for _k, _sev, text in problem_notes(r, WARN):
             warnings.append((r.get("camera", "?"), text))
-    for _k, _sev, text in problem_notes(rp, WARN):
-        warnings.append(("run", text))
-    hard_run = problem_notes(rp, HARD)
-    code = 1 if (failed or hard_run or not results) else 0
-    return failed, warnings, code
+    return failed, warnings, (1 if (failed or not results) else 0)
 
 
-async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
-                      skip_baseline=False, carry=None):
-    name = cam["nickname"]
-    unique = cam["uniqueName"]
-    # `original` is threaded through gain re-sweeps. Re-deriving it there read
-    # post-sweep state, so a later failure "restored" the camera to whatever the
-    # last swept exposure happened to be.
-    if original is None:
-        original = {
-            "cameraExposureRaw": cam["settings"]["cameraExposureRaw"],
-            "cameraGain": cam["settings"]["cameraGain"],
-            "cameraAutoExposure": cam["settings"]["cameraAutoExposure"],
+# ───────────────────────── configuration ─────────────────────────
+#
+# FROZEN, and that is the entire point of it.
+#
+# The gain ratchet came back three times. Every recurrence was a value written
+# onto a shared argparse namespace and read by the next camera or the next
+# pass - args.gain, args.gain_steps, args.min_exposure, args.max_exposure,
+# args.steps. It was fixed with a save/restore, then a second save/restore, then
+# a per-camera copy.copy, and each fix left the shared object in place and
+# promised the next edit would not misuse it. The third fix's own comment says
+# "so a third door cannot open".
+#
+# A frozen dataclass cannot be written to at all, so the bug is not absent, it
+# is inexpressible. Search state has exactly one home - the Search object
+# tune_camera builds inside its own frame - and that object is thrown away when
+# the camera is done.
+
+@dataclasses.dataclass(frozen=True)
+class Config:
+    host: str = "photonvision.local"
+    port: int = 5800
+    cameras: object = None          # comma-separated nicknames, or None for all
+
+    # what the tune decides
+    max_gain: float = 100.0
+    max_blur_px: float = 6.0
+    blur_rate: float = 360.0
+    fx: float = 1105.9              # fallback only; camera_fx() reads the real one
+    max_exposure: float = 25000.0   # ceiling for the over-budget walk only
+
+    # how a measurement is taken
+    dwell: float = 4.0
+    settle: float = 0.7
+    min_tags: float = 2.0
+    max_ambiguity: float = 0.20
+
+    # the baseline
+    baseline: bool = True
+    baseline_only: bool = False
+    brightness: object = None
+
+    # sampling transport
+    no_nt: bool = False
+    nt_server: object = None
+
+    # wiring, filled in once by _run_inner and by the daemon. Not policy.
+    readers: dict = dataclasses.field(default_factory=dict)
+    nt_inst: object = None
+
+    @classmethod
+    def from_args(cls, a):
+        return cls(host=a.host, port=a.port, cameras=a.cameras,
+                   max_gain=a.max_gain, max_blur_px=a.max_blur_px,
+                   blur_rate=a.blur_rate, fx=a.fx, max_exposure=a.max_exposure,
+                   dwell=a.dwell, settle=a.settle, min_tags=a.min_tags,
+                   max_ambiguity=a.max_ambiguity, baseline=a.baseline,
+                   baseline_only=a.baseline_only, brightness=a.brightness,
+                   no_nt=a.no_nt, nt_server=a.nt_server)
+
+
+class Search:
+    """One camera's search state. Created INSIDE the per-camera loop, never shared.
+
+    The gain ratchet came back three times through three different doors, and
+    every one of them was a value written onto the shared `args` namespace and
+    read by the next camera or the next pass: args.gain, args.gain_steps,
+    args.min_exposure, args.max_exposure, args.steps. The fixes were a
+    save/restore, then a second save/restore, then a per-camera copy.copy - all
+    of them keeping the shared object and promising not to misuse it.
+
+    This is the structural version of that promise. Config is frozen (see
+    Config) and therefore cannot hold search state at all; search state has one
+    home, this object, and it is constructed fresh per camera. A line added
+    later cannot reintroduce the bug, because there is nowhere to write it.
+    """
+    __slots__ = ("cam", "unique", "nickname", "original", "fx", "t_budget",
+                 "exposure", "gain", "reference", "trials", "notes")
+
+    def __init__(self, cam):
+        self.cam = cam
+        self.unique = cam["uniqueName"]
+        self.nickname = cam["nickname"]
+        st = cam["settings"]
+        self.original = {
+            "cameraExposureRaw": st["cameraExposureRaw"],
+            "cameraGain": st["cameraGain"],
+            "cameraAutoExposure": st["cameraAutoExposure"],
         }
-    log("── %s ──  current exposure %s, gain %s" % (name, original["cameraExposureRaw"], original["cameraGain"]))
+        self.fx = None
+        self.t_budget = None       # the blur budget, in microseconds
+        self.exposure = None       # the exposure actually being tried
+        self.gain = None           # the gain actually being tried
+        self.reference = None      # Sample at max gain: the best the scene can do
+        self.trials = []           # every (gain, exposure, Sample), in order
+        self.notes = []            # human-readable trail, for the record
 
-    # Start from the BASELINE gain, not from whatever the last run left behind.
-    # `original` stays the restore target - a failure must put back what the user
-    # had - but it must not be the starting point, or tuning is a ratchet.
-    if args.gain is not None:
-        gain = args.gain
-    elif skip_baseline:
-        gain = original["cameraGain"]          # a re-sweep, already reset
-    else:
-        gain = getattr(args, "start_gain", BASELINE_START_GAIN)
-        if abs(float(original["cameraGain"]) - float(gain)) > 1e-6:
-            log("   gain: resetting to baseline %g (camera was at %g)"
-                % (gain, original["cameraGain"]))
-    result = {"camera": name, "uniqueName": unique, "original": original,
-              "applied": None, "samples": [], "cliff": None, "gain": gain}
-    # A gain escalation re-enters here and RETURNS the inner dict, so anything the
-    # outer frame had already recorded has to be carried in explicitly.
-    for _k in FAILURE_KEYS:
-        if (carry or {}).get(_k):
-            result[_k] = carry[_k]
+    def exposure_bounds(self):
+        """The camera's OWN reported exposure limits, as floats.
 
-    try:
-        # Structural settings FIRST. Tuning exposure against a crushed brightness
-        # just answers with a long, blurry exposure and calls it a success.
-        if getattr(args, "baseline", True) and not skip_baseline:
-            _changed, _failed, _unconfirmed = await assert_baseline(
-                pv, cam, args, log)
-            if _changed:
-                fresh = await pv.cameras_fresh(timeout=8)
-                newer = next((c for c in fresh if c["uniqueName"] == unique), None)
-                if newer:
-                    cam = dict(cam)
-                    cam["settings"] = newer["settings"]
-            result["baseline_changed"] = list(_changed)
-            if _failed:
-                note_problem(result, "baseline_failed",
-                             [list(map(str, f)) for f in _failed])
-            if _unconfirmed:
-                note_problem(result, "baseline_unconfirmed", _unconfirmed)
-        # AFTER the baseline: solvePNPEnabled is PhotonVision's default-off, and
-        # checking first meant the gate was blind on exactly the fresh camera it
-        # exists for. Judge on what the camera will be, not what it was.
-        _was = (cam.get("settings") or {}).get("cameraVideoModeIndex")
-        cam, problem = await ensure_calibrated_mode(pv, cam, args, log)
-        if (cam.get("settings") or {}).get("cameraVideoModeIndex") != _was:
-            note_problem(result, "video_mode_switched",
-                         [_was, cam["settings"].get("cameraVideoModeIndex")])
-        if problem:
-            log("   !! CALIBRATION: %s" % problem)
-            result["error"] = "no calibration for the active resolution"
-            note_problem(result, "calibration_problem", problem)
-            return result
-        if getattr(args, "baseline_only", False):
-            result["applied"] = None
-            result["error"] = "baseline only - not tuned"
-            return result
-
-        bad = await pv.set_and_verify(unique, settle=max(args.settle, 1.5),
-                                      log=log,
-                                      cameraAutoExposure=False, cameraGain=gain)
-        rejected = [b for b in bad if b[0] is not None]
-        unverified = [b for b in bad if b[0] is None]
-        if rejected:
-            for k, want, have in rejected:
-                log("   WARNING: %s did not take (wanted %s, camera has %s)" % (k, want, have))
-            log("   the sweep below is NOT at the gain it claims - results are unreliable")
-            note_problem(result, "setting_rejected",
-                         [list(map(str, b)) for b in rejected])
-        if unverified:
-            # NOT a shrug any more. This is reached only after polling for the
-            # whole confirm timeout, which means PhotonVision stopped answering
-            # with cameraSettings at all - the state a bad pipeline selection
-            # puts it in. Everything measured after it is unattributable: the
-            # sweep cannot say what gain it ran at.
-            log("   !! could not read the camera back to confirm the gain, after"
-                " polling for %.0f s." % CONFIRM_TIMEOUT_S)
-            log("   !! PhotonVision is not reporting cameraSettings. Nothing"
-                " below can be attributed to a known gain.")
-            note_problem(result, "unverified",
-                         "no cameraSettings from PhotonVision for %.0f s"
-                         % CONFIRM_TIMEOUT_S)
-
-        # What is the camera doing RIGHT NOW, before we touch the exposure? Used
-        # afterwards to tell a bad measurement from a genuine detection cliff.
-        base_exposure = float(original.get("cameraExposureRaw") or 0.0)
-        # Measure the baseline AT the baseline exposure, rather than wherever the
-        # camera happens to be sitting.
-        #
-        # On a gain escalation this function re-enters with the camera parked at
-        # the LAST exposure the previous sweep tested - 25000 us - while this
-        # line goes on to claim it measured "its current 1500". base_tags then
-        # described a state the camera was not in, and baseline_contradiction()
-        # compared the new sweep against it and aborted the tune.
-        #
-        # FORCED on this rig with --no-optimise-gain: camera OV9281 escalated
-        # gain 0 -> 10, re-entered with the camera at 25000 us, logged "at its
-        # current 1500 the camera sees 4.00 tags", and then failed the whole
-        # camera with "sweep contradicts baseline (2871 saw 0.00 tags vs 4.00 at
-        # 1500)". Reproduced identically on the previous revision, so it is not
-        # a regression - it is the same class as the read-backs in D6: a number
-        # recorded against a state that was never true.
-        mark0 = capture_mark(args, cam)
-        if base_exposure > 0:
-            await pv.set_setting(unique, cameraExposureRaw=base_exposure)
-            await asyncio.sleep(args.settle)
-        base_raw = await sample(pv, cam, args, max(1.5, args.dwell * 0.6), mark0)
-        base_tags = (sum(base_raw["tags"]) / len(base_raw["tags"])) if base_raw["tags"] else 0.0
-        log("   baseline: at its current %.0f the camera sees %.2f tags"
-            % (base_exposure, base_tags))
-
-        PENDING_RESTORE[unique] = dict(original)
-        samples = []
-        blanks = 0
-        # Clamp to the camera's OWN reported bounds. PhotonVision clamps the
-        # hardware call but stores the unclamped value, so a sweep past the limit
-        # reads back "verified" while every step sits at the same real exposure
-        # and scores identically. Bounds differ per model: this CSI OV9281 reports
-        # 7-80000 us, while USB variants report entirely different ranges.
-        lo, hi = args.min_exposure, args.max_exposure
-        cmin, cmax = cam.get("minExposureRaw"), cam.get("maxExposureRaw")
-        if cmin is not None and lo < float(cmin):
-            log("   raising sweep floor %.0f -> %.0f (camera minimum)" % (lo, float(cmin)))
-            lo = float(cmin)
-        if cmax is not None and hi > float(cmax):
-            log("   lowering sweep ceiling %.0f -> %.0f (camera maximum)" % (hi, float(cmax)))
-            hi = float(cmax)
-        sweep = geometric_sweep(lo, hi, args.steps)
-        for step_i, exposure in enumerate(sweep):
-            if progress:
-                progress(step_i / float(len(sweep)))
-            mark = capture_mark(args, cam)
-            await pv.set_setting(unique, cameraExposureRaw=float(exposure))
-            await asyncio.sleep(args.settle)
-            raw = await sample(pv, cam, args, args.dwell, mark)
-
-            s = Sample(exposure)
-            s.frames = raw["frames"]
-            s.multitag_solves = raw["solves"]
-            s.reproj = raw["reproj"]
-            s.tag_counts = raw["tags"]
-            s.ambiguities = raw["amb"]
-            samples.append(s)
-            ok = s.passes(args.min_tags, args.max_ambiguity)
-            mark = "ok " if ok else "   "
-            log("   %s exposure %8.0f   %s" % (mark, exposure, s.summary()))
-
-            # Overexposure is monotonic: once the image is too bright to detect a
-            # tag, every LONGER exposure is worse. The sweep climbs, so a run of
-            # dead steps at the top is physics, not information. Stop after two
-            # consecutive blanks - two rather than one, so a single dropped frame
-            # or a hand passing the lens cannot truncate the sweep.
-            # Count FAILING steps, not blank ones. A dying exposure usually still
-            # reports 1 tag rather than 0, so gating on "no tags at all" almost
-            # never fires and the sweep runs to the top anyway.
-            if not ok:
-                blanks += 1
-                if blanks >= 2 and any(x.passes(args.min_tags, args.max_ambiguity)
-                                       for x in samples):
-                    skipped = len(sweep) - step_i - 1
-                    if skipped > 0:
-                        log("   (stopping: 2 failed steps, %d longer exposure%s skipped "
-                            "- they can only be worse)"
-                            % (skipped, "" if skipped == 1 else "s"))
-                    break
-            else:
-                blanks = 0
-
-        result["samples"] = [
-            {"exposure": s.exposure, "frames": s.frames, "solve_rate": s.solve_rate,
-             "mean_tags": s.mean_tags, "med_reproj": s.med_reproj,
-             "med_ambiguity": s.med_ambiguity,
-             "passes": s.passes(args.min_tags, args.max_ambiguity)}
-            for s in samples
-        ]
-
-        contra = baseline_contradiction(samples, base_exposure, base_tags)
-        if contra:
-            log("   *** SWEEP CONTRADICTS THE CAMERA'S OWN STARTING STATE - NOT APPLYING ***")
-            log("   At its incoming exposure %.0f the camera saw %.2f tags, but the"
-                % (base_exposure, base_tags))
-            log("   sweep claims %.0f - a LONGER exposure - saw only %.2f."
-                % (contra[0], contra[1]))
-            log("   The scene did not change that much; the measurement is wrong.")
-            log("   Usual cause: something else reading PhotonVision's websocket at")
-            log("   the same time. Stop it and re-run. Settings left untouched.")
-            await pv.set_setting(unique, **original)
-            result["error"] = ("sweep contradicts baseline (%.0f saw %.2f tags vs %.2f at %.0f)"
-                               % (contra[0], contra[1], base_tags, base_exposure))
-            return result
-
-        holes = sweep_holes(samples)
-        if holes:
-            log("   *** THIS SWEEP IS NOT PHYSICALLY POSSIBLE - NOT APPLYING ***")
-            log("   Detection vanished and came back as exposure increased:")
-            for e, t in holes:
-                log("     exposure %8.0f saw %.2f tags, but both shorter AND longer"
-                    " exposures saw tags" % (e, t))
-            log("   Brightness only goes up with exposure, so these samples are")
-            log("   measurement artefacts, not the scene. Usual cause: something")
-            log("   else reading PhotonVision's websocket at the same time, or the")
-            log("   scene changed mid-sweep (someone walked in front of the camera).")
-            log("   Re-run with nothing else talking to PhotonVision.")
-            await pv.set_setting(unique, **original)
-            result["error"] = "non-monotonic sweep (%d impossible samples)" % len(holes)
-            return result
-
-        bias = args.bias
-        chosen, shortest, cliff, tag_target = choose_exposure(
-            samples, bias, args.min_tags, args.max_ambiguity, args.tag_fraction)
-        if tag_target:
-            log("   best exposure saw %.2f tags - requiring >= %.2f (%.0f%%)"
-                % (max(s.mean_tags for s in samples), tag_target, 100*args.tag_fraction))
-        if chosen is None:
-            # Exposure alone could not get there. Raising gain buys brightness
-            # WITHOUT buying motion blur, so escalate gain rather than accept a
-            # long exposure - which is what a naive tuner would do.
-            if args.gain_steps and gain < args.max_gain:
-                nxt, one_jump = _escalate_to(args, gain)
-                log("   nothing passed at gain %g - retrying at gain %g" % (gain, nxt))
-                log("   (gain costs noise; exposure costs blur - prefer gain)")
-                args.gain = nxt
-                args.gain_steps = 0 if one_jump else args.gain_steps - 1
-                return await tune_camera(pv, cam, args, log, progress,
-                                         original=original, skip_baseline=True,
-                                         carry=result)
-            log("   NOTHING PASSED even at gain %g." % gain)
-            log("   That is a LIGHTING or CONFIG problem, not an exposure one:")
-            log("     - check cameraBrightness (a low value crushes the image to black)")
-            log("     - check the camera is actually pointed at tags")
-            log("     - add light, or raise --max-gain")
-            await pv.set_setting(unique, **original)
-            PENDING_RESTORE.pop(unique, None)
-            result["error"] = "no passing exposure even at max gain"
-            return result
-
-        result["cliff"] = cliff
-        log("   cliff ~%.0f (bracketed), shortest verified pass %.0f, bias %.2f  ->  %.0f"
-            % (cliff, shortest.exposure, bias, chosen))
-        fx = camera_fx(cam, args.fx)
-        if abs(fx - args.fx) > 1.0:
-            log("   fx %.1f from this camera's calibration (default was %.1f)"
-                % (fx, args.fx))
-        blur = lambda deg: math.radians(deg) * (chosen / 1e6) * fx
-        log("   predicted blur: %.1f px @90deg/s, %.1f px @%.0fdeg/s"
-            % (blur(90), blur(args.blur_rate), args.blur_rate))
-
-        # Blur is a BUDGET, not a footnote. Until now it was printed and ignored,
-        # so a camera at low gain could be handed an 18814 us exposure - 131 px of
-        # smear across a ~70 px tag, i.e. blind the moment the robot moves - and
-        # the tool would call it a pass because the bench was stationary.
-        # Gain costs noise; exposure costs blur. Trade them.
-        predicted = blur(args.blur_rate)
-        # Only worth raising gain if there is room to go SHORTER. When the cliff
-        # already sits at the bottom of the sweep, more gain cannot buy a shorter
-        # exposure - it just re-sweeps to the same answer until gain_steps runs
-        # out, a minute a time. Seen looping at 10.4 px against a 10 px budget.
-        at_floor = shortest.exposure <= args.min_exposure * 1.25
-        if predicted > args.max_blur_px * 1.15 and not at_floor:
-            if args.gain_steps and gain < args.max_gain:
-                nxt, one_jump = _escalate_to(args, gain)
-                log("   %.0f px of blur at %.0f deg/s exceeds the %.0f px budget"
-                    % (predicted, args.blur_rate, args.max_blur_px))
-                log("   raising gain %g -> %g and re-sweeping (gain costs noise, "
-                    "exposure costs blur)" % (gain, nxt))
-                if one_jump:
-                    # Straight to the top, and only once. If the most gain
-                    # available cannot buy a shorter exposure then no value in
-                    # between can either, and each intermediate step costs a
-                    # whole sweep - measured 23 s. Climbing 0 -> 10 -> 20 cost
-                    # two extra sweeps per camera and ended at the same 1500 us.
-                    # Which gain is actually APPLIED is decided afterwards by the
-                    # fixed-exposure scan, so overshooting here is free.
-                    log("   (straight to the top of the range; the gain finally "
-                        "applied is chosen by the fixed-exposure scan)")
-                # More gain moves the cliff DOWN or leaves it - it can never need
-                # a LONGER exposure - so bracket the previous answer instead of
-                # re-exploring the whole range.
-                args.max_exposure = min(args.max_exposure,
-                                        max(args.min_exposure * 1.5,
-                                            shortest.exposure * 1.5))
-                args.steps = max(3, min(args.steps, 4))
-                args.gain = nxt
-                args.gain_steps = 0 if one_jump else args.gain_steps - 1
-                return await tune_camera(pv, cam, args, log, progress,
-                                         original=original, skip_baseline=True,
-                                         carry=result)
-            log("   !! %.1f px of blur at %.0f deg/s, over the %.0f px budget, and"
-                % (predicted, args.blur_rate, args.max_blur_px))
-            log("   !! gain is already at %g. Works on a BENCH; will smear on a"
-                % gain)
-            log("   !! moving robot. Add light, or raise --max-gain.")
-            note_problem(result, "over_blur_budget", round(predicted, 1))
-        elif predicted > args.max_blur_px and at_floor:
-            log("   note: %.1f px of blur at %.0f deg/s is over the %.0f px budget,"
-                % (predicted, args.blur_rate, args.max_blur_px))
-            log("   but the cliff is already at the bottom of the sweep (%.0f us) -"
-                % args.min_exposure)
-            log("   more gain cannot buy a shorter exposure. Lower --min-exposure"
-                " to explore further, or add light.")
-            note_problem(result, "over_blur_budget", round(predicted, 1))
-
-        mark = capture_mark(args, cam)
-        await pv.set_setting(unique, cameraExposureRaw=float(chosen), cameraGain=gain,
-                             cameraAutoExposure=False)
-        await asyncio.sleep(args.settle)
-        raw = await sample(pv, cam, args, args.dwell, mark)
-        check = Sample(chosen)
-        check.frames = raw["frames"]; check.multitag_solves = raw["solves"]
-        check.reproj = raw["reproj"]; check.tag_counts = raw["tags"]
-        check.ambiguities = raw["amb"]
-        if check.passes(args.min_tags, args.max_ambiguity):
-            log("   applied %.0f - verified: %s" % (chosen, check.summary()))
-            result["applied"] = chosen
-        else:
-            log("   %.0f FAILED verification (%s)" % (chosen, check.summary()))
-            log("   falling back to shortest verified pass: %.0f" % shortest.exposure)
-            await pv.set_setting(unique, cameraExposureRaw=float(shortest.exposure))
-            await asyncio.sleep(args.settle)
-            result["applied"] = shortest.exposure
-            note_problem(result, "fellback", True)
-        PENDING_RESTORE.pop(unique, None)
-        return result
-
-    except BaseException as exc:
-        # BaseException, not Exception. Ctrl-C raises KeyboardInterrupt, which is
-        # NOT an Exception - so an interrupt during the sweep skipped this restore
-        # and left the camera sitting at whatever exposure was being tested.
-        # asyncio.CancelledError is the same family. Restore, then re-raise those
-        # two so the interrupt still ends the program.
-        log("   %s (%s) - restoring original settings"
-            % ("INTERRUPTED" if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError, Terminated))
-               else "ERROR", exc or type(exc).__name__))
-        restored = False
-        try:
-            await pv.set_setting(unique, **original)
-            await asyncio.sleep(0.4)          # let the write reach PhotonVision
-            restored = True
-        except BaseException:
-            pass
-        if restored:
-            PENDING_RESTORE.pop(unique, None)
-        else:
-            # The socket is gone, so nothing was restored - keep the record so
-            # main() can replay it on a fresh connection. Dropping it here meant
-            # a dropped websocket mid-sweep left the camera parked at whatever
-            # exposure was being tested, while the log claimed a restore.
-            PENDING_RESTORE[unique] = dict(original)
-            log("   restore did NOT reach the camera - will retry on a fresh connection")
-        if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError, Terminated)):
-            PENDING_RESTORE[unique] = dict(original)   # loop is dying; main() retries
-            raise
-        result["error"] = str(exc)
-        return result
+        PhotonVision clamps the hardware call but STORES the unclamped value,
+        so an exposure written past the limit reads back "verified" while the
+        sensor sits at the bound. Every exposure this tool writes is clamped
+        here first so the number in the log is the number on the sensor.
+        Measured on this rig's CSI OV9281: 7 to 80000 us. USB variants report
+        entirely different ranges, which is why this is read and not assumed.
+        """
+        lo = self.cam.get("minExposureRaw")
+        hi = self.cam.get("maxExposureRaw")
+        return (float(lo) if lo is not None else EXPOSURE_FLOOR_FALLBACK,
+                float(hi) if hi is not None else EXPOSURE_CEILING_FALLBACK)
 
 
-async def _gain_trial(pv, cam, args, gain, exposure, settle_extra=0.0):
-    """Detection quality at ONE gain, with the exposure held where it is."""
-    mark = capture_mark(args, cam)
+async def trial(pv, cam, cfg, gain, exposure, log=None):
+    """Measure detection quality at ONE (gain, exposure). The only measurement.
+
+    Writes the pair, waits one settle, then samples from the first frame
+    CAPTURED after the write - see capture_mark(). MEASURED apply latency on
+    this rig: exposure 0.25-0.36 s over six trials, gain 0.234 s median
+    (0.197-0.241, n=8), symmetric in both directions. The 0.7 s default settle
+    covers both with about 3x margin, which is what makes walking gain as cheap
+    as walking exposure and therefore makes this design affordable at all.
+    """
+    mark = capture_mark(cfg, cam)
     await pv.set_setting(cam["uniqueName"], cameraAutoExposure=False,
                          cameraGain=int(round(gain)),
                          cameraExposureRaw=float(exposure))
-    await asyncio.sleep(args.settle + settle_extra)
-    raw = await sample(pv, cam, args, args.dwell, mark)
-    s = Sample(exposure)
+    await asyncio.sleep(cfg.settle)
+    raw = await sample(pv, cam, cfg, cfg.dwell, mark)
+    s = Sample(float(exposure), int(round(gain)))
     s.frames = raw["frames"]
     s.multitag_solves = raw["solves"]
     s.reproj = raw["reproj"]
@@ -1377,310 +1089,361 @@ async def _gain_trial(pv, cam, args, gain, exposure, settle_extra=0.0):
     return s
 
 
-async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=False):
-    """ONE exposure sweep, then a gain scan with that exposure held fixed.
+class RobotEnabled(Exception):
+    """The robot went enabled mid-tune. Abort and put the camera back."""
 
-    The old shape ran a whole tune_camera - a complete exposure sweep - once per
-    gain candidate, six times over. MEASURED on this rig: 91.6 s per camera, and
-    what it bought was a decision smaller than its own noise. Holding exposure
-    fixed and repeating the gain scan three times, reprojection at gain 40 read
-    1.100 / 0.683 / 0.431 px - a 2.55x spread at ONE gain - while the decision
-    the tool actually made was gain 80 (0.471) over gain 40 (0.563), a 1.19x
-    difference sitting well inside that spread. It chose 60, 80 and 100 on
-    different runs in the same room and the same light.
 
-    MEASURED costs of the two halves: one 8-step exposure sweep 23 s; a
-    fixed-exposure scan over all six gain candidates 13.2 s (three repeats:
-    13.3 / 13.2 / 13.2). 36 s per camera instead of 91.6 s.
+def _check_not_enabled(cfg, where):
+    """Raise if the robot went enabled. Called BETWEEN steps, never inside one.
 
-    Re-sweeping exposure per gain was never needed anyway: across every run on
-    this rig the cliff sat at 1500 us for every gain from 20 to 100.
+    robot_is_enabled was checked once before the run and never again during
+    it, so a match starting mid-tune left a camera wherever the walk had got
+    to. That violates "a match must never be interrupted" more directly than
+    any bug four audits found. RobotEnabled unwinds through tune_camera's
+    restore, so the camera goes back to what the user had.
+
+    cfg.nt_inst is None on the CLI path, where there is no NetworkTables
+    client to ask - a human at a terminal is not a match.
     """
-    unique = cam["uniqueName"]
-    nick = cam["nickname"]
+    if cfg.nt_inst is not None and robot_is_enabled(cfg.nt_inst):
+        raise RobotEnabled(where)
 
-    # ---- phase 1: find the exposure, once, with the log VISIBLE ----------
-    # The old code passed log=lambda m: None here, which is why a connection
-    # death, a calibration refusal and a dark room all printed as the same
-    # "no passing exposure".
-    saved_gain, saved_steps = args.gain, args.gain_steps
-    saved_bounds = (args.min_exposure, args.max_exposure, args.steps)
-    saved_follows = getattr(args, "_gain_scan_follows", False)
-    args._gain_scan_follows = True      # lets phase 1 escalate in one jump
-    # Pin the starting gain explicitly. tune_camera's skip_baseline branch falls
-    # back to the camera's CURRENT gain, which is the ratchet this tool exists to
-    # avoid: measured, a first pass at a camera left on gain 100 swept at 100 and
-    # then scanned only [100], so the search could never go back down.
-    if args.gain is None:
-        args.gain = float(getattr(args, "start_gain", BASELINE_START_GAIN))
+
+async def tune_camera(pv, cam, cfg, log=print, progress=None):
+    """Fix the exposure at the blur budget, then find the least gain that works.
+
+    One sentence a student can repeat: THE LEAST GAIN THAT STILL SEES EVERY
+    TAG, AT THE EXPOSURE A SPINNING ROBOT ALLOWS.
+
+    A LOOP, returning one record. The previous version escalated by
+    `return await tune_camera(...)`, which discarded the frame that had run the
+    baseline; `carry`, merge_failures, save/restore and copy.copy were four
+    layers protecting one shared object from that. None of them are needed by a
+    loop, so none of them are here.
+
+    Why this shape at all: the old objective was bestReprojErr, which is
+    OpenCV's RMS residual over the corners of the multi-tag fit. It measures
+    internal consistency of a fit, NOT pose accuracy, and it IMPROVES when
+    distant tags drop out of the solve - fewer, closer corners fit better. So
+    the optimiser was rewarded for losing tags, a tag-count guard had to be
+    bolted on to stop it, and with nothing in the objective penalising gain the
+    only thing that ever stopped it choosing maximum was a tie-break floored at
+    an arbitrary constant. MEASURED: 0.0-0.9% repeat noise, ~2.0% drift across
+    one scan, decisions turning on 0.005 px, and six identical runs on one
+    camera choosing gain 60, 80, 60, 80, 100, 100.
+
+    Reprojection is still RECORDED and printed. It is simply not permitted to
+    choose anything.
+    """
+    st = Search(cam)
+    rec = {"camera": st.nickname, "uniqueName": st.unique,
+           "original": dict(st.original), "applied": None, "gain": None,
+           "trials": [], "budget": None}
+    log("── %s ──  current exposure %s, gain %s"
+        % (st.nickname, st.original["cameraExposureRaw"], st.original["cameraGain"]))
+
     try:
-        r = await tune_camera(
-            pv, cam, args, log=log,
-            progress=(lambda f: progress(0.55 * f)) if progress else None,
-            skip_baseline=skip_baseline)
-    finally:
-        # tune_camera writes args.gain and narrows the sweep bounds during an
-        # escalation, and args is shared across cameras - camera 1's answer used
-        # to become camera 2's start.
-        args.gain, args.gain_steps = saved_gain, saved_steps
-        args.min_exposure, args.max_exposure, args.steps = saved_bounds
-        args._gain_scan_follows = saved_follows
+        # ---- 1. the baseline, and the calibration it depends on -----------
+        if cfg.baseline:
+            changed, failed, unconfirmed = await assert_baseline(pv, cam, cfg, log)
+            if changed:
+                fresh = await pv.cameras_fresh(timeout=8)
+                newer = next((c for c in fresh if c["uniqueName"] == st.unique), None)
+                if newer:
+                    cam = dict(cam)
+                    cam["settings"] = newer["settings"]
+                    st.cam = cam
+                rec["baseline_changed"] = list(changed)
+            if failed:
+                note_problem(rec, "baseline_failed",
+                             [list(map(str, f)) for f in failed])
+            if unconfirmed:
+                note_problem(rec, "baseline_unconfirmed", unconfirmed)
+        # AFTER the baseline: solvePNPEnabled is PhotonVision's default-off, so
+        # checking first left the gate blind on exactly the fresh camera it
+        # exists for. Judge on what the camera will be, not what it was.
+        was_mode = (cam.get("settings") or {}).get("cameraVideoModeIndex")
+        cam, problem = await ensure_calibrated_mode(pv, cam, cfg, log)
+        st.cam = cam
+        if (cam.get("settings") or {}).get("cameraVideoModeIndex") != was_mode:
+            note_problem(rec, "video_mode_switched",
+                         [was_mode, cam["settings"].get("cameraVideoModeIndex")])
+        if problem:
+            log("   !! CALIBRATION: %s" % problem)
+            rec["error"] = "no calibration for the active resolution"
+            note_problem(rec, "calibration_problem", problem)
+            return rec
+        if cfg.baseline_only:
+            rec["error"] = "baseline only - not tuned"
+            return rec
 
-    exposure = r.get("applied")
-    if not exposure:
-        return r                 # the sweep already said why, in the real log
+        # ---- 2. the exposure, which is not searched for -------------------
+        st.fx = camera_fx(cam, cfg.fx)
+        lo_e, hi_e = st.exposure_bounds()
+        want = blur_budget_exposure(cfg.max_blur_px, cfg.blur_rate, st.fx)
+        st.t_budget = min(max(want, lo_e), hi_e)
+        rec["budget"] = {"fx": st.fx, "max_blur_px": cfg.max_blur_px,
+                         "blur_rate": cfg.blur_rate, "wanted": want,
+                         "exposure": st.t_budget}
+        log("   fx %.1f from this camera's own calibration; %g px at %.0f deg/s "
+            "allows %.0f us" % (st.fx, cfg.max_blur_px, cfg.blur_rate, want))
+        if abs(st.t_budget - want) > 1.0:
+            log("   clamped to the camera's reported range %.0f-%.0f us -> %.0f us"
+                % (lo_e, hi_e, st.t_budget))
+        st.exposure = st.t_budget
 
-    original = r.get("original") or {}
+        PENDING_RESTORE[st.unique] = dict(st.original)
+        gains, margin_step = gain_grid(cfg.max_gain)
 
-    # ---- phase 2: scan gain with that exposure held ----------------------
-    # The FULL range, not "from whatever the sweep ended at". Phase 1 may have
-    # jumped to the ceiling just to find an exposure; the whole point of the scan
-    # is to walk that back down, and a trial that cannot see the tags at a low
-    # gain drops out on its own merits.
-    lo = float(saved_gain if saved_gain is not None
-               else getattr(args, "start_gain", BASELINE_START_GAIN))
-    hi = float(args.max_gain)
-    n = max(1, int(args.gain_search_steps))
-    if n == 1 or hi <= lo:
-        gains = [lo]
-    else:
-        gains = [lo + (hi - lo) * i / float(n - 1) for i in range(n)]
-    gains = sorted({int(round(g)) for g in gains})
-    log("   gain scan at exposure %.0f over %s" % (exposure, gains))
+        # ---- 3. the reference: the best this scene can do inside the budget
+        _check_not_enabled(cfg, "before the reference measurement")
+        top = gains[-1]
+        st.reference = await trial(pv, cam, cfg, top, st.exposure, log)
+        st.trials.append(st.reference)
+        log("   reference  gain %-4d exposure %6.0f  %s"
+            % (top, st.exposure, st.reference.summary()))
+        best_tags = st.reference.mean_tags
 
-    # Phase 1 popped this on success, but the camera is about to be moved again.
-    if original:
-        PENDING_RESTORE[unique] = dict(original)
-
-    steps = len(gains) + GAIN_REPEATS
-    measured = []
-    for i, gv in enumerate(gains):
-        if progress:
-            progress(0.55 + 0.45 * i / steps)
-        try:
-            s = await _gain_trial(pv, cam, args, gv, exposure)
-        except Exception as exc:
-            # Abort the SCAN, not the run. Running the remaining trials against a
-            # dead socket produced five more silent no-ops and then blamed the
-            # lighting; the sweep's own answer is still good and is kept.
-            log("       gain %-5d  ABORTED: %s (%s)"
-                % (gv, type(exc).__name__, exc or "no detail"))
-            log("   stopping the gain scan with %d candidate(s) untried - a dead "
-                "connection is not a dark room. Keeping the sweep's answer."
-                % (len(gains) - i))
-            note_problem(r, "gain_scan_error",
-                         "%s aborted it with %d candidate(s) untried"
-                         % (type(exc).__name__, len(gains) - i))
-            break
-        measured.append((gv, s))
-        log("       gain %-5d  %s" % (gv, s.summary()))
-
-    # The SAME tag-count floor the exposure sweep applies, for the same reason.
-    # The scan used to pass no tag_target at all, so a gain that had started
-    # losing tags could still win on reprojection - and fitting four corners of
-    # three tags well is not better than fitting four tags. OBSERVED: the scan
-    # pinned gain at the top of the range while mean tags fell from 4.00 to
-    # 3.5-3.8. A gain that loses tags is not a better gain.
-    #
-    # Computed from the scan's own best, exactly as choose_exposure() computes it
-    # from the sweep's own best, so the two halves of the tune judge alike.
-    best_tags = max((s.mean_tags for _g, s in measured), default=0.0)
-    tag_target = (best_tags * args.tag_fraction
-                  if best_tags >= 2 else None)
-    if tag_target:
-        log("   best gain saw %.2f tags - requiring >= %.2f (%.0f%%) of every "
-            "other gain" % (best_tags, tag_target, 100 * args.tag_fraction))
-
-    trials = []
-    reasons = {}
-    for gv, s in measured:
-        why = s.why_failed(args.min_tags, args.max_ambiguity, tag_target)
-        trials.append((gv, s.med_reproj if why is None else None, s))
-        if why is not None:
-            reasons[gv] = why
-            log("   rejected gain %-5d - %s" % (gv, why))
-
-    good = [t for t in trials if t[1] is not None]
-    if not good:
-        log("   no gain in the scan measured usable reprojection - keeping the "
-            "sweep's own gain %g. Reasons: %s"
-            % (lo, "; ".join("gain %d: %s" % (g, w) for g, w in sorted(reasons.items()))
-               or r.get("gain_scan_error", "none recorded")))
-        PENDING_RESTORE.pop(unique, None)
-        return r
-
-    # ---- phase 3: how much of that spread is just measurement noise? -----
-    #
-    # Measured AT THE CANDIDATE THAT IS ABOUT TO WIN, not at the first one that
-    # passed. This is the whole of D4. The old code repeated the first passing
-    # gain - in practice gain 0, the quietest operating point on the sensor -
-    # measured 0% repeat noise there, and then floored the band at 5% and used
-    # that 5% to judge a decision being made at gain 100. FORCED by the audit:
-    # three identical runs in the same room and the same light chose 100, 100,
-    # 60, because at the deciding point gain 100 read 0.378 / 0.393 / 0.510 - a
-    # 35% swing - while every gain that was NOT deciding anything was stable to
-    # 0.2% (gain 60: 0.478 / 0.479 / 0.478). The noise was real; it was simply
-    # never measured where the decision was made.
-    #
-    # Two consequences, both deliberate:
-    #  - the leader's reprojection becomes the MEDIAN of its repeats, so a single
-    #    lucky reading cannot win the scan;
-    #  - the noise band is the spread actually observed at that point, so a lead
-    #    smaller than it is reported as a tie and the LOWER gain takes it.
-    leader = min(good, key=lambda t: t[1])
-    repeats = [leader[1]]
-    if len(good) > 1 and not r.get("gain_scan_error"):
-        for k in range(GAIN_REPEATS):
+        # ---- 4. walk gain UP, stop at the first pass ----------------------
+        #
+        # UP from zero, not down from the top and not out from a previous
+        # answer. Gain is not a setting with a good value - it is a cost paid
+        # in sensor noise to buy a shorter exposure, and the exposure is
+        # already fixed, so the right amount is the least that works. Starting
+        # anywhere else is what made this a ratchet: escalation is one-way, so
+        # a tune that starts from the last tune's answer walks toward maximum
+        # gain over a season with nothing reporting it.
+        picked = None
+        for i, g in enumerate(gains):
             if progress:
-                progress(0.55 + 0.45 * (len(gains) + k) / steps)
-            try:
-                again = await _gain_trial(pv, cam, args, leader[0], exposure)
-            except Exception as exc:
-                log("   repeat %d of gain %d failed: %s - noise estimated from "
-                    "%d reading(s)" % (k + 1, leader[0], type(exc).__name__,
-                                       len(repeats)))
-                note_problem(r, "gain_scan_error",
-                             "%s during the repeat that measures the noise"
-                             % type(exc).__name__)
+                progress(0.1 + 0.7 * i / float(len(gains)))
+            _check_not_enabled(cfg, "walking gain at %d" % g)
+            if g == top:
+                s = st.reference            # already measured; same operating point
+            else:
+                s = await trial(pv, cam, cfg, g, st.exposure, log)
+                st.trials.append(s)
+            why = s.why_failed(cfg.min_tags, cfg.max_ambiguity, best_tags)
+            log("   %s gain %-4d exposure %6.0f  %s%s"
+                % ("ok " if why is None else "   ", g, st.exposure, s.summary(),
+                   "" if why is None else "   <- " + why))
+            if why is None:
+                picked = g
                 break
-            if again.passes(args.min_tags, args.max_ambiguity,
-                            tag_target) and again.med_reproj:
-                repeats.append(again.med_reproj)
+
+        if picked is not None:
+            # ONE grid step of margin. A field is not the pit: the light
+            # changes, the tags get further away, and the cost of one step is
+            # sensor noise on a solve that is already passing, while the cost
+            # of being one step short is a camera that stops seeing tags.
+            st.gain = gain_with_margin(picked, margin_step, cfg.max_gain)
+            if st.gain != picked:
+                log("   lowest gain that sees every tag: %d. Applying %d - one "
+                    "grid step of margin, because a field is not the pit."
+                    % (picked, st.gain))
             else:
-                # A repeat that no longer passes is not a missing measurement,
-                # it is evidence the leader is not repeatable. Say so.
-                log("   repeat %d of gain %d did NOT pass this time (%s)"
-                    % (k + 1, leader[0], again.summary()))
-    if len(repeats) > 1:
-        log("   gain %d repeated %d times: %s - %.0f%% spread AT THE DECIDING "
-            "POINT" % (leader[0], len(repeats),
-                       " / ".join("%.3f" % x for x in repeats),
-                       100 * (math.exp(abs(math.log(max(repeats) / min(repeats)))) - 1)))
-        if abs(_median(repeats) - leader[1]) > 1e-9:
-            log("      using the median of those, %.3f, not the single reading "
-                "%.3f that happened to lead" % (_median(repeats), leader[1]))
+                log("   lowest gain that sees every tag: %d, which is already "
+                    "the top of the range - no margin left to add." % picked)
+        else:
+            # ---- 5/6. nothing in the grid worked at the budget exposure ----
+            st.gain, st.exposure = await _rescue(pv, cam, cfg, st, rec, log)
+            if st.gain is None:
+                msg = ("no gain from %s saw the tags at %.0f us, and neither a "
+                       "shorter nor a longer exposure did. That is a LIGHTING "
+                       "or CONFIG problem, not a tuning one: check "
+                       "cameraBrightness, check the camera is pointed at tags, "
+                       "add light." % (gains, st.t_budget))
+                log("   !! " + msg)
+                note_problem(rec, "no_workable_settings", msg)
+                rec["error"] = "nothing worked at any gain or exposure"
+                await pv.set_setting(st.unique, **st.original)
+                await asyncio.sleep(0.4)
+                PENDING_RESTORE.pop(st.unique, None)
+                return rec
 
-    by_gain = {g: s for g, _rp, s in good}
-    pick, best, band, noise, pairs = gain_decision(
-        [(g, rp) for g, rp, _s in good], repeats, leader[0],
-        args.reproj_tolerance)
-    good = [(g, rp, by_gain[g]) for g, rp in pairs]
+        # ---- 7. apply, confirm, and report the blur we ended up with ------
+        _check_not_enabled(cfg, "before the final write")
+        rec["gain"] = st.gain
+        want_state = {"cameraGain": int(st.gain),
+                      "cameraExposureRaw": float(st.exposure)}
+        await pv.set_setting(st.unique, cameraAutoExposure=False, **want_state)
+        # cameraSettings lags a write by 1-2 s, so a plain read here reports the
+        # PREVIOUS value and cries MISMATCH on a write that succeeded. Poll.
+        bad, read_ok = await pv.confirm(st.unique, want_state,
+                                        settle=max(cfg.settle, 1.5), log=log)
+        if not read_ok:
+            log("   !! applied gain %d / exposure %.0f but the camera never "
+                "reported back - the write is UNCONFIRMED."
+                % (st.gain, st.exposure))
+            note_problem(rec, "apply_unconfirmed",
+                         "no cameraSettings for %.0f s after the final write"
+                         % CONFIRM_TIMEOUT_S)
+            rec["error"] = "could not confirm the final write"
+            return rec
+        if bad:
+            got = {k: h for k, _w, h in bad}
+            log("   *** MISMATCH *** wanted gain %d / exposure %.0f, camera "
+                "reports %s" % (st.gain, st.exposure,
+                                ", ".join("%s=%s" % (k, v) for k, v in got.items())))
+            # applied stays None. The camera is NOT at the settings this run
+            # chose, and saying "exposure -> 864" about a camera that is not at
+            # 864 is the lie this tool most needed to stop telling: it used to
+            # print MISMATCH and then set applied on the next line anyway.
+            note_problem(rec, "apply_mismatch",
+                         {"wanted": [st.gain, st.exposure],
+                          "got": [got.get("cameraGain", st.gain),
+                                  got.get("cameraExposureRaw", st.exposure)]})
+            rec["error"] = "the final write did not take"
+            return rec
 
-    log("      %s" % ", ".join("gain %d -> %.3f" % (g, rp) for g, rp, _ in good))
-    if len(good) == 1:
-        log("   only gain %d measured usable reprojection (%.3f) at exposure %.0f"
-            % (pick[0], pick[1], exposure))
-    elif pick[0] == best[0]:
-        log("   chose gain %d at exposure %.0f - reproj %.3f, the best measured "
-            "and outside the %.0f%% noise measured at that gain"
-            % (pick[0], exposure, pick[1], 100 * (band - 1)))
-        if pick[0] >= max(t[0] for t in trials) and len(trials) > 1:
-            log("      NOTE: that is the TOP of the search range - the optimum "
-                "may be higher. Raise --max-gain to find it.")
-    else:
-        log("   chose gain %d (reproj %.3f) over gain %d (reproj %.3f) at "
-            "exposure %.0f" % (pick[0], pick[1], best[0], best[1], exposure))
-        log("      NOT SIGNIFICANT: the difference is inside the %.0f%% noise "
-            "measured at gain %d itself, so the two cannot be separated - and "
-            "the lower gain is the one with less sensor noise."
-            % (100 * (band - 1), leader[0]))
+        px = blur_px(st.exposure, cfg.blur_rate, st.fx)
+        log("   applied gain %d / exposure %.0f - confirmed. %.1f px of smear "
+            "at %.0f deg/s (budget %g)"
+            % (st.gain, st.exposure, px, cfg.blur_rate, cfg.max_blur_px))
+        if px > cfg.max_blur_px * 1.001:
+            note_problem(rec, "over_blur_budget", round(px, 1))
+        rec["applied"] = st.exposure
+        PENDING_RESTORE.pop(st.unique, None)
+        if progress:
+            progress(1.0)
+        return rec
 
-    r["gain_trials"] = [{"gain": g, "reproj": rp, "frames": s.frames,
-                         "mean_tags": s.mean_tags, "solve_rate": s.solve_rate,
-                         "why_failed": reasons.get(g)}
-                        for g, rp, s in trials]
-    r["gain_tag_target"] = tag_target
-    r["gain_repeats"] = {"gain": leader[0], "reproj": repeats}
-    r["gain_noise_pct"] = None if noise is None else round(100 * (math.exp(noise) - 1), 1)
-    r["gain_significant"] = (pick[0] == best[0])
-
-    # Explicitly apply the winner. The scan leaves whichever gain was tried LAST
-    # on the camera - the repeat, in fact - which is the winner only by luck.
-    if True:
-        # Guarded for the same reason as the trials: if the socket died during
-        # the scan, the apply cannot succeed, and a traceback out of here loses
-        # the whole run's result. PENDING_RESTORE is deliberately left in place
-        # on failure so the exit-path replay puts the camera back.
-        want = {"cameraGain": int(pick[0]), "cameraExposureRaw": float(exposure)}
+    except BaseException as exc:
+        # BaseException, not Exception. Ctrl-C raises KeyboardInterrupt, which
+        # is NOT an Exception, so an interrupt during the walk skipped this
+        # restore and left the camera at whatever it was testing.
+        # asyncio.CancelledError is the same family.
+        interrupted = isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError,
+                                       Terminated))
+        log("   %s (%s) - restoring original settings"
+            % ("INTERRUPTED" if interrupted else "ERROR",
+               exc or type(exc).__name__))
+        restored = False
         try:
-            await pv.set_setting(unique, cameraAutoExposure=False, **want)
-            # cameraSettings lags a second or two, so a plain read here reports
-            # the PREVIOUS value and cries MISMATCH on a write that succeeded -
-            # poll until it agrees or the timeout expires.
-            bad, read_ok = await pv.confirm(unique, want,
-                                            settle=max(args.settle, 1.5), log=log)
-        except Exception as exc:
-            log("   could not apply gain %d / exposure %.0f: %s"
-                % (pick[0], exposure, type(exc).__name__))
-            r["error"] = "could not apply the tuned settings (%s)" % type(exc).__name__
-            r["applied"] = None
-            return r
-        r["gain"] = pick[0]
-        if not read_ok or bad:
-            # THE defect this tool most needed to stop doing. It already
-            # detected this, logged "*** MISMATCH ***" - and then set
-            # r["applied"] = exposure on the next line regardless, so the CLI
-            # exited 0 and the daemon published ok=true for a write the tool had
-            # just proved did not take.
-            #
-            # applied stays None: the camera is NOT at the settings this run
-            # chose, and saying "exposure -> 1500" about a camera that is not at
-            # 1500 is the lie. PENDING_RESTORE is deliberately left in place, so
-            # the exit path puts the camera back where the user had it rather
-            # than leaving it in a state nobody chose.
-            if not read_ok:
-                log("   !! applied gain %d / exposure %.0f but the camera never "
-                    "reported back - the write is UNCONFIRMED."
-                    % (pick[0], exposure))
-                note_problem(r, "apply_unconfirmed",
-                             "no cameraSettings for %.0f s after the final write"
-                             % CONFIRM_TIMEOUT_S)
-                r["error"] = "could not confirm the final write"
-            else:
-                got = {k: h for k, _w, h in bad}
-                log("   *** MISMATCH *** wanted gain %d / exposure %.0f, camera "
-                    "reports %s" % (pick[0], exposure,
-                                    ", ".join("%s=%s" % (k, v) for k, v in got.items())))
-                note_problem(r, "apply_mismatch",
-                             {"wanted": [pick[0], exposure],
-                              "got": [got.get("cameraGain", pick[0]),
-                                      got.get("cameraExposureRaw", exposure)]})
-                r["error"] = "the final write did not take"
-            r["applied"] = None
-            return r
-        log("   applied gain %d / exposure %.0f - confirmed" % (pick[0], exposure))
-        r["applied"] = exposure
-        PENDING_RESTORE.pop(unique, None)
-    if progress:
-        progress(1.0)
-    return r
+            await pv.set_setting(st.unique, **st.original)
+            await asyncio.sleep(0.4)          # let the write reach PhotonVision
+            restored = True
+        except BaseException:
+            pass
+        if restored:
+            PENDING_RESTORE.pop(st.unique, None)
+        else:
+            # The socket is gone, so nothing was restored - keep the record so
+            # the exit path can replay it on a fresh connection. Dropping it
+            # here meant a dropped websocket mid-walk left the camera parked at
+            # whatever it was testing, while the log claimed a restore.
+            PENDING_RESTORE[st.unique] = dict(st.original)
+            log("   restore did NOT reach the camera - will retry on a fresh "
+                "connection")
+        if interrupted:
+            PENDING_RESTORE[st.unique] = dict(st.original)   # loop is dying
+            raise
+        if isinstance(exc, RobotEnabled):
+            note_problem(rec, "robot_enabled_midrun", str(exc))
+            rec["error"] = "aborted: the robot went enabled (%s)" % exc
+            return rec
+        note_problem(rec, "search_error",
+                     "%s: %s" % (type(exc).__name__, exc or "no detail"))
+        rec["error"] = str(exc) or type(exc).__name__
+        return rec
+    finally:
+        rec["trials"] = [{"gain": s.gain, "exposure": s.exposure,
+                          "frames": s.frames, "mean_tags": s.mean_tags,
+                          "solve_rate": s.solve_rate,
+                          "med_reproj": s.med_reproj,
+                          "med_ambiguity": s.med_ambiguity}
+                         for s in st.trials]
 
 
-async def verify_final_state(pv, cam, rec, args, log):
+async def _rescue(pv, cam, cfg, st, rec, log):
+    """Nothing in the gain grid passed at the budget exposure. Which way is out?
+
+    Two possibilities, and they need opposite answers, so guessing is not an
+    option:
+
+      SATURATED - the image is already too bright, so gain makes it worse. The
+        signature is failing at gain 0 AND at maximum gain with the tag count
+        FALLING as gain rises. Judged with the same significance test the walk
+        uses, not with a fraction. The way out is a SHORTER exposure, which
+        also costs nothing in blur.
+
+      TOO DARK - even maximum gain cannot make the budget exposure work. The
+        only way out is a LONGER exposure, which is over the blur budget by
+        definition, so it is applied and reported as a warning rather than
+        silently accepted.
+
+    Returns (gain, exposure), or (None, None) if neither walk found anything.
+    """
+    gains, _step = gain_grid(cfg.max_gain)
+    lo_e, hi_e = st.exposure_bounds()
+    at_zero = next((s for s in st.trials if s.gain == gains[0]), None)
+    at_top = st.reference
+    saturated = (at_zero is not None
+                 and at_top.tags_significantly_below(at_zero.mean_tags))
+
+    if saturated:
+        log("   tags FALL as gain rises (%.2f at gain %d, %.2f at gain %d) - "
+            "the image is saturated, not dark. Walking exposure DOWN at gain %d."
+            % (at_zero.mean_tags, gains[0], at_top.mean_tags, gains[-1], gains[0]))
+        floor = max(lo_e, st.t_budget / 32.0)
+        ladder = geometric_sweep(st.t_budget, floor, EXPOSURE_WALK_STEPS + 1)[1:]
+        gain = gains[0]
+    else:
+        ceiling = min(hi_e, cfg.max_exposure)
+        if ceiling <= st.t_budget * 1.001:
+            log("   even gain %d cannot work at %.0f us, and there is no longer "
+                "exposure available (ceiling %.0f us)."
+                % (gains[-1], st.t_budget, ceiling))
+            return None, None
+        log("   even gain %d cannot see the tags at %.0f us - the scene is too "
+            "dark for the blur budget. Walking exposure UP at gain %d; whatever "
+            "this lands on is over budget by definition."
+            % (gains[-1], st.t_budget, gains[-1]))
+        ladder = geometric_sweep(st.t_budget, ceiling, EXPOSURE_WALK_STEPS + 1)[1:]
+        gain = gains[-1]
+
+    for i, e in enumerate(ladder):
+        _check_not_enabled(cfg, "walking exposure at %.0f us" % e)
+        e = min(max(e, lo_e), hi_e)
+        s = await trial(pv, cam, cfg, gain, e, log)
+        st.trials.append(s)
+        # No tag reference on this walk. The reference is "the best the scene
+        # can do INSIDE the budget", and this walk has already left the budget -
+        # comparing against a count that was measured in a state we have just
+        # abandoned would reject the only settings that work.
+        why = s.why_failed(cfg.min_tags, cfg.max_ambiguity)
+        log("   %s gain %-4d exposure %6.0f  %s%s"
+            % ("ok " if why is None else "   ", gain, e, s.summary(),
+               "" if why is None else "   <- " + why))
+        if why is None:
+            return gain, e
+    return None, None
+
+
+async def verify_final_state(pv, cam, rec, cfg, log):
     """Re-read the camera AFTER its tune and check it is where we left it.
 
     Every read-back before this one was a snapshot taken seconds before the run
     ended, and a snapshot only proves the value was right at that instant.
-    MEASURED: photontune's own NetworkTables-server toggle bounced a competing
-    writer offline inside the baseline read-back window; the read-back saw the
-    value it wanted, recorded no failure, the run exited 0 - and the camera
-    ended that run with cameraRedGain=50, which the baseline exists to set to 0.
-    Nothing in the tool looked again.
+    MEASURED: a competing writer was bounced offline inside the baseline
+    read-back window; the read-back saw the value it wanted, recorded no
+    failure, the run exited 0 - and the camera ended that run with
+    cameraRedGain=50, which the baseline exists to set to 0. Nothing in the
+    tool looked again.
 
     Only runs when something was actually applied: on a failure path the camera
     is deliberately put back to the user's own settings, which legitimately do
     not match the baseline.
     """
-    baseline_only = getattr(args, "baseline_only", False)
-    if not rec.get("applied") and not baseline_only:
+    if not rec.get("applied") and not cfg.baseline_only:
         return
     expect = {}
-    if getattr(args, "baseline", True):
+    if cfg.baseline:
         for tbl in (BASELINE_ALWAYS, BASELINE_DEFAULT):
             for k, (_v, e, _why) in tbl.items():
                 expect[k] = e
-        if getattr(args, "brightness", None) is not None:
-            expect["cameraBrightness"] = int(args.brightness)
+        if cfg.brightness is not None:
+            expect["cameraBrightness"] = int(cfg.brightness)
     if rec.get("applied"):
         expect["cameraExposureRaw"] = float(rec["applied"])
         if rec.get("gain") is not None:
@@ -1812,164 +1575,110 @@ class RunLock:
                 % (self.holder or "pid unknown"))
 
 
-async def run(args, log=print, progress=None, on_camera=None):
+async def run(cfg, log=print, progress=None, on_camera=None):
     lock = RunLock()
     if not lock.acquire():
         raise AlreadyRunning(lock.message())
     try:
-        return await _run_locked(args, log, progress, on_camera)
+        return await _run_inner(cfg, log, progress, on_camera)
     finally:
         lock.release()
 
 
-async def _run_locked(args, log=print, progress=None, on_camera=None):
-    args._run_problems = {}      # per RUN, not per camera; reset every trigger
-    return await _run_inner(args, log, progress, on_camera)
-
-
-async def _run_inner(args, log=print, progress=None, on_camera=None):
-    async with Photon(args.host, args.port) as pv:
+async def _run_inner(cfg, log=print, progress=None, on_camera=None):
+    async with Photon(cfg.host, cfg.port) as pv:
         cams = await pv.cameras()
         if not cams:
-            raise LookupError("no cameras reported by PhotonVision at %s" % args.host)
-        if args.cameras:
-            want = {c.strip().lower() for c in args.cameras.split(",")}
+            raise LookupError("no cameras reported by PhotonVision at %s" % cfg.host)
+        if cfg.cameras:
+            want = {c.strip().lower() for c in cfg.cameras.split(",")}
             matched = [c for c in cams
                        if c["nickname"].lower() in want or c["uniqueName"].lower() in want]
             if not matched:
                 raise LookupError(
                     "no camera matched %r. Available: %s"
-                    % (args.cameras, ", ".join(c["nickname"] for c in cams)))
+                    % (cfg.cameras, ", ".join(c["nickname"] for c in cams)))
             cams = matched
-        log("tuning %d camera(s): %s" % (len(cams), ", ".join(c["nickname"] for c in cams)))
-        args._nt = {}
-        if not getattr(args, "no_nt", False):
-            # Try the given server, then loopback. Running ON the coprocessor,
-            # --host defaults to photonvision.local, and resolving its own mDNS
-            # name does not connect - so a bare invocation silently fell back to
-            # the slow websocket path. 127.0.0.1 is harmless to try elsewhere:
-            # if nothing is listening, available() just returns False.
-            cands = [args.nt_server or args.host]
-            if "127.0.0.1" not in cands:
-                cands.append("127.0.0.1")
-            for ntsrv in cands:
-                try:
-                    readers = {}
-                    for c in cams:
-                        r = NTResults(ntsrv, c["nickname"])
-                        if not r.available():
-                            r.close()
-                            for done in readers.values():
-                                done.close()
-                            readers = {}
-                            break
-                        readers[c["nickname"]] = r
-                    if readers:
-                        args._nt = readers
-                        log("   NetworkTables server: %s" % ntsrv)
-                        break
-                except Exception as exc:
-                    log("   NT unavailable via %s (%s)" % (ntsrv, exc))
-        if args._nt:
+        log("%s %d camera(s): %s"
+            % ("baseline for" if cfg.baseline_only else "tuning", len(cams),
+               ", ".join(c["nickname"] for c in cams)))
+        readers = {} if cfg.baseline_only else _open_readers(cfg, cams, log)
+        # The ONE place the frozen config gains its sampling wiring. After this
+        # line nothing may write to cfg at all, which is what makes the gain
+        # ratchet inexpressible rather than merely absent.
+        cfg = dataclasses.replace(cfg, readers=readers)
+        if readers:
             log("   sampling over NetworkTables (~4.8x the frames of the websocket)")
-        else:
-            log("   sampling over the websocket - it is throttled to ~9 fps, so each")
-            log("   sweep point is scored on ~30 frames. Run with an NT server"
-                " reachable for better data.")
-        results = []
-        return await _tune_all(pv, cams, args, log, progress, on_camera, results)
+        elif not cfg.baseline_only:
+            log("   sampling over the websocket - it is throttled to ~9 results/s")
+            log("   per camera (measured on this rig, both cameras streaming:")
+            log("   8.9 and 9.0), so a %.1f s dwell is ~%d frames."
+                % (cfg.dwell, int(cfg.dwell * 9)))
+        try:
+            return await _tune_all(pv, cams, cfg, log, progress, on_camera)
+        finally:
+            for r in readers.values():
+                r.close()
 
 
-async def _tune_all(pv, cams, outer_args, log, progress, on_camera, results):
-        for idx, cam in enumerate(cams):   # sequential: avoids cameras perturbing each other
-            # EVERY camera gets its own argument state. Not a save/restore around
-            # each call - a copy, so there is no door left to leave open.
-            #
-            # This bug arrived twice through two different doors. The first fix
-            # put a save/restore inside optimise_gain; _tune_all then called
-            # tune_camera DIRECTLY on the --no-optimise-gain path with no restore
-            # at all, and the same bug came straight back. FORCED: camera 1
-            # escalated 0 -> 10 -> 20 -> 30 and narrowed its sweep to a 4-point
-            # 200/471/1111/2620 grid; camera 2 then logged "gain is already at
-            # 30", never printed "resetting to baseline 0", and swept camera 1's
-            # leftover grid instead of its own range. Exit 0.
-            #
-            # tune_camera mutates args.gain, args.gain_steps, args.min_exposure,
-            # args.max_exposure and args.steps as it escalates. A shallow copy
-            # keeps those per camera while sharing _nt (the readers are meant to
-            # be shared) - so a third door cannot open.
-            # Rebinding `args` itself, not introducing a second name: every
-            # line below - and every line anyone adds below - uses the
-            # per-camera copy automatically. A `cam_args` alias standing next to
-            # a live `args` would leave the same door open for the next edit to
-            # walk through, and this bug has already come back once that way.
-            args = copy.copy(outer_args)
-            def cam_progress(f, idx=idx):
-                if progress:
-                    progress((idx + f) / float(len(cams)))
-            if on_camera:
-                on_camera(cam["nickname"], idx, len(cams))
-            # THE per-camera record. It is built here and not by tune_camera,
-            # because this frame is the only one present for the whole camera:
-            # the gain search calls tune_camera with skip_baseline=True and a gain
-            # escalation returns a fresh inner dict, so a failure recorded down
-            # there had no way back up. Measured: a run whose baseline did not
-            # apply exited 0.
-            rec = {"camera": cam["nickname"], "uniqueName": cam["uniqueName"],
-                   "applied": None}
-            if args.optimise_gain:
-                # Structural settings BEFORE the gain search, not inside it.
-                # optimise_gain runs tune_camera with its logging discarded, so a
-                # baseline failure was both invisible and too late: measured, a
-                # camera left at inputImageRotationMode=1 made all six gain trials
-                # report "no passing exposure" - six full sweeps burned against a
-                # camera that was broken in a way the tool already knew how to fix,
-                # and the fix only landed afterwards in the fallback path.
-                if getattr(args, "baseline", True):
-                    _ch, _fl, _un = await assert_baseline(pv, cam, args, log)
-                    if _ch:
-                        fresh = await pv.cameras_fresh(timeout=8)
-                        newer = next((c for c in fresh
-                                      if c["uniqueName"] == cam["uniqueName"]), None)
-                        if newer:
-                            cam = dict(cam)
-                            cam["settings"] = newer["settings"]
-                        rec["baseline_changed"] = list(_ch)
-                    if _fl:
-                        log("   !! baseline did not fully apply: %s"
-                            % ", ".join(str(f[0]) for f in _fl))
-                        log("   !! tuning on top of settings that are still wrong")
-                        note_problem(rec, "baseline_failed",
-                                     [list(map(str, f)) for f in _fl])
-                    if _un:
-                        note_problem(rec, "baseline_unconfirmed", _un)
-                # AFTER the baseline, because the baseline is what turns solvePNP
-                # on, and the gate was silent while it was off.
-                was = (cam.get("settings") or {}).get("cameraVideoModeIndex")
-                cam, _prob = await ensure_calibrated_mode(pv, cam, args, log)
-                if (cam.get("settings") or {}).get("cameraVideoModeIndex") != was:
-                    note_problem(rec, "video_mode_switched",
-                                 [was, cam["settings"].get("cameraVideoModeIndex")])
-                if _prob:
-                    log("   !! CALIBRATION: %s" % _prob)
-                    rec["error"] = "no calibration for the active resolution"
-                    note_problem(rec, "calibration_problem", _prob)
-                    results.append(rec)
-                    continue
-                r = await optimise_gain(pv, cam, args, log, cam_progress,
-                                        skip_baseline=True)
-                if r is not None:
-                    merge_failures(rec, r)
-                    await verify_final_state(pv, cam, rec, args, log)
-                    results.append(rec)
-                    continue
-            merge_failures(rec, await tune_camera(pv, cam, args, log,
-                                                  cam_progress, carry=rec))
-            await verify_final_state(pv, cam, rec, args, log)
-            results.append(rec)
-        if progress:
-            progress(1.0)
-        return results
+def _open_readers(cfg, cams, log):
+    """NetworkTables readers for every camera, or {} if there is no server.
+
+    photontune never CREATES a server - see NTResults. --nt-server points at
+    one that already exists; on a robot that is the roboRIO. Loopback is tried
+    as well because running ON the coprocessor, --host defaults to
+    photonvision.local and resolving its own mDNS name does not connect, so a
+    bare invocation silently fell back to the slow path.
+    """
+    if cfg.no_nt:
+        return {}
+    cands = [cfg.nt_server or cfg.host]
+    if "127.0.0.1" not in cands:
+        cands.append("127.0.0.1")
+    for ntsrv in cands:
+        readers = {}
+        try:
+            for c in cams:
+                r = NTResults(ntsrv, c["nickname"])
+                if not r.available():
+                    r.close()
+                    for done in readers.values():
+                        done.close()
+                    readers = {}
+                    break
+                readers[c["nickname"]] = r
+            if readers:
+                log("   NetworkTables server: %s" % ntsrv)
+                return readers
+        except Exception as exc:
+            for done in readers.values():
+                done.close()
+            log("   NT unavailable via %s (%s)" % (ntsrv, exc))
+    return {}
+
+
+async def _tune_all(pv, cams, cfg, log, progress, on_camera):
+    """Tune each camera in turn. Sequential: cameras perturb each other's light.
+
+    There is no per-camera copy of anything here, and no save/restore, because
+    there is nothing mutable to copy: cfg is frozen and every value the search
+    writes lives on the Search object tune_camera builds inside its own frame.
+    That is the gain ratchet's three doors closed by construction rather than
+    by three promises.
+    """
+    results = []
+    for idx, cam in enumerate(cams):
+        def cam_progress(f, idx=idx):
+            if progress:
+                progress((idx + f) / float(len(cams)))
+        if on_camera:
+            on_camera(cam["nickname"], idx, len(cams))
+        rec = await tune_camera(pv, cam, cfg, log, cam_progress)
+        await verify_final_state(pv, cam, rec, cfg, log)
+        results.append(rec)
+    if progress:
+        progress(1.0)
+    return results
 
 
 # ───────────────────────── B: NetworkTables trigger ─────────────────────────
@@ -2283,7 +1992,7 @@ def _matches(have, expect):
         return have == expect
 
 
-async def assert_baseline(pv, cam, args, log=print):
+async def assert_baseline(pv, cam, cfg, log=print):
     """Put the structural settings where they must be, before tuning anything.
 
     Reports every change and its reason, so 'blindly applied' is visible rather
@@ -2300,9 +2009,9 @@ async def assert_baseline(pv, cam, args, log=print):
         for k, (v, e, _why) in tbl.items():
             want[k] = v
             expect[k] = e
-    if getattr(args, "brightness", None) is not None:
-        want["cameraBrightness"] = int(args.brightness)
-        expect["cameraBrightness"] = int(args.brightness)
+    if cfg.brightness is not None:
+        want["cameraBrightness"] = int(cfg.brightness)
+        expect["cameraBrightness"] = int(cfg.brightness)
 
     live = cam.get("settings", {})
     todo = {}
@@ -2323,7 +2032,7 @@ async def assert_baseline(pv, cam, args, log=print):
     # Poll, do not snapshot. A single look 1.5 s later saw a value that a
     # competing writer then took back, and reported it as applied.
     bad, read_ok = await pv.confirm(unique, {k: expect[k] for k in todo},
-                                    settle=max(args.settle, 1.5), log=log)
+                                    settle=max(cfg.settle, 1.5), log=log)
     failed, unconfirmed = [], None
     if not read_ok:
         # NOT silence. This used to log one line, record nothing, and let the
@@ -2351,6 +2060,31 @@ def robot_is_enabled(inst):
 
 
 async def daemon(args, log=print):
+    """Assert the baseline once at boot; tune only when asked.
+
+    BOOT ASSERTS THE BASELINE ONLY - seconds, safe, and it cannot leave a
+    camera mid-walk. TUNING IS ON DEMAND, from the dashboard, at the field.
+
+    Why, verified rather than assumed:
+
+      - PhotonVision already persists every websocket write to SQLite, so
+        tune-once-and-persist is the platform's own default. Re-deriving the
+        same answer every power cycle buys nothing.
+      - The boot autorun this replaces spent ~131 s sweeping both cameras
+        through blind exposures while the robot may be on the cart about to be
+        enabled, and robot_is_enabled was checked once before the run and never
+        again during it. A match starting mid-sweep left a camera wherever the
+        sweep had got to. That violates "a match must never be interrupted"
+        more directly than any bug four audits found.
+      - Lighting differs between the pit and the field. You want to tune where
+        you will play, not where you parked - which is an argument FOR on
+        demand and AGAINST boot.
+
+    The baseline is different in kind: it is idempotent, it writes settings
+    that have ONE right answer, it finishes in seconds, and three of its
+    entries were silently never applied for two weeks. That is worth doing
+    every boot.
+    """
     try:
         import ntcore
     except ImportError:
@@ -2363,11 +2097,13 @@ async def daemon(args, log=print):
     else:
         inst.setServerTeam(args.team)
 
+    base_cfg = dataclasses.replace(Config.from_args(args), nt_inst=inst)
+
     tbl = inst.getTable(args.nt_table)
     run_entry = tbl.getEntry("run")
     run_entry.setDefaultBoolean(False)
     status = tbl.getEntry("status")          # live human-readable line
-    busy = tbl.getEntry("busy")              # true while sweeping
+    busy = tbl.getEntry("busy")              # true while tuning
     ok_entry = tbl.getEntry("ok")            # <- go / no-go for the last run
     summary = tbl.getEntry("summary")        # <- one line, what it did
     warnings_e = tbl.getEntry("warnings")    # <- things that are not failures but
@@ -2375,11 +2111,10 @@ async def daemon(args, log=print):
     progress_e = tbl.getEntry("progress")    # <- 0..1, for a progress bar
     heartbeat = tbl.getEntry("heartbeat")    # <- proves the service is alive
     result_entry = tbl.getEntry("result")    # full JSON
-    camera_e = tbl.getEntry("camera")             # <- camera being tuned, "2 of 3"
-    # Automatic tune shortly after boot, so nobody has to remember to press run.
-    boot_ran = tbl.getEntry("bootTuneRan")        # <- did the automatic run happen at all
-    boot_ok = tbl.getEntry("bootTuneOk")          # <- did it succeed
-    boot_sum = tbl.getEntry("bootTuneSummary")    # <- what it did, or why it did not
+    camera_e = tbl.getEntry("camera")        # <- camera being tuned, "2 of 3"
+    boot_ran = tbl.getEntry("bootBaselineRan")      # <- did the boot baseline happen
+    boot_ok = tbl.getEntry("bootBaselineOk")        # <- did it succeed
+    boot_sum = tbl.getEntry("bootBaselineSummary")  # <- what it did, or why not
     status.setString("idle")
     summary.setString("never run")
     warnings_e.setString("")
@@ -2388,15 +2123,13 @@ async def daemon(args, log=print):
     progress_e.setDouble(0.0)
     boot_ran.setBoolean(False)
     boot_ok.setBoolean(False)
-    boot_sum.setString("pending" if args.autorun else "disabled")
+    boot_sum.setString("pending")
 
-    # Fire one tune after PhotonVision is actually answering - a fixed sleep from
-    # service start is not enough, the pipeline comes up well after the process does.
-    auto = {"fire": False, "done": not args.autorun}
-    async def _autorun():
+    async def boot_baseline():
+        """Wait for PhotonVision to answer, then assert the baseline. Seconds."""
         t0 = time.time()
         ready = False
-        while time.time() - t0 < args.autorun_timeout:
+        while time.time() - t0 < args.boot_timeout:
             try:
                 async with Photon(args.host, args.port) as probe:
                     if await probe.cameras():
@@ -2406,16 +2139,49 @@ async def daemon(args, log=print):
                 pass
             await asyncio.sleep(2.0)
         if not ready:
-            auto["done"] = True
-            why = "PhotonVision not ready within %.0fs" % args.autorun_timeout
-            boot_ran.setBoolean(False); boot_ok.setBoolean(False); boot_sum.setString(why)
-            log("autorun skipped: " + why)
+            why = "PhotonVision not ready within %.0fs" % args.boot_timeout
+            boot_ran.setBoolean(False); boot_ok.setBoolean(False)
+            boot_sum.setString(why)
+            log("boot baseline skipped: " + why)
             return
-        log("autorun: PhotonVision up, tuning in %.0fs" % args.autorun_delay)
-        await asyncio.sleep(args.autorun_delay)
-        auto["fire"] = True
-    if args.autorun:
-        asyncio.ensure_future(_autorun())
+        # The baseline is safe with the robot enabled in a way a tune is not -
+        # it writes only settings that have one right answer and it does not
+        # move exposure or gain - but it still changes the pipeline, so it
+        # waits rather than interrupting a match.
+        if robot_is_enabled(inst):
+            boot_ran.setBoolean(False); boot_ok.setBoolean(False)
+            boot_sum.setString("skipped: robot was enabled at boot")
+            log("boot baseline skipped: robot is enabled")
+            return
+        status.setString("asserting the baseline...")
+        t1 = time.time()
+        try:
+            res = await run(dataclasses.replace(base_cfg, baseline_only=True),
+                            log=log)
+        except Exception as exc:
+            boot_ran.setBoolean(True); boot_ok.setBoolean(False)
+            boot_sum.setString("error: %s" % exc)
+            status.setString("boot baseline error: %s" % exc)
+            log("boot baseline error: %s" % exc)
+            return
+        failed, warns, code = run_verdict(
+            res, dataclasses.replace(base_cfg, baseline_only=True))
+        line = "; ".join(
+            "%s: %s" % (r["camera"],
+                        ("%d changed" % len(r["baseline_changed"]))
+                        if r.get("baseline_changed") else "already correct")
+            for r in res)
+        if failed:
+            line += "; FAILED: " + ", ".join(
+                "%s (%s)" % (r["camera"], r.get("error", "?")) for r in failed)
+        boot_ran.setBoolean(True)
+        boot_ok.setBoolean(code == 0)
+        boot_sum.setString(line[:200])
+        status.setString("idle - baseline asserted in %.0f s" % (time.time() - t1))
+        log("boot baseline done in %.0f s: ok=%s %s"
+            % (time.time() - t1, code == 0, line))
+
+    asyncio.ensure_future(boot_baseline())
 
     log("daemon up. table /%s  - set 'run' true to tune." % args.nt_table)
     last = False
@@ -2424,89 +2190,75 @@ async def daemon(args, log=print):
         beat += 1.0
         heartbeat.setDouble(beat)
         trigger = run_entry.getBoolean(False)
-        boot_fire = auto["fire"] and not auto["done"]
-        if boot_fire:
-            auto["fire"] = False
-            auto["done"] = True
-            trigger = True
-        if trigger and (not last or boot_fire):
+        if trigger and not last:
             if robot_is_enabled(inst):
                 status.setString("refused: robot enabled")
                 log("trigger ignored - robot is enabled")
                 run_entry.setBoolean(False)
-                if boot_fire:
-                    boot_ran.setBoolean(False); boot_ok.setBoolean(False)
-                    boot_sum.setString("skipped: robot was enabled at boot")
             else:
-                run_ok = {"value": False, "summary": ""}
                 busy.setBoolean(True)
                 warnings_e.setString("")
                 ok_entry.setBoolean(False)
                 progress_e.setDouble(0.0)
                 status.setString("tuning on the tags in view...")
                 summary.setString("running...")
-                lines = []
                 def cap(msg):
-                    lines.append(str(msg)); log(msg); status.setString(str(msg)[:120])
+                    log(msg); status.setString(str(msg)[:120])
                 def announce(nick, idx, total):
                     camera_e.setString("%s (%d of %d)" % (nick, idx + 1, total))
 
                 try:
-                    res = await run(args, log=cap, progress=lambda f: progress_e.setDouble(f),
+                    res = await run(base_cfg, log=cap,
+                                    progress=lambda f: progress_e.setDouble(f),
                                     on_camera=announce)
-                    failed, warns, code = run_verdict(res, args)
+                    failed, warns, code = run_verdict(res, base_cfg)
                     applied = [r for r in res if r not in failed and r.get("applied")]
-                    line = "; ".join(
-                        "%s=%.0f%s" % (r["camera"], r["applied"], " (fallback)" if r.get("fellback") else "")
-                        for r in applied)
+                    line = "; ".join("%s=%.0f@g%s" % (r["camera"], r["applied"],
+                                                      r.get("gain"))
+                                     for r in applied)
                     if failed:
                         line += ("; FAILED: " + ", ".join(
-                            "%s (%s)" % (r["camera"], r.get("error", "?")) for r in failed))
-                    for _k, _s, _t in problem_notes(run_problems(args), HARD):
-                        line += "; FAILED: %s" % _t
+                            "%s (%s)" % (r["camera"], r.get("error", "?"))
+                            for r in failed))
                     # Warnings reach the dashboard, not just the log. A camera
-                    # whose RESOLUTION this tool changed, or one applied over the
-                    # blur budget, published ok=true and said nothing - so the
-                    # one signal a team reads could not tell them their camera is
-                    # no longer running the mode they set.
+                    # whose RESOLUTION this tool changed, or one applied over
+                    # the blur budget, published ok=true and said nothing - so
+                    # the one signal a team reads could not tell them their
+                    # camera is no longer running the mode they set.
                     wline = " | ".join("%s: %s" % (who, t) for who, t in warns)
                     warnings_e.setString(wline[:500])
                     if wline:
                         line += "  [WARN] " + wline
                         log("WARNINGS: " + wline)
                     every_camera_ok = bool(applied) and code == 0
-                    run_ok["value"] = every_camera_ok
-                    run_ok["summary"] = line or "no cameras tuned"
                     ok_entry.setBoolean(every_camera_ok)
                     summary.setString(line or "no cameras tuned")
-                    status.setString(("DONE - " if every_camera_ok else "DONE WITH ERRORS - ") + line)
+                    status.setString(("DONE - " if every_camera_ok
+                                      else "DONE WITH ERRORS - ") + line)
                     result_entry.setString(json.dumps(res))
                     progress_e.setDouble(1.0)
                     log("done: " + line)
                 except AlreadyRunning as exc:
                     # SKIP the trigger, do not fail it. A human at the CLI while
-                    # the daemon's autorun fires is the ordinary case, and the
+                    # the daemon is triggered is the ordinary case, and the
                     # human's run is the one that should win - they are standing
-                    # there watching it. A failed boot tune would also latch
-                    # bootTuneOk=false for the rest of the session.
-                    run_ok["summary"] = "skipped: %s" % str(exc).splitlines()[0]
-                    summary.setString(run_ok["summary"])
-                    status.setString(run_ok["summary"])
-                    log(run_ok["summary"])
+                    # there watching it.
+                    msg = "skipped: %s" % str(exc).splitlines()[0]
+                    summary.setString(msg); status.setString(msg); log(msg)
                 except Exception as exc:
-                    run_ok["value"] = False
-                    run_ok["summary"] = "error: %s" % exc
                     ok_entry.setBoolean(False)
                     summary.setString("error: %s" % exc)
                     status.setString("error: %s" % exc)
                     log("error: %s" % exc)
                 finally:
-                    # The daemon is the DEPLOYED mode, and the replay used to sit
-                    # in the `except` branch only - which is the branch a dropped
-                    # websocket does NOT take, because tune_camera swallows it and
-                    # returns normally. Every exit path, or it is not a restore.
+                    # The daemon is the DEPLOYED mode, and the replay used to
+                    # sit in the `except` branch only - which is the branch a
+                    # dropped websocket does NOT take, because tune_camera
+                    # swallows it and returns normally. Every exit path, or it
+                    # is not a restore.
                     try:
-                        for unique, orig, ok in await restore_pending(args.host, args.port):
+                        for unique, orig, ok in await restore_pending(args.host,
+                                                                      args.port):
                             log("%s %s to %s"
                                 % ("restored" if ok else "UNVERIFIED restore of",
                                    unique, orig))
@@ -2515,18 +2267,6 @@ async def daemon(args, log=print):
                     busy.setBoolean(False)
                     camera_e.setString("")
                     run_entry.setBoolean(False)
-                    if boot_fire:
-                        boot_ran.setBoolean(True)
-                        # Publish what we COMPUTED. Reading it back through NT
-                        # here returned the default False, because the run has
-                        # already stopped PhotonVision's NT server by this point
-                        # and this client has disconnected - so a tune where every
-                        # camera succeeded still reported ok=False at boot, which
-                        # is the one signal a team would actually trust.
-                        boot_ok.setBoolean(bool(run_ok["value"]))
-                        boot_sum.setString(str(run_ok["summary"])[:200])
-                        log("autorun done: ok=%s %s"
-                            % (run_ok["value"], run_ok["summary"]))
         last = trigger
         await asyncio.sleep(0.2)
 
@@ -2535,80 +2275,69 @@ async def daemon(args, log=print):
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description="Tune PhotonVision exposure by detection quality, biased short to limit motion blur.")
+        description="Set PhotonVision exposure from a motion-blur budget, then "
+                    "find the least gain that still sees every tag.")
     p.add_argument("--host", default="photonvision.local", help="PhotonVision host")
     p.add_argument("--port", type=int, default=5800)
     p.add_argument("--cameras", default=None,
                    help="comma-separated nicknames to tune (default: all)")
-    p.add_argument("--min-exposure", type=float, default=1000.0)
-    p.add_argument("--max-exposure", type=float, default=25000.0)
-    p.add_argument("--steps", type=int, default=8)
-    p.add_argument("--bias", type=float, default=1.5,
-                   help="safety factor above the shortest passing exposure (default 1.5)")
-    p.add_argument("--gain", type=float, default=None,
-                   help="force this exact starting gain, overriding the baseline")
-    p.add_argument("--start-gain", type=float, default=BASELINE_START_GAIN,
-                   help="gain every tune STARTS from (default %(default)g). A tune must "
-                        "not start from the previous tune's answer: escalation is one-way, "
-                        "so that ratchets gain upward a little more on every run.")
-    p.add_argument("--gain-steps", type=int, default=3,
-                   help="how many times to escalate gain if no exposure passes (0 = never)")
+
+    p.add_argument("--max-blur-px", type=float, default=6.0,
+                   help="motion-blur budget in pixels at --blur-rate (default "
+                        "%(default)g). This SETS the exposure: "
+                        "t = max_blur_px / (radians(blur_rate) * fx). "
+                        "PROXY-DERIVED, not measured on a moving robot. "
+                        "PhotonVision's Gaussian blur swept at fixed exposure "
+                        "loses 12%% of tags by sigma 0.5 and all multi-tag "
+                        "between sigma 1.5 and 2.0; converting by equal "
+                        "high-frequency attenuation (sigma = L/sqrt(12)) puts "
+                        "the cliff near 3.5 px of smear. Gaussian blur damages "
+                        "edges in every direction while motion smear only "
+                        "damages the ones perpendicular to it, and a tag has "
+                        "edges in two orthogonal directions, so the proxy "
+                        "overstates the damage by roughly 2x - hence 6 rather "
+                        "than 3.5. blurtest.py measures the real thing, but it "
+                        "needs a human waving a tag.")
+    p.add_argument("--blur-rate", type=float, default=360.0,
+                   help="angular rate the blur budget is judged at, deg/s. 360 is "
+                        "what robots actually do while aiming (CTRE default 270, "
+                        "REV 360, Limelight rejects vision above 360); 900 is "
+                        "never-exceed.")
     p.add_argument("--max-gain", type=float, default=100.0,
-                   help="ceiling for gain escalation")
-    p.add_argument("--no-optimise-gain", "--no-optimize-gain", dest="optimise_gain",
-                   action="store_false", default=True,
-                   help="skip the gain search and sweep exposure at a single gain. "
-                        "Faster, but gain is venue-dependent: measured on an OV9281 "
-                        "in a dim room, reprojection improved monotonically from "
-                        "1.231 px at gain 0 to 0.496 px at gain 100, all at the same "
-                        "1500 us exposure. A constant cannot be right in both a dim "
-                        "workshop and a lit field.")
-    p.add_argument("--optimise-gain", "--optimize-gain", dest="optimise_gain",
-                   action="store_true",
-                   help="search gain AND exposure together for the shortest exposure that "
-                        "still sees all the tags (slower, but exposure is the costly one)")
-    p.add_argument("--gain-search-steps", type=int, default=6,
-                   help="how many gain values to try with --optimise-gain")
-    p.add_argument("--reproj-tolerance", type=float, default=1.5,
-                   help="reject a gain whose reprojection exceeds this multiple of the "
-                        "best seen - stops noise being traded for exposure indefinitely")
-    p.add_argument("--fast", action="store_true",
-                   help="shorter settle and dwell. Over NetworkTables the default 2.5 s "
-                        "dwell is ~100 results per candidate, which is far more than is "
-                        "needed to tell a pass from a blank.")
-    p.add_argument("--dwell", type=float, default=1.5,
-                   help="seconds of data per candidate (default %(default)s). Over "
-                        "NetworkTables that is ~60 results, well past what is needed "
-                        "to separate a pass from a failure.")
+                   help="top of the gain grid. The walk visits six points from 0 "
+                        "to here and stops at the first that sees every tag, so "
+                        "this also sets the margin step (default %(default)g -> "
+                        "steps of 20).")
+    p.add_argument("--fx", type=float, default=1105.9,
+                   help="focal length in px, used ONLY if the camera's active "
+                        "calibration does not report one. The blur budget scales "
+                        "directly with fx, and on this rig fx is 1105.9 at "
+                        "1280x800 but 570.5 at 640x400, so a default carried "
+                        "across a resolution change overstates blur by 1.94x.")
+    p.add_argument("--max-exposure", type=float, default=25000.0,
+                   help="ceiling for the too-dark exposure walk ONLY. The tuned "
+                        "exposure is the blur budget; this bounds how far past it "
+                        "the tool may go when even maximum gain cannot see the "
+                        "tags, and anything it lands on is reported as over "
+                        "budget.")
+
+    p.add_argument("--dwell", type=float, default=4.0,
+                   help="seconds of data per trial (default %(default)s). Over the "
+                        "websocket that is ~36 results at the ~9/s measured on "
+                        "this rig - the sampling error on the tag count is what "
+                        "decides a marginal gain, so this is not a knob to "
+                        "shorten casually.")
     p.add_argument("--settle", type=float, default=0.7,
-                   help="seconds to wait after changing a setting (default %(default)s). "
-                        "MEASURED on a Pi 5 / OV9281: the pipeline reflects a new "
-                        "exposure in 0.25-0.36 s, worst case 0.36 s over six trials, "
-                        "timed on the coprocessor against PhotonVision's own capture "
-                        "timestamps. This is that worst case roughly doubled. The old "
-                        "1.5 s default was 4x the measurement and was multiplied by "
-                        "every step of every sweep.")
+                   help="seconds to wait after changing a setting (default "
+                        "%(default)s). MEASURED on a Pi 5 / OV9281 against "
+                        "PhotonVision's own capture timestamps: exposure applies "
+                        "in 0.25-0.36 s (6 trials), gain in 0.234 s median "
+                        "(0.197-0.241, n=8). This is the worst case roughly "
+                        "doubled.")
     p.add_argument("--min-tags", type=float, default=2.0,
                    help="mean tags per frame required when multi-tag is unavailable")
     p.add_argument("--max-ambiguity", type=float, default=0.20)
-    p.add_argument("--tag-fraction", type=float, default=0.85,
-                   help="require at least this fraction of the tags the best exposure "
-                        "in the sweep saw (default 0.85); 0 disables")
-    p.add_argument("--fx", type=float, default=1105.9, help="focal length in px, for the blur estimate")
-    p.add_argument("--json", action="store_true", help="emit JSON results")
-    p.add_argument("--daemon", action="store_true", help="NT-triggered service mode")
-    p.add_argument("--nt-server", default=None, help="NT server host (daemon mode)")
-    p.add_argument("--team", type=int, default=0, help="team number for NT (daemon mode)")
-    p.add_argument("--nt-table", default="PhotonTune")
-    p.add_argument("--max-blur-px", type=float, default=10.0,
-                   help="blur budget in pixels at --blur-rate. If the chosen exposure "
-                        "exceeds it, raise gain and re-sweep rather than accept a "
-                        "blurry answer. JUDGEMENT, not a measurement - blurtest.py "
-                        "can measure the real tolerance on your rig.")
-    p.add_argument("--blur-rate", type=float, default=360.0,
-                   help="angular rate the blur budget is judged at, deg/s. 360 is what "
-                        "robots actually do while aiming (CTRE default 270, REV 360, "
-                        "Limelight rejects vision above 360); 900 is never-exceed.")
+
     p.add_argument("--no-baseline", dest="baseline", action="store_false", default=True,
                    help="do NOT assert the structural settings first. They are "
                         "asserted by default: brightness, rotation, blur and the tag "
@@ -2617,15 +2346,25 @@ def build_parser():
     p.add_argument("--brightness", type=int, default=None,
                    help="override the asserted cameraBrightness (default 40)")
     p.add_argument("--baseline-only", action="store_true",
-                   help="assert the structural settings and stop - do not tune")
+                   help="assert the structural settings and stop - do not tune. "
+                        "This is what the daemon does at boot.")
+
     p.add_argument("--no-nt", action="store_true",
                    help="always sample from the websocket, never NetworkTables")
-    p.add_argument("--autorun", action="store_true",
-                   help="daemon: tune once automatically after PhotonVision comes up")
-    p.add_argument("--autorun-delay", type=float, default=5.0,
-                   help="seconds to wait after PhotonVision answers, before the automatic tune")
-    p.add_argument("--autorun-timeout", type=float, default=90.0,
-                   help="give up waiting for PhotonVision after this many seconds")
+    p.add_argument("--nt-server", default=None,
+                   help="host of an EXISTING NetworkTables server - the roboRIO on "
+                        "a robot. photontune never starts one: toggling "
+                        "PhotonVision's own server calls stopServer() and "
+                        "NetworkManager.reinitialize(), which orphans every NT "
+                        "client and drops every websocket, including this tool's.")
+    p.add_argument("--json", action="store_true", help="emit JSON results")
+
+    p.add_argument("--daemon", action="store_true", help="NT-triggered service mode")
+    p.add_argument("--team", type=int, default=0, help="team number for NT (daemon mode)")
+    p.add_argument("--nt-table", default="PhotonTune")
+    p.add_argument("--boot-timeout", type=float, default=90.0,
+                   help="daemon: give up waiting for PhotonVision to answer after "
+                        "this many seconds (default %(default)s)")
     return p
 
 
@@ -2716,11 +2455,10 @@ async def _guard_signals(coro):
 def main():
     _install_signal_handlers()
     args = build_parser().parse_args()
-    if getattr(args, "fast", False):
-        args.dwell = min(args.dwell, 0.9)
-        args.settle = min(args.settle, 0.5)
-    if args.min_exposure <= 0 or args.max_exposure <= args.min_exposure:
-        sys.exit("--max-exposure must exceed --min-exposure, both > 0")
+    if args.max_blur_px <= 0:
+        sys.exit("--max-blur-px must be > 0: it is what SETS the exposure")
+    if args.blur_rate <= 0:
+        sys.exit("--blur-rate must be > 0")
     if args.daemon:
         try:
             try:
@@ -2740,34 +2478,33 @@ def main():
     # the restore has to hang off the exit, not off an exception.
     try:
         try:
-            results = asyncio.run(_guard_signals(run(args)))
+            results = asyncio.run(_guard_signals(run(Config.from_args(args))))
         except (AlreadyRunning, ConnectionError, LookupError) as exc:
             sys.exit("photontune: %s" % exc)
         except (KeyboardInterrupt, Terminated):
             # The interrupted loop could not complete the restore. Do it on a new one.
             print("\ninterrupted - putting camera settings back...")
             sys.exit(130)
-        # --baseline-only never sets `applied` by design, so "no applied" cannot
-        # mean failure in that mode. A baseline that did NOT take, or a rejected
-        # setting, MUST mean failure in every mode - previously both were recorded
-        # and never consulted, so the tool reported success with a 90-degree
-        # rotated image and a gain that never applied.
-        failed, warnings, code = run_verdict(results, args)
+        failed, warnings, code = run_verdict(results, Config.from_args(args))
         if args.json:
             print(json.dumps(results, indent=2))
         else:
             print("\ncompleted in %.0f s" % (time.time() - t0))
             for r in results:
                 if r.get("applied"):
-                    print("  %-14s exposure -> %.0f, gain %s%s"
-                          % (r["camera"], r["applied"], r.get("gain"),
-                             "  (fallback)" if r.get("fellback") else ""))
+                    print("  %-14s exposure -> %.0f, gain %s"
+                          % (r["camera"], r["applied"], r.get("gain")))
+                elif args.baseline_only:
+                    print("  %-14s baseline asserted%s"
+                          % (r["camera"],
+                             (" (%d changed)" % len(r["baseline_changed"]))
+                             if r.get("baseline_changed") else " (already correct)"))
                 else:
                     print("  %-14s unchanged (%s)"
                           % (r["camera"], r.get("error", "nothing applied")))
-            # Warnings are NOT failures and are NOT footnotes. A camera left on a
-            # resolution nobody chose, or applied with 17.9 px of blur against a
-            # 1 px budget, both used to exit 0 with nothing in the summary at all.
+            # Warnings are NOT failures and are NOT footnotes. A camera left on
+            # a resolution nobody chose, or applied over the blur budget, both
+            # used to exit 0 with nothing in the summary at all.
             if warnings:
                 print("")
                 print("WARNINGS - the tune stands, but these need a human to know:")
@@ -2783,8 +2520,6 @@ def main():
             for text in notes:
                 if text not in why:
                     print("       %s" % text)
-        for _k, _sev, text in problem_notes(run_problems(args), HARD):
-            print("FAILED run: %s" % text)
         sys.exit(code)
     finally:
         # EVERY exit path, including the ordinary one and sys.exit above.

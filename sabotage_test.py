@@ -82,10 +82,11 @@ MATRIX_VALUES = {
     "apply_mismatch":         ("camera", {"wanted": [20, 1500], "got": [0, 1500]}),
     "apply_unconfirmed":      ("camera", "no cameraSettings after the write"),
     "final_state_wrong":      ("camera", [["cameraRedGain", 0, 50]]),
-    "gain_scan_error":        ("camera", "ConnectionClosed, 4 candidates untried"),
+    "search_error":           ("camera", "ConnectionClosed: socket is closed"),
+    "no_workable_settings":   ("camera", "no gain saw the tags at 864 us"),
+    "robot_enabled_midrun":   ("camera", "walking gain at 40"),
     "video_mode_switched":    ("camera", [0, 1]),
     "over_blur_budget":       ("camera", 17.9),
-    "fellback":               ("camera", True),
 }
 
 _CHILD = r'''
@@ -93,13 +94,10 @@ import json, sys
 sys.path.insert(0, sys.argv[1])
 import photontune as pt
 key, mode, value = sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
-rec = {"camera": "CAM", "uniqueName": "u", "applied": 1500.0, "gain": 0}
+rec = {"camera": "CAM", "uniqueName": "u", "applied": 864.0, "gain": 40}
 if mode == "camera":
     pt.note_problem(rec, key, value)
-async def fake_run(args, log=print, progress=None, on_camera=None):
-    args._run_problems = {}
-    if mode == "run":
-        pt.note_run_problem(args, key, value)
+async def fake_run(cfg, log=print, progress=None, on_camera=None):
     return [rec]
 pt.run = fake_run
 sys.argv = ["photontune.py", "--host", "127.0.0.1"]
@@ -107,85 +105,129 @@ pt.main()
 '''
 
 
-# ───────────────── the gain decision, replayed (no hardware) ─────────────────
+# ────────────────── the gain walk, replayed (no hardware) ──────────────────
 #
-# The audit's three runs, same room, same light, on OV9281. It reported the two
-# candidates the decision came down to:
+# REAL per-frame tag counts, recorded on this rig at the blur-budget exposure
+# (864 us) on both cameras, one entry per grid gain as
+# ({tags-in-frame: how many frames}, multi-tag solves). Histograms rather than
+# the raw sequence because order is not used by anything, but the SCATTER is -
+# the significance test measures the sampling error of the tag count from
+# exactly these numbers, and reconstructing plausible-looking counts from a
+# mean would decide the test on the reconstruction.
 #
-#     gain 100   0.378   0.393   0.510      <- the deciding point, 35% swing
-#     gain  60   0.478   0.479   0.478      <- 0.2%, stable
-#     chosen      100     100      60       <- not reproducible
+# Gains 0 and 20 carry three independent back-to-back readings each, because
+# those are the two points the answer turns on; 40 through 100 were flat.
+# Recorded at --dwell 4.0, which is ~41-46 frames per reading on this rig.
 #
-# The reason the old rule flipped is not that the scan was unlucky. It measured
-# its repeat noise at the FIRST PASSING gain - gain 0, where the audit measured
-# 0% - so the band floored at 5%, and a 35% swing at the gain actually being
-# decided was invisible to it. In run 3 that swing put gain 100 above gain 60
-# and the answer changed.
+# What this asserts:
+#   1. EVERY combination of those independent readings lands on the same gain.
+#      The reprojection rule this replaces chose 60 / 80 / 60 / 80 / 100 / 100
+#      across six identical runs of one camera.
+#   2. Attaching the audit's own reprojection numbers - 0.378 / 0.393 / 0.510,
+#      the 35%% swing that made the old rule flip - changes nothing, because
+#      nothing in the walk reads reprojection.
+#   3. The applied gain is exactly one grid step above the lowest that works.
 #
-# This replays those numbers through the real gain_decision() and through the
-# old rule, which is reproduced here from the previous revision:
-#     band = max(math.exp(noise) if noise is not None else 1.0, 1.05)
-#     contenders = [t for t in usable if t[1] <= best_rp * band]
-#     pick = min(contenders, key=lambda t: t[0])
-# with `noise` coming from a repeat of the first passing candidate.
-AUDIT_RUNS = [
-    # (run, {gain: reproj}, repeats of gain 100 as measured across the audit)
-    ("run 1", {100: 0.378, 60: 0.478}),
-    ("run 2", {100: 0.393, 60: 0.479}),
-    ("run 3", {100: 0.510, 60: 0.478}),
-]
-AUDIT_REPEATS_AT_100 = [0.378, 0.393, 0.510]   # the swing, measured at gain 100
-AUDIT_REPEATS_AT_60 = [0.478, 0.479, 0.478]    # stable
-AUDIT_NOISE_AT_QUIET_GAIN = 0.0                # what the old rule measured
+# Sample.why_failed() and gain_with_margin() are the REAL functions the tune
+# calls. Only the "walk up, stop at the first pass" loop is reproduced here,
+# because in the tune it is interleaved with the measuring.
+
+WALK_RUNS = {
+    'OV9281 @864us': {
+        100: [({4: 44}, 44)],
+        80:  [({4: 43}, 43)],
+        60:  [({4: 40}, 40)],
+        40:  [({4: 41}, 41)],
+        20:  [({0: 1, 4: 44}, 44), ({4: 45}, 45), ({4: 42}, 42)],
+        0:   [({0: 39, 1: 4, 4: 2}, 2), ({0: 31, 1: 14}, 0), ({0: 44, 1: 2}, 0)],
+    },
+    'OV9281 (1) @864us': {
+        100: [({2: 45}, 45)],
+        80:  [({1: 1, 2: 42}, 42)],
+        60:  [({1: 2, 2: 40}, 40)],
+        40:  [({1: 1, 2: 40}, 40)],
+        20:  [({1: 2, 2: 42}, 42), ({1: 5, 2: 40}, 40), ({2: 44, 4: 1}, 45)],
+        0:   [({0: 1, 1: 42, 2: 1}, 1), ({1: 44}, 0), ({1: 45}, 0)],
+    },
+}
+
+# The audit's three reprojection readings at the gain the OLD rule decided on.
+# Attached to every sample below purely to prove they cannot reach a decision.
+AUDIT_REPROJ = [0.378, 0.393, 0.510]
 
 
-def _old_rule(good, noise, tolerance=1.5):
-    """The previous revision's pick, reproduced verbatim from its three lines."""
-    import math
-    best_rp = min(rp for _g, rp in good)
-    usable = [t for t in good if t[1] <= best_rp * float(tolerance)]
-    band = max(math.exp(noise) if noise is not None else 1.0, 1.05)
-    contenders = [t for t in usable if t[1] <= best_rp * band]
-    return min(contenders, key=lambda t: t[0])
+def _sample(pt, gain, hist, solves, reproj):
+    s = pt.Sample(864.0, gain)
+    counts = []
+    for tags, frames in sorted(hist.items()):
+        counts.extend([int(tags)] * int(frames))
+    s.frames = len(counts)
+    s.tag_counts = counts
+    s.multitag_solves = solves
+    s.reproj = [reproj] * solves
+    s.ambiguities = [0.05] * len(counts)
+    return s
 
 
-def gain_decision_replay(src_dir):
+def gain_walk_replay(src_dir):
+    import itertools
     sys.path.insert(0, src_dir)
     import photontune as pt
 
-    print("=" * 66)
-    print("GAIN DECISION  - the audit's own three runs, replayed")
-    print("=" * 66)
-    print("%-7s %-22s %-10s %-10s" % ("run", "measured", "old rule", "new rule"))
-    print("-" * 66)
-    old_picks, new_picks, ties = [], [], []
-    for label, table in AUDIT_RUNS:
-        good = sorted(table.items())
-        old = _old_rule(good, AUDIT_NOISE_AT_QUIET_GAIN)
-        # the new rule repeats whichever candidate leads, so the repeats it gets
-        # are the ones the audit measured AT that gain
-        leader = min(good, key=lambda t: t[1])[0]
-        repeats = (AUDIT_REPEATS_AT_100 if leader == 100 else AUDIT_REPEATS_AT_60)
-        pick, best, band, noise, _pairs = pt.gain_decision(good, repeats, leader, 1.5)
-        old_picks.append(old[0])
-        new_picks.append(pick[0])
-        ties.append(pick[0] != best[0])
-        print("%-7s %-22s gain %-5d gain %-5d  (band %.0f%%%s)"
-              % (label, ", ".join("%d:%.3f" % (g, rp) for g, rp in good),
-                 old[0], pick[0], 100 * (band - 1),
-                 ", reported as a tie" if pick[0] != best[0] else ""))
-    print("-" * 66)
-    ok = len(set(new_picks)) == 1
-    print("old rule chose %s  <- the audit's finding, reproduced"
-          % " / ".join(str(g) for g in old_picks))
-    print("new rule chose %s  <- %s"
-          % (" / ".join(str(g) for g in new_picks),
-             "the same gain every run" if ok else "STILL NOT REPRODUCIBLE"))
-    if len(set(old_picks)) == 1:
-        print("  !! the old rule did NOT flip here - this replay proves nothing")
-        ok = False
-    print("=" * 66)
-    return 0 if ok else 1
+    print("=" * 74)
+    print("GAIN WALK  - real recorded samples, the real pass rule, "
+          "every combination")
+    print("=" * 74)
+    bad = 0
+    for label, table in WALK_RUNS.items():
+        gains, step = pt.gain_grid(100)
+        combos = list(itertools.product(*[table[g] for g in gains]))
+        landings = {}
+        for ci, combo in enumerate(combos):
+            reference = None
+            rejected = []
+            walked = None
+            # the reference is the top of the grid, measured first
+            top_hist, top_solves = combo[-1]
+            reference = _sample(pt, gains[-1], top_hist, top_solves,
+                                AUDIT_REPROJ[ci % 3]).mean_tags
+            for gi, g in enumerate(gains):
+                hist, solves = combo[gi]
+                smp = _sample(pt, g, hist, solves, AUDIT_REPROJ[gi % 3])
+                why = smp.why_failed(2.0, 0.20, reference)
+                if why is None:
+                    walked = g
+                    break
+                rejected.append((g, smp.mean_tags, why))
+            applied = (None if walked is None
+                       else pt.gain_with_margin(walked, step, 100))
+            landings.setdefault((walked, applied), rejected)
+        print("%-20s %d combination(s) of the independent readings"
+              % (label, len(combos)))
+        for (walked, applied), rejected in sorted(
+                landings.items(), key=lambda kv: (kv[0][0] is None, kv[0][0] or 0)):
+            print("   lowest passing gain %-4s -> apply %-4s   rejected: %s"
+                  % (walked, applied,
+                     ", ".join("gain %d at %.2f tags" % (g, m)
+                               for g, m, _w in rejected) or "none"))
+        if len(landings) == 1:
+            walked, applied = list(landings)[0]
+            print("   SAME ANSWER in all %d combinations: gain %s"
+                  % (len(combos), applied))
+            if walked is None or applied != min(100, walked + step):
+                print("   !! the margin is not one grid step (%s -> %s, step %d)"
+                      % (walked, applied, step))
+                bad += 1
+        else:
+            print("   !! NOT REPRODUCIBLE: %s" % sorted(landings))
+            bad += 1
+    print("-" * 74)
+    print("Reprojection was attached to every sample and varied across "
+          "0.378 / 0.393 / 0.510 -\nthe swing that made the old rule choose a "
+          "different gain on identical runs. It\nchanged nothing here, because "
+          "nothing in the walk reads it.")
+    print("=" * 74)
+    return 1 if bad else 0
 
 
 def sample_floor(src_dir):
@@ -481,9 +523,10 @@ def main():
                    help="command that runs photontune")
     p.add_argument("--sample-floor", action="store_true",
                    help="offline: assert a sample too small to judge is refused.")
-    p.add_argument("--gain-decision", action="store_true",
-                   help="offline: replay the audit's three runs through the gain "
-                        "decision and show it no longer flips. No hardware.")
+    p.add_argument("--gain-walk", action="store_true",
+                   help="offline: drive the real pass/reject rule with recorded "
+                        "samples and show which gain the walk lands on. No "
+                        "hardware.")
     p.add_argument("--verdict-matrix", action="store_true",
                    help="offline: assert the exit code and the surfaced text for "
                         "every problem photontune can record. No hardware.")
@@ -492,8 +535,8 @@ def main():
     a = p.parse_args()
     if a.verdict_matrix:
         sys.exit(verdict_matrix(a.src))
-    if a.gain_decision:
-        sys.exit(gain_decision_replay(a.src))
+    if a.gain_walk:
+        sys.exit(gain_walk_replay(a.src))
     if a.sample_floor:
         sys.exit(sample_floor(a.src))
     a.photontune = a.photontune.split()
