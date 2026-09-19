@@ -1692,6 +1692,7 @@ def _open_readers(cfg, cams, log):
     cands = [cfg.nt_server or cfg.host]
     if "127.0.0.1" not in cands:
         cands.append("127.0.0.1")
+    t0 = time.time()
     for ntsrv in cands:
         readers = {}
         try:
@@ -1711,6 +1712,13 @@ def _open_readers(cfg, cams, log):
             for done in readers.values():
                 done.close()
             log("   NT unavailable via %s (%s)" % (ntsrv, exc))
+    # Say what the probe cost. MEASURED on this rig with no server anywhere:
+    # NTResults.available() waits 4 s per candidate host, and with the given
+    # host and loopback both failing that is ~8 s of every run spent finding
+    # out - about a fifth of a two-camera tune, and it was previously silent.
+    # Pass --no-nt to skip it when you know there is no server.
+    log("   no NetworkTables server at %s (%.1f s spent looking)"
+        % (" or ".join(cands), time.time() - t0))
     return {}
 
 
