@@ -115,10 +115,15 @@ MATRIX_SEVERITY = {
     # The tune stands; the robot-enabled guard could not be consulted, which
     # a human has to know because the safety argument rests on it.
     "robot_state_unknown":    WARN,
-    # The bar the walk compares against did not itself pass. The walk falls
-    # back to its own rate gate, which still has to be met, so the answer is
-    # defensible - but the reference is the thing the tune is built on.
-    "reference_unusable":     WARN,
+    # The bar the walk compares against did not itself pass, so the
+    # tag-count floor was dropped and nothing in the run checked that the
+    # answer sees every tag - which is the tool's one claim. It was WARN, and
+    # a rescue shipped 2.00 tags in a 4.00-tag scene at exit 0. It is also
+    # the gate on the whole rescue path: _rescue is unreachable while the
+    # reference passes.
+    "reference_unusable":     HARD,
+    # The shortfall itself, measured on the settings actually applied.
+    "rescue_tags_short":      HARD,
 }
 
 MATRIX_VALUES = {
@@ -140,6 +145,8 @@ MATRIX_VALUES = {
                                                  "36 frames"}),
     "robot_state_unknown":    ("camera", "no NetworkTables server is reachable"),
     "reference_unusable":     ("camera", "multi-tag solved in 4% of 45 frames"),
+    "rescue_tags_short":      ("camera", {"got": 2.0, "scene_best": 4.0,
+                                          "scene_at": 863.5, "scene_gain": 40}),
 }
 
 # THE SAME KEYS, EACH WITH A FALSY VALUE OF ITS OWN NATURAL TYPE.
@@ -181,6 +188,7 @@ MATRIX_FALSY = {
     "applied_point_failed":   ("camera", {}),
     "robot_state_unknown":    ("camera", ""),
     "reference_unusable":     ("camera", ""),
+    "rescue_tags_short":      ("camera", {}),
 }
 
 _CHILD = r'''

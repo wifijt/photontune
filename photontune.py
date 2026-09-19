@@ -1329,12 +1329,55 @@ PROBLEMS = {
                   "maximum gain. The camera has been left at this setting "
                   "because it is the best available, but it is NOT within the "
                   "blur budget. Add light." % fmt_px(v)),
-    # ---- warn ----
-    "reference_unusable": (WARN,
+    # reference_unusable is HARD, and it was WARN.
+    #
+    # The reference is the ONLY thing that measures what this scene can do,
+    # and the tool's one claim is "the lowest gain that sees EVERY tag". When
+    # the reference fails its own test the tag-count floor is dropped, and
+    # with it the only evidence for the word "every": what is left is the 90%
+    # multi-tag rate gate, which two tags satisfy just as well as four.
+    #
+    # It is also the gate on the whole rescue path. `_rescue` is reachable
+    # ONLY when the reference is unusable - if the reference passes, then
+    # gain==top IS the reference, it is judged against its own mean, and it
+    # passes, so the walk always picks at least max gain and never falls
+    # through. So every rescue is a run whose floor was dropped.
+    #
+    # FORCED on 89e94a4: --blur-rate 1 --max-blur-px 0.00251 on OV9281. The
+    # reference read "tags 1.00" and failed, the floor was dropped, _rescue
+    # walked exposure up and stopped at the FIRST pass - 172 us, multitag
+    # 100%, tags 2.00 - in a scene that shows 4.00 tags at its tuned
+    # settings. Exit 0.
+    #
+    # Same doctrine as over_blur_budget: the camera is LEFT at what the walk
+    # found, because the best available answer beats no answer, and the exit
+    # code is how a script tells a human the tool could not substantiate the
+    # claim it exists to make.
+    "reference_unusable": (HARD,
         lambda v: "the reference measurement did not itself pass (%s), so it "
                   "is not a bar anything can be held to. The walk fell back "
-                  "to its own rate gate and the tag-count floor was not "
-                  "applied." % v),
+                  "to its own rate gate and the tag-count floor was NOT "
+                  "applied, so nothing in this run checked that the settings "
+                  "it chose see every tag the scene has. The tune stands as "
+                  "the best available answer; it is not a verified one." % v),
+    # The shortfall itself, named and measured, because "the reference was
+    # unusable" understates what actually shipped. _rescue takes the FIRST
+    # passing exposure, which on the too-dark walk is the SHORTEST and so the
+    # darkest - it systematically lands on the fewest tags that still
+    # multi-tag solve. That is deliberate and stays: the walk is already over
+    # the blur budget and a longer exposure buys tags with more smear, which
+    # is the trade this tool exists to refuse. What was NOT acceptable is
+    # doing it silently. The floor _rescue now carries is a REPORTED one, not
+    # a gate: it never turns a passing exposure into no answer at all, it
+    # says how many tags the answer costs.
+    "rescue_tags_short": (HARD,
+        lambda v: "the rescue walk left this camera seeing %.2f tags, but "
+                  "this run measured %.2f tags in the same scene at %.0f us / "
+                  "gain %s. The exposure search escaped the blur budget by "
+                  "landing on the fewest tags that still solve. Add light "
+                  "instead." % (v["got"], v["scene_best"], v["scene_at"],
+                                v["scene_gain"])),
+    # ---- warn ----
     "robot_state_unknown": (WARN,
         lambda v: "THE ROBOT-ENABLED GUARD WAS INACTIVE for this tune: %s. "
                   "Nothing would have stopped this run if a match had started "
@@ -1789,7 +1832,8 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
         else:
             log("   !! the reference does not pass its own test (%s), so it "
                 "cannot be a bar. Walking without the tag-count floor; the "
-                "90%% multi-tag gate still applies." % ref_why)
+                "90%% multi-tag gate still applies, but two tags satisfy it "
+                "as well as four, so THIS RUN WILL NOT REPORT SUCCESS." % ref_why)
             note_problem(rec, "reference_unusable", ref_why)
             best_tags = None
             best_tags_se = None
@@ -1932,6 +1976,58 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
             note_problem(rec, "applied_point_failed",
                          {"gain": st.gain, "exposure": st.exposure,
                           "why": why})
+
+        # ---- 8b. did a rescue buy its pass by giving up tags? -------------
+        #
+        # Only on the rescue path: at_budget means the gain walk found the
+        # answer at the budget exposure, where the reference already IS the
+        # floor. Off it, nothing in the run has checked the tag count against
+        # anything, and _rescue stops at the first pass by design.
+        #
+        # The bar is the most tags ANY trial in this run saw. That is not the
+        # reference - the reference is one operating point and it is the one
+        # that failed - it is a scene-wide observation: this camera, in this
+        # scene, in the last minute, demonstrably resolved that many. Judged
+        # with the same significance test the walk uses, with both samples'
+        # own scatter, so a 2.00-against-2.05 does not trip it.
+        #
+        # REPORTED, not gated. It cannot make _rescue return nothing, and it
+        # does not move the camera: a camera that sees two tags beats a
+        # camera restored to whatever it had before. It makes the cost of the
+        # rescue a number in the summary instead of a line in the log.
+        #
+        # WHAT THIS CANNOT SEE, stated plainly because it bounds the value of
+        # the check: the bar is the best count among THIS RUN's trials, and
+        # on the too-dark walk every one of them is at or below the budget
+        # exposure, so they are all darker than the answer and all see fewer
+        # tags. In the forced case above - 2.00 tags in a scene that shows
+        # 4.00 - this check does NOT fire, because nothing in that run ever
+        # measured the 4.00. The 4.00 is known from tuning the same scene at
+        # 863 us, which is a different run.
+        #
+        # So this is not what closes the hole. reference_unusable being HARD
+        # is: _rescue is unreachable while the reference passes, so every
+        # dropped-floor run now exits 1 whether or not this fires. This is
+        # the part that says HOW MUCH was given up, on the runs where the
+        # evidence is already in hand - mostly saturated rescues, where the
+        # gain walk did sample a brighter operating point. Measuring the
+        # scene properly would mean one extra dwell at the camera's incoming
+        # settings on every run, which is a runtime change and not this
+        # round's.
+        if not at_budget and final.tag_counts:
+            best = max((t for t in st.trials if t.tag_counts),
+                       key=lambda t: t.mean_tags, default=None)
+            if best is not None and final.tags_significantly_below(
+                    best.mean_tags, reference_se=best.tag_standard_error()):
+                log("   !! this rescue sees %.2f tags; this run saw %.2f at "
+                    "%.0f us / gain %s in the same scene."
+                    % (final.mean_tags, best.mean_tags, best.exposure,
+                       best.gain))
+                note_problem(rec, "rescue_tags_short",
+                             {"got": final.mean_tags,
+                              "scene_best": best.mean_tags,
+                              "scene_at": best.exposure,
+                              "scene_gain": best.gain})
         rec["applied"] = st.exposure
         PENDING_RESTORE.pop(st.unique, None)
         if progress:
@@ -2058,6 +2154,14 @@ async def _rescue(pv, cam, cfg, st, log):
         # measured where nothing worked - and on the saturated walk it would
         # be too lenient, because the reference itself is a washed-out count.
         # A count from a state we have abandoned is not a floor.
+        #
+        # That argument is about the REFERENCE, and it still holds. It is not
+        # an argument for landing on two tags in a four-tag scene and saying
+        # nothing, which is what stopping at the first pass with no floor at
+        # all used to do. Step 8b measures the point this returns against the
+        # most tags anything in the run saw and records rescue_tags_short.
+        # The check is there and not here because it belongs on the settings
+        # actually APPLIED, not on a candidate that may yet be superseded.
         why = s.why_failed(cfg.min_tags, cfg.max_ambiguity)
         log("   %s gain %-4d exposure %6.0f  %s%s"
             % ("ok " if why is None else "   ", gain, e, s.summary(),
