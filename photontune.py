@@ -74,6 +74,46 @@ def rate_upper_bound(hits, n, z=_RATE_Z):
     return min(1.0, (centre + half) / denom)
 
 
+# Below this many frames, rate_upper_bound is too generous to mean anything and
+# the sample is not classified at all.
+#
+# MEASURED, by asking for each n what the SMALLEST hit rate is that still clears
+# the nominal 0.90 gate through the upper bound:
+#
+#     n =  3  ->  0.667      n = 13  ->  0.769      n = 26  ->  0.808
+#     n =  4  ->  0.750      n = 19  ->  0.789      n = 33  ->  0.818
+#     n =  7  ->  0.714      n = 20  ->  0.800      n = 64  ->  0.844
+#
+# At the old n>=3 floor, 2 frames out of 3 - 67% - was a "pass" against a 90%
+# threshold, reachable on --no-nt --fast. The sequence is not monotonic (it is
+# granularity, not statistics), so the floor has to be the point from which
+# EVERY larger n behaves: from n=20 upward the effective floor never drops below
+# 0.80 again, for the 0.95 reference-tag gate as well as the 0.90 multi-tag one.
+#
+# Sampling extends itself to reach this rather than failing (see sample()), so
+# the cost lands only on the slow websocket path: over NetworkTables a 1.5 s
+# dwell already carries ~60 frames.
+MIN_SAMPLE_FRAMES = 20
+
+# How long a collect may run PAST its dwell to reach MIN_SAMPLE_FRAMES. Bounded
+# on purpose: a dead pipeline must not add this to all eight sweep points, which
+# is why the extension also requires at least one frame to have arrived.
+SAMPLE_EXTEND_S = 4.0
+
+# How long a read-back may poll for the camera to agree before it is called a
+# failure. PhotonVision's cameraSettings broadcast lags a write by 1-2 s, so
+# anything under a few seconds cries wolf; 12 s is long enough that "still not
+# agreeing" means it never will.
+CONFIRM_TIMEOUT_S = 12.0
+
+# Extra measurements of the gain that is about to win, to estimate the noise
+# WHERE THE DECISION IS MADE. Two, for three readings in total: one repeat gives
+# a spread that is itself a coin toss, and the audit's three runs of the same
+# gain (0.378 / 0.393 / 0.510) show the outlier need not be adjacent. Costs
+# 2 x (settle + dwell) ~ 4.4 s per camera.
+GAIN_REPEATS = 2
+
+
 class Sample:
     """Detection quality at one exposure, for one camera."""
     def __init__(self, exposure):
@@ -111,7 +151,7 @@ class Sample:
         return _median(self.ref_ranges)
 
     def passes(self, min_tags, max_ambiguity, ref_tag=None, tag_target=None):
-        if self.frames < 3:
+        if self.frames < MIN_SAMPLE_FRAMES:
             return False
         # Multi-tag solves happily on a subset, so "it solved" is not the same as
         # "it saw everything available". Require most of the tags that the best
@@ -145,8 +185,14 @@ class Sample:
         """
         if self.passes(min_tags, max_ambiguity, ref_tag, tag_target):
             return None
-        if self.frames < 3:
-            return "only %d frames arrived - nothing was being published" % self.frames
+        if self.frames == 0:
+            return "no frames arrived - nothing was being published"
+        if self.frames < MIN_SAMPLE_FRAMES:
+            return ("only %d frames - under the %d needed to classify (at %d "
+                    "frames the 90%% gate lets %.0f%% through, so a 'pass' here "
+                    "would be noise). Raise --dwell, or drop --fast."
+                    % (self.frames, MIN_SAMPLE_FRAMES, self.frames,
+                       100 * _effective_floor(self.frames)))
         if tag_target is not None and self.mean_tags < tag_target:
             return "saw %.2f tags, needed %.2f" % (self.mean_tags, tag_target)
         if ref_tag is not None:
@@ -177,6 +223,56 @@ class Sample:
         amb = self.med_ambiguity
         return "tags %.2f  ambiguity %s  (no multitag)" % (
             self.mean_tags, "%.3f" % amb if amb is not None else "n/a")
+
+
+def _effective_floor(n, threshold=0.90):
+    """The smallest hit rate that still clears `threshold` through the bound at n.
+
+    Only used to SAY how weak a small sample is, in the message that refuses it.
+    """
+    for h in range(n + 1):
+        if rate_upper_bound(h, n) >= threshold:
+            return h / float(n) if n else 1.0
+    return 1.0
+
+
+# The noise band never goes below this. One set of near-identical readings must
+# not make every 1% difference "significant".
+GAIN_BAND_FLOOR = 1.05
+
+
+def gain_decision(good, repeats, leader_gain, reproj_tolerance,
+                  band_floor=GAIN_BAND_FLOOR):
+    """Which gain wins, given [(gain, reproj)] and repeat readings of the leader.
+
+    Pure arithmetic, deliberately separated from the measuring so it can be
+    driven with recorded numbers - see sabotage_test.py --gain-decision, which
+    replays the audit's own three runs (gain 100 read 0.378 / 0.393 / 0.510 and
+    gain 60 read 0.478 / 0.479 / 0.478) and shows the old rule choosing 100,
+    100, 60 while this one chooses the same gain all three times.
+
+    Returns (pick, best, band, noise, good) where pick and best are (gain,
+    reproj) pairs and `good` is the input with the leader's reprojection
+    replaced by the median of its repeats.
+    """
+    noise = None
+    if len(repeats) > 1:
+        # The spread OBSERVED AT THE DECIDING POINT, not at the quietest gain in
+        # the scan. And the median of the repeats, so one lucky reading cannot
+        # win the scan on its own.
+        noise = abs(math.log(max(repeats) / min(repeats)))
+        leader_rp = _median(repeats)
+        good = [(g, leader_rp if g == leader_gain else rp) for g, rp in good]
+    best_rp = min(rp for _g, rp in good)
+    # --reproj-tolerance keeps its own job: REJECT a gain whose fit is clearly
+    # worse than the best. It is not a noise estimate and must not be used as
+    # one - at its 1.5 default it declares a 28% difference insignificant.
+    usable = [t for t in good if t[1] <= best_rp * float(reproj_tolerance)]
+    band = max(math.exp(noise) if noise is not None else 1.0, band_floor)
+    contenders = [t for t in usable if t[1] <= best_rp * band]
+    pick = min(contenders, key=lambda t: t[0])       # LOWEST gain wins a tie
+    best = min(good, key=lambda t: t[1])
+    return pick, best, band, noise, good
 
 
 def _median(xs):
@@ -437,8 +533,91 @@ class Photon:
                 bad.append((k, want, have))
         return bad
 
-    async def collect(self, unique_name, seconds, ref_tag=None):
-        """Gather pipeline results for one camera."""
+    async def confirm(self, unique_name, expect, timeout=CONFIRM_TIMEOUT_S,
+                      settle=1.2, log=None):
+        """Poll cameraSettings until the camera agrees, or the timeout expires.
+
+        Returns (mismatches, read_ok). read_ok is False only if we never managed
+        to read this camera AT ALL - which is NOT "the setting was rejected", and
+        is not a pass either. Both of those confusions were live:
+
+          - ONE look, 1.5 s after the write, was the whole read-back. Measured:
+            photontune's own NT-server toggle bounced a competing writer offline
+            inside that window, the single look saw the value it wanted, no
+            failure was recorded, the run exited 0 - and the camera ended it with
+            cameraRedGain=50. A snapshot cannot tell a settled value from one
+            that is about to be overwritten; only re-reading can.
+          - When PhotonVision stopped broadcasting cameraSettings the read
+            returned None, which was logged and then treated as success.
+
+        Polling rather than one longer sleep because PhotonVision's cameraSettings
+        broadcast lags the write by 1-2 s and is not on a fixed schedule: an
+        earlier attempt at this cried wolf on writes that had in fact succeeded.
+        On the happy path this returns after the first look, so it costs what the
+        old single read cost; the extra time is only ever spent on a failure.
+        """
+        deadline = time.time() + timeout
+        await asyncio.sleep(min(settle, timeout))
+        bad, read_ok, gap = None, False, 0.5
+        while True:
+            try:
+                cams = await self.cameras_fresh(timeout=6)
+            except Exception:
+                cams = []
+            got = next((c for c in cams if c["uniqueName"] == unique_name), None)
+            if got is not None:
+                read_ok = True
+                bad = self._diff(got["settings"], expect)
+                if not bad:
+                    return [], True
+            if time.time() >= deadline:
+                break
+            # Back off. Every poll is a NEW websocket connection - cameraSettings
+            # is only broadcast on connect - and a fixed 0.4 s interval means ~25
+            # connect/disconnect cycles in a 12 s timeout. MEASURED: three runs
+            # died with "no close frame received or sent" while polling hard
+            # across a video-mode change, which restarts the capture pipeline and
+            # is exactly when a read-back disagrees for several seconds. Slower
+            # polling still confirms in 1-2 s on the happy path (the first look
+            # almost always agrees) and stops the tool from knocking over the
+            # server it is asking.
+            await asyncio.sleep(gap)
+            gap = min(gap * 1.6, 2.0)
+        if not read_ok and log:
+            log("   !! PhotonVision did not broadcast cameraSettings once in "
+                "%.0f s. It is up (the websocket connected) but is not "
+                "reporting camera state." % timeout)
+            log("   !! Seen after selecting pipeline 0 on this rig: every "
+                "DataChangeService dispatch threw NullPointerException and the "
+                "broadcast stopped. Select a different pipeline.")
+        return (bad if bad is not None else []), read_ok
+
+    async def set_and_verify(self, unique_name, settle=1.5,
+                             timeout=CONFIRM_TIMEOUT_S, log=None, **kw):
+        """Write settings and confirm the camera took them. Returns list of failures.
+
+        A single (None, None, None) entry means "could not read the camera back
+        at all" - different from a rejection, and treated as a HARD failure by
+        the caller rather than as silence.
+        """
+        await self.set_setting(unique_name, **kw)
+        bad, read_ok = await self.confirm(unique_name, kw, timeout=timeout,
+                                          settle=settle, log=log)
+        if not read_ok:
+            return [(None, None, None)]
+        return bad
+
+    async def collect(self, unique_name, seconds, ref_tag=None, min_frames=0,
+                      extend=SAMPLE_EXTEND_S):
+        """Gather pipeline results for one camera.
+
+        min_frames: keep collecting past `seconds` until this many frames have
+        arrived. The websocket is throttled to ~9 fps, so a 0.9 s --fast dwell
+        carries ~8 frames - below MIN_SAMPLE_FRAMES, which would refuse to
+        classify anything in that mode. Extending is the cheap half of the fix.
+        Only extends when frames ARE arriving: at zero the pipeline is dead or
+        the scene is black, and waiting longer buys nothing but a slower sweep.
+        """
         out = {"frames": 0, "solves": 0, "reproj": [], "tags": [], "amb": [],
                "ref_seen": 0, "ref_ranges": []}
         def handle(msg):
@@ -462,6 +641,10 @@ class Photon:
                 out["solves"] += 1
                 out["reproj"].append(mt.get("bestReprojectionError", float("nan")))
         await self._pump(seconds, handle)
+        t_end = time.time() + extend
+        while (min_frames and 0 < out["frames"] < min_frames
+               and time.time() < t_end):
+            await self._pump(0.5, handle)
         return out
 
 
@@ -473,8 +656,10 @@ async def sample(pv, cam, args, seconds, ref_tag, after_capture=None):
     if reader is not None:
         # ntcore blocks; keep the event loop free so nothing else stalls.
         return await asyncio.get_event_loop().run_in_executor(
-            None, reader.collect, seconds, ref_tag, after_capture)
-    return await pv.collect(cam["uniqueName"], seconds, ref_tag)
+            None, reader.collect, seconds, ref_tag, after_capture,
+            MIN_SAMPLE_FRAMES)
+    return await pv.collect(cam["uniqueName"], seconds, ref_tag,
+                            min_frames=MIN_SAMPLE_FRAMES)
 
 
 def capture_mark(args, cam):
@@ -1954,7 +2139,8 @@ class NTResults:
             time.sleep(0.1)
         return False
 
-    def collect(self, seconds, ref_tag=None, after_capture=None):
+    def collect(self, seconds, ref_tag=None, after_capture=None, min_frames=0,
+                extend=SAMPLE_EXTEND_S):
         """after_capture: discard frames CAPTURED at or before this timestamp.
 
         Waiting a settle period is not enough. The pipeline runs ~125 ms behind,
@@ -1968,9 +2154,14 @@ class NTResults:
                "ref_seen": 0, "ref_ranges": [], "stale_dropped": 0}
         seen = set()
         end = time.time() + seconds
+        # Keep ONE dedupe set across the extension rather than calling collect
+        # twice: sub.get() returns the latest value, so a second call would
+        # re-count the frame that straddles the boundary.
+        hard_end = end + (extend if min_frames else 0.0)
         # ntcore's readQueue() returned nothing here regardless of pollStorage,
         # so poll and dedupe on sequenceID. At 500 Hz nothing is missed at 24 ms.
-        while time.time() < end:
+        while (time.time() < end
+               or (0 < out["frames"] < min_frames and time.time() < hard_end)):
             raw = self.sub.get()
             if raw:
                 try:
