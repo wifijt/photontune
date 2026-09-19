@@ -6,19 +6,26 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/photontune
-# --nt-server: point at the roboRIO at competition (e.g. 10.TE.AM.2),
-#              or use --team <number> instead. 127.0.0.1 works while
-#              PhotonVision itself is running the NT server (bench only).
+# --nt-server: point at a NetworkTables server that ALREADY EXISTS - the
+#              roboRIO at competition (e.g. 10.TE.AM.2), or use --team
+#              <number> instead. photontune never starts one; if none is
+#              reachable it samples over PhotonVision's websocket instead.
+#
+# The daemon asserts the baseline once at boot and then waits. Set
+# PhotonTune/run true from the dashboard to tune, at the field, in the light
+# you will actually play in.
 ExecStart=/usr/bin/python3 /opt/photontune/photontune.py \
     --daemon \
-    --nt-server 127.0.0.1 \
+    --nt-server 10.0.0.2 \
     --host 127.0.0.1 \
-    --nt-table PhotonTune \
-    --steps 8 \
-    --dwell 2.5 \
-    --bias 1.5
+    --nt-table PhotonTune
 Restart=on-failure
 RestartSec=5
+# photontune exits 143 on SIGTERM (128 + 15, the shell's convention) so that a
+# script can tell an interruption from a clean finish. Declaring it a success
+# keeps `systemctl stop` from looking like a crash. It is NOT a blanket
+# amnesty: a camera the tool could not put back exits 1 specifically, so that
+# case still reaches the journal as a failure.
 # Never higher priority than the vision pipeline itself
 Nice=5
 

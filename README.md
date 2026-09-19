@@ -1,33 +1,30 @@
 # photontune
 
-Automatic exposure tuning for [PhotonVision](https://photonvision.org) AprilTag pipelines,
-scored on **detection quality** rather than image brightness — and deliberately biased
-toward **short exposures** to limit motion blur.
+Exposure and gain for [PhotonVision](https://photonvision.org) AprilTag pipelines, set
+from a **motion-blur budget** rather than searched for on a bench.
 
-Built for the case where there is no time at a competition to calmly tune camera settings.
-A full sweep takes about 40 seconds per camera, needs no service restart, and can be
-triggered from the driver station by anyone on the team.
+> *The least gain that still sees every tag, at the exposure a spinning robot allows.*
 
 ```
-exposure  1584   no tags                      <- cliff
-exposure  2508   multitag  82%
-exposure  3973   multitag 100%  reproj 0.178  ok
-exposure  6292   multitag 100%  reproj 0.190  ok
-exposure 25000   multitag 100%  reproj 0.669  ok
-
-cliff ~3157 (bracketed), bias 1.50  ->  4735
-predicted blur: 8.2 px @90deg/s, 32.9 px @360deg/s (tag edge ~70 px)
-applied 4735 - verified: multitag 100%  reproj 0.131
+── OV9281 ──  current exposure 1500.0, gain 100
+   baseline: already correct
+   fx 1105.9 from this camera's own calibration; 6 px at 360 deg/s allows 863 us
+   reference  gain 100  exposure    863  multitag 100%  reproj   0.460  tags 3.70
+       gain 0    exposure    863  multitag   5%  reproj   1.137  tags 1.09   <- saw 1.09 tags
+              against the reference's 3.70 - 2.61 short, over the 0.22 that 3 sigma of this
+              sample's own scatter allows, so it is a real loss and not noise
+   ok  gain 20   exposure    863  multitag  98%  reproj   0.869  tags 3.93
+   lowest gain that sees every tag: 20. Applying 40 - one grid step of margin.
+   applied gain 40 / exposure 863 - confirmed. 6.0 px of smear at 360 deg/s (budget 6)
 ```
 
-## Why not just pick the middle of the range?
+Two cameras in **43 s**, measured on a Pi 5 with two OV9281s.
 
-Because every setting above the cliff looks identical on a bench, and they are wildly
-different on a moving robot.
+## Why the exposure is not searched for
 
 This tool measures a **stationary** camera, so motion blur is exactly zero in everything
-it can observe. Left to itself it would always drift toward longer exposures. But blur
-scales linearly with exposure time:
+it can observe. Every plateau it can find is a plateau in the one condition that does not
+matter. Blur scales linearly with exposure:
 
 ```
 blur_px = rotation_rate x exposure x focal_length
@@ -39,17 +36,44 @@ rotation rate              1000us   2000us   4000us   8000us  15000us  25000us
 360 deg/s fast spin           6.9     13.9     27.8     55.6    104.2    173.7
 ```
 
-(fx = 1105.9 px, 1280x800. A tag edge is only about 70 px across at 2.4 m, and good pose
+(fx = 1105.9 px at 1280x800. A tag edge is only about 70 px across at 2.4 m, and good pose
 accuracy rests on roughly 0.2 px of corner precision.)
 
 A tuner that picked "the middle of the plateau" would happily choose 12000 — about 104 px
-of smear on a 70 px tag during a fast spin. The tag is erased.
+of smear on a 70 px tag during a fast spin. The tag is erased. So turn it around: the
+exposure is whatever the budget allows, and the only thing left to decide is gain.
 
-### This is measured, not just modelled
+```
+t_budget = max_blur_px / (radians(blur_rate) * fx)
+```
 
-`blurtest.py` records PhotonVision's own detected corners while you wave a tag, derives
-image-plane speed from frame-to-frame corner displacement, and correlates it with
-detection. Two 30-second runs, same tag on a 3 m string, same motion:
+`fx` comes from the camera's **own active calibration**, not from a flag — on this rig it
+is 1105.9 at 1280x800 and 570.5 at 640x400, so a constant carried across a resolution
+change overstates blur by 1.94x.
+
+### The budget is a proxy, and is labelled as one
+
+`--max-blur-px` defaults to **6**, derived rather than measured. PhotonVision's own
+Gaussian `blur` swept at fixed exposure and gain:
+
+```
+blur   tags   multitag        blur   tags   multitag
+0.0    3.96     100%          2.0    1.00       0%
+0.5    3.47     100%          2.5    1.00       0%
+1.0    2.00     100%          3.0    0.76       0%
+1.5    1.50      50%          4.0    0.00       0%
+```
+
+Detection degrades immediately — 12% of tags gone by sigma 0.5 — and multi-tag collapses
+between sigma 1.5 and 2.0. A box smear of length L matches a Gaussian of sigma L/sqrt(12)
+by equal high-frequency attenuation, so sigma 1.0 is about 3.5 px of smear.
+
+That proxy **overstates the damage by roughly 2x**: Gaussian blur degrades edges in every
+direction, motion smear only degrades the ones perpendicular to the motion, and a tag has
+edges in two orthogonal directions. Hence 6 px rather than 3.5.
+
+`blurtest.py` measures the real thing but needs a human waving a tag. Two 30-second runs,
+same tag on a 3 m string, same motion:
 
 ```
                           4735 us        15000 us
@@ -59,34 +83,71 @@ max blur                   8.39 px       30.74 px
 ambiguity, moving          0.357          0.431
 ```
 
-**Both settings scored 100% on the static sweep.** Under motion one holds 99% detection
-and the other loses a quarter of its frames — at a peak rate of only ~106 deg/s, far below
-a defensive pivot. That is the whole argument for biasing short, and it is why a tuner
-scored on a stationary camera must not be trusted to pick its own spot on the plateau.
-
-Ambiguity also tripled with motion at the *short* exposure (0.117 still to 0.357 moving),
-so blur degrades pose quality well before it costs you detections.
+Both scored 100% on a static sweep. Run it when someone is available and correct the
+number.
 
 ```sh
 python3 blurtest.py <host> <tagId> <exposure_us> <seconds>
 ```
 
-So `photontune` finds where detection actually *fails*, and sits a small safety factor
-above that. It is correcting for a cost that is real, known in direction, and invisible
-to the instrument.
+## How it chooses the gain
 
-## How it chooses
+Per camera:
 
-1. Sweeps exposure geometrically across the requested range.
-2. Scores each point on **multi-tag solve rate** (>= 90%), falling back to mean tags per
-   frame plus ambiguity when multi-tag is unavailable.
-3. Brackets the failure cliff between the highest failing and lowest passing sample and
-   takes their geometric mean. (Biasing off the shortest *tested* pass double-counts
-   margin — with a log-spaced sweep that sample already sits up to one full step high.)
-4. Applies `cliff x bias`, then **verifies** it, falling back to the shortest known-good
-   value if the interpolated pick does not hold.
+1. **Assert the baseline** — the structural settings that have one right answer
+   (see below), then check the camera has a calibration for the resolution it is
+   actually running.
+2. **Fix the exposure** at `t_budget`, clamped to the camera's own reported
+   `minExposureRaw` / `maxExposureRaw`.
+3. **Reference count**: sample at the top of the gain grid. That is the best the scene can
+   do without exceeding the budget.
+4. **Walk gain up** through a six-point grid (0, 20, 40, 60, 80, 100), sampling each.
+   A point passes if the multi-tag solve rate's upper confidence bound clears 90% **and**
+   its tag count is not significantly below the reference. **Stop at the first pass and
+   apply that gain plus one grid step** — a field is not the pit.
+5. If the image turns out to be **saturated** (fails at gain 0, and the tag count *falls*
+   as gain rises) walk exposure **down** instead. If even maximum gain cannot see the tags
+   at the budget exposure, walk exposure **up** and raise an `over_blur_budget` warning:
+   the answer stands, but you are outside the budget and a human has to know.
+6. Write it, poll until the camera agrees, then re-read the whole camera at the end of the
+   tune and check it is still where the tune left it.
 
-Settings are changed live over PhotonVision's websocket, so the camera never drops out.
+Reprojection error is measured, printed and stored in the JSON. **It never chooses
+anything.** It is OpenCV's RMS residual over the corners of the multi-tag fit: it measures
+internal consistency of a fit, not pose accuracy, and it *improves* when distant tags drop
+out of the solve. Optimising it rewarded losing tags; six identical runs of one camera
+chose gain 60, 80, 60, 80, 100, 100.
+
+### "Significantly below", not a fraction
+
+A fraction cannot decide whether a tag count dropped. At 0.85 a reference of 4.00 sets the
+floor at 3.40, so a real loss to 3.73 passes; at 0.96 a reference of 2.00 sets it at 1.92
+and a reading of exactly 1.92 — one frame in 25 short — changed the answer. The test is
+whether the shortfall exceeds three standard errors of *this sample's own* tag count,
+computed from the per-frame counts already in hand. It tightens with more evidence rather
+than loosening.
+
+## The baseline
+
+Everything with one right answer is asserted before anything is measured, because tuning
+on top of a crushed brightness just answers with a long, blurry exposure and calls it
+success. `inputImageRotationMode=0`, `blur=0`, `cameraAutoExposure=off`, red/blue gain 0,
+`targetModel=7` (6.5 in), `tagFamily=0`, plus measured defaults for `decisionMargin`,
+`hammingDist`, `threads`, `decimate`, `cameraBrightness`, `numIterations`, `refineEdges`,
+`doMultiTarget` and `solvePNPEnabled`. Each carries its reason in the source.
+
+Three of those had never once applied, for two weeks, because they were sent as enum names
+where PhotonVision requires ordinals — and the tool logged its own failure and carried on.
+`sabotage_test.py` exists for that reason: it breaks 15 settings on purpose and checks each
+one is repaired.
+
+```sh
+python3 sabotage_test.py --photontune "python3 /opt/photontune/photontune.py --host 127.0.0.1"
+python3 sabotage_test.py --verdict-matrix   # offline: exit code per recorded problem
+python3 sabotage_test.py --gain-walk        # offline: recorded samples, real pass rule
+python3 sabotage_test.py --sample-floor     # offline: a 3-frame sample cannot "pass"
+python3 sabotage_test.py --cli-smoke        # offline: the real main(), every flag
+```
 
 ## Install
 
@@ -109,24 +170,25 @@ sudo pip3 install --break-system-packages pyntcore
 ## Usage — CLI
 
 ```sh
-# measure and report, change nothing
-python3 photontune.py --host photonvision.local --dry-run
-
 # tune every camera
 python3 photontune.py --host photonvision.local
 
 # specific cameras
 python3 photontune.py --cameras Front,Back
 
+# assert the structural settings and stop
+python3 photontune.py --baseline-only
+
 # run it on the coprocessor itself - no laptop setup required
 python3 photontune.py --host 127.0.0.1
 ```
 
-Exits `0` on success, `1` if any camera failed. Dry runs never exit non-zero.
+Exits `0` only if every camera ended in the state the run says it did. **No path exits 0
+on a failure the tool detected** — that is asserted per problem by
+`sabotage_test.py --verdict-matrix`, which runs the real `main()` in a subprocess and
+checks the process exit status.
 
 ## Usage — NetworkTables daemon
-
-Install the service, pointing `--nt-server` at the roboRIO:
 
 ```sh
 sudo cp photontune.py /opt/photontune/
@@ -134,131 +196,53 @@ sudo cp photontune.service /etc/systemd/system/
 sudo systemctl enable --now photontune
 ```
 
-Then anyone can trigger it from the dashboard:
-
 | Topic | Type | Meaning |
 |---|---|---|
 | `PhotonTune/run` | bool | set true to start; auto-clears when finished |
-| `PhotonTune/busy` | bool | true while sweeping |
+| `PhotonTune/busy` | bool | true while tuning |
 | `PhotonTune/progress` | double | 0..1, spans all cameras |
 | `PhotonTune/ok` | bool | **go / no-go for the last run** |
-| `PhotonTune/summary` | string | `OV9281=4735`, or `FAILED: ...` |
-| `PhotonTune/status` | string | live line, updates each sweep point |
+| `PhotonTune/summary` | string | `OV9281=863@g40`, or `FAILED: ...` |
+| `PhotonTune/warnings` | string | not failures, but a human must be told |
+| `PhotonTune/status` | string | live line |
 | `PhotonTune/heartbeat` | double | increments continuously — proves the service is alive |
-| `PhotonTune/result` | string | full JSON: every sample, ranges, warnings |
+| `PhotonTune/result` | string | full JSON: every trial, every problem |
 | `PhotonTune/camera` | string | camera being tuned, e.g. `Front (2 of 3)` |
-| `PhotonTune/referenceTag` | double | **write before running**: held tag ID, `-1` = use field tags |
-| `PhotonTune/referenceRange` | double | **write before running**: string length in metres |
-| `PhotonTune/holdCard` | bool | true while a card must be held steady |
-| `PhotonTune/holdFor` | string | **which camera** to hold it in front of
-| `PhotonTune/bootTuneRan` | bool | the automatic boot tune actually executed |
-| `PhotonTune/bootTuneOk` | bool | it succeeded on **every** camera |
-| `PhotonTune/bootTuneSummary` | string | what it applied, or why it did not run | |
+| `PhotonTune/bootBaselineRan` | bool | the boot baseline actually executed |
+| `PhotonTune/bootBaselineOk` | bool | it succeeded on **every** camera |
+| `PhotonTune/bootBaselineSummary` | string | what it changed, or why it did not run |
 
-Press the button, watch the bar, wait for the green box.
+**`heartbeat` matters.** If the daemon dies, `ok` and `busy` hold their last values forever
+and the button silently does nothing. A frozen heartbeat means the service is down — not
+that tuning failed. Check it before pressing.
 
-**`heartbeat` matters.** If the daemon dies, `ok` and `busy` hold their last values
-forever and the button silently does nothing. A frozen heartbeat means the service is
-down — not that tuning failed. Check it before pressing.
+### Boot asserts the baseline; tuning is on demand
 
-### Tuning automatically at boot
+At startup the daemon waits for PhotonVision to answer, asserts the baseline on every
+camera, and stops. That takes seconds and cannot leave a camera mid-search.
 
-Add `--autorun` and the daemon tunes once by itself shortly after startup, so nobody
-has to remember to press anything:
+It does **not** tune at boot, deliberately:
 
-```
---autorun --autorun-delay 5
-```
+- PhotonVision persists every websocket write to SQLite, so tune-once-and-persist is the
+  platform's own default. Re-deriving the same answer every power cycle buys nothing.
+- The boot tune this replaces spent ~131 s driving both cameras through blind exposures
+  while the robot may be on the cart about to be enabled.
+- Lighting differs between the pit and the field. Tune where you will play.
 
-The delay is counted from when **PhotonVision starts answering**, not from when the
-service starts. `After=photonvision.service` only waits for the process, not for the
-pipeline, so a fixed sleep fires into a camera that is not streaming yet. The daemon
-polls until PhotonVision reports cameras, waits `--autorun-delay`, then tunes once.
-If PhotonVision never comes up it gives up after `--autorun-timeout` (default 90 s)
-and says so in `bootTuneSummary` rather than hanging.
+The daemon refuses to start a tune while the robot is enabled (`FMSInfo/FMSControlData`
+bit 0), and **re-checks between every step during one**, aborting with a restore if the
+robot goes enabled mid-tune.
 
-**A failed boot tune changes nothing.** If the robot powers up in the pit with no tags
-in view, the sweep finds no passing exposure and every failure path restores the
-original exposure and gain before returning. You get `bootTuneOk=false`, a reason in
-`bootTuneSummary`, and the settings you had. The same is true of any exception.
+### photontune never starts a NetworkTables server
 
-If the robot is already enabled when the daemon starts, the automatic run is skipped
-entirely — `bootTuneSummary` says so.
+`--nt-server` points at one that already **exists** — the roboRIO on a robot. Toggling
+PhotonVision's own `runNTServer` posts to `/api/settings/general`, which calls
+`stopServer()` (orphaning every NT client) *and* `NetworkManager.reinitialize()`, which
+restarts the web server and drops every websocket regardless of `shouldManage`. The tool
+used to do that twice per run and destroy its own control channel.
 
-The daemon **refuses to run while the robot is enabled** (`FMSInfo/FMSControlData` bit 0).
-
-## Reference-tag mode
-
-Hold a tag in front of the camera on a string of known length and tune in the pit, before
-you ever get field access:
-
-```sh
-python3 photontune.py --reference-tag 8 --reference-range 3.0
-```
-
-From the dashboard, write `referenceTag` and `referenceRange` first, then press `run`.
-Leave `referenceTag` at `-1` to tune against whatever field tags are in view instead.
-
-### With more than one camera
-
-Cameras point in different directions, so a held card is only ever visible to one of them.
-The tool tunes cameras **sequentially** and tells the person holding it where to stand:
-
-```
-camera  = "Front (1 of 2)"     holdFor = "Front"
-   ... 40 s ...
-   move the card to 'Rear' - 8s        <- --move-pause
-camera  = "Rear (2 of 2)"      holdFor = "Rear"
-```
-
-Put `holdFor` somewhere large on the dashboard. Budget roughly
-`40s x cameras + 8s x (cameras - 1)`. Tune `--move-pause` to however long it actually takes
-to walk between them.
-
-Scoring switches to that tag's **detection rate** — a single held tag cannot multi-tag,
-and its ambiguity is driven by viewing angle rather than exposure.
-
-The string length matters, so the tool checks it. It measures the range independently from
-tag size and your calibration, and warns if reality disagrees:
-
-```
-reference tag 8 measured at 2.53 m (string says 1.00 m)
-WARNING: measured range is 253% of the stated range.
-         Tuning at the wrong distance biases exposure badly -
-         too close under-exposes you for real field tags.
-```
-
-A tag at 1 m is large and bright and passes at almost any exposure, so the cliff you would
-measure sits far below the real one against field tags at 3–6 m. Use a representative
-distance.
-
-### Held-card mode carries extra margin, on purpose
-
-Detecting one tag is easier than getting several tags detected *well enough to multi-tag*.
-Measured on the same rig minutes apart:
-
-```
-field tags, multi-tag solve rate  ->  4735
-held card, single-tag detection   ->  2990      (1.6x shorter)
-```
-
-So a held card measures the **single-tag detection floor**, which is below what a field
-multi-tag solve actually needs — it would under-expose you for the thing you depend on.
-`--reference-bias` compensates — but **the right value is specific to your camera**, because
-the field cliff is set by the hardest tag in view, not an average. Measure yours once:
-
-```sh
-python3 photontune.py --calibrate-reference-bias --reference-tag 6 --reference-range 3.0
-```
-
-It runs both modes back to back (changing no settings) and prints the flag to paste into
-your systemd unit. Re-measure if you move or re-aim a camera.
-
-**Hold the card consistently.** It is only as repeatable as your presentation — square to
-the camera, steady, no glare. If the tool reports a ratio below 1.0 it will tell you the
-result is suspect: a single close tag should always be easier than a full multi-tag solve,
-so an inverted ratio means the card moved rather than anything about your camera. Taping
-the card to something beats holding it.
+With no NT server reachable, sampling falls back to PhotonVision's websocket at ~9–11
+results/s, which the algorithm tolerates: a 4 s dwell is ~40 frames.
 
 ## Options
 
@@ -266,28 +250,28 @@ the card to something beats holding it.
 |---|---|---|
 | `--host` | `photonvision.local` | PhotonVision host |
 | `--cameras` | all | comma-separated nicknames |
-| `--min-exposure` / `--max-exposure` | 1000 / 25000 | sweep range |
-| `--steps` | 8 | sweep points |
-| `--bias` | 1.5 | safety factor above the estimated cliff |
-| `--gain` | unchanged | fixed gain for the sweep |
-| `--dwell` / `--settle` | 2.5 / 1.5 | seconds collecting / waiting after a change |
-| `--max-ambiguity` | 0.20 | ambiguity bar when multi-tag is unavailable |
-| `--fx` | 1105.9 | focal length in px, for the blur estimate |
-| `--reference-tag` / `--reference-range` | — | held-tag mode |
-| `--dry-run`, `--json` | | |
+| `--max-blur-px` | 6 | **the budget that sets the exposure.** Proxy-derived |
+| `--blur-rate` | 360 | deg/s the budget is judged at |
+| `--max-gain` | 100 | top of the six-point grid; also sets the margin step |
+| `--dwell` / `--settle` | 4.0 / 0.7 | seconds collecting / waiting after a change |
+| `--max-exposure` | 25000 | ceiling for the too-dark walk only |
+| `--fx` | 1105.9 | fallback only; the camera's own calibration wins |
+| `--min-tags` / `--max-ambiguity` | 2.0 / 0.20 | bars when multi-tag is unavailable |
+| `--baseline-only`, `--no-baseline`, `--brightness` | | the structural settings |
+| `--nt-server`, `--no-nt`, `--json` | | |
 
 ## Limitations
 
-- **It cannot measure motion blur.** A stationary bench is blind to the dominant cost of
-  exposure. The short bias compensates for that, but the final word belongs to a moving
-  robot.
-- **The pass thresholds (90% solve rate, 95% reference detection) are judgement calls**
-  and deserve checking against a real field.
-- **It tunes exposure, not gain.** Gain is held fixed during a sweep. If nothing passes,
-  raise `--gain` and run again.
+- **The blur budget is a proxy.** It comes from Gaussian blur on a stationary camera,
+  halved by an argument about edge orientation. It is the weakest number in the tool.
+  `blurtest.py` measures the real one.
+- **The 90% solve-rate bar and the 3-sigma tag test are judgement calls** — better ones
+  than the fractions they replace, but still calls.
+- **Gain is chosen on a six-point grid**, so the answer is granular by construction. That
+  is deliberate: a finer grid would decide on differences smaller than the measurement.
 - **Multi-camera is sequential**, so cameras cannot perturb each other — but N cameras
   takes N times as long.
-- The cliff genuinely moves as lighting changes. Retune when conditions change materially.
+- The right answer genuinely moves as lighting changes. Retune where you will play.
 
 ## See also
 
