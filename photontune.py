@@ -2489,10 +2489,13 @@ def main():
             results = asyncio.run(_guard_signals(run(Config.from_args(args))))
         except (AlreadyRunning, ConnectionError, LookupError) as exc:
             sys.exit("photontune: %s" % exc)
-        except (KeyboardInterrupt, Terminated):
-            # The interrupted loop could not complete the restore. Do it on a new one.
+        except (KeyboardInterrupt, Terminated) as exc:
+            # The interrupted loop could not complete the restore. Do it on a
+            # new one - see the `finally` below. Exit 130 for Ctrl-C and 143
+            # for SIGTERM, the shell's own conventions (128 + signal), so a
+            # script that launched this can tell WHICH interruption it was.
             print("\ninterrupted - putting camera settings back...")
-            sys.exit(130)
+            sys.exit(143 if isinstance(exc, Terminated) else 130)
         failed, warnings, code = run_verdict(results, Config.from_args(args))
         if args.json:
             print(json.dumps(results, indent=2))
