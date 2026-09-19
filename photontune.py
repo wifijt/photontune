@@ -206,6 +206,27 @@ GAIN_GRID_STEPS = 6
 # the old escalation turned a 25 s tune into a two-minute one.
 EXPOSURE_WALK_STEPS = 5
 
+# How far past the blur budget the too-dark walk may go before it stops
+# walking. The walk's ceiling used to be --max-exposure, 25000 us, which at
+# 360 deg/s and fx 1105.9 is 174 px of smear: FORCED, and it shipped as a
+# success with a warning.
+#
+# The number comes from the same proxy the budget does, read at the other end
+# of the table. PhotonVision's Gaussian blur swept at fixed exposure:
+# multi-tag survives sigma 1.5 (50% solve rate) and is gone by sigma 2.0 (0%).
+# Converting by equal high-frequency attenuation, sigma = L/sqrt(12), sigma
+# 1.5 is 5.2 px of smear and sigma 2.0 is 6.9 px. Applying the same 2x
+# correction for edge orientation that gives the 6 px budget, multi-tag is
+# gone somewhere around 14 px of motion smear and already halved by 10 px.
+#
+# 2x the budget - 12 px at the default - is therefore the last point the proxy
+# says anything survives at. Past it there is nothing to walk towards, so the
+# walk stops rather than spending trials on exposures that cannot work on a
+# moving robot. It is a MULTIPLE of the budget rather than an absolute number
+# so that lowering --max-blur-px lowers this too: a user who asks for 0.05 px
+# is not asking to be given 1.3.
+OVER_BUDGET_LIMIT = 2.0
+
 
 class Sample:
     """Detection quality at one (gain, exposure), for one camera."""
@@ -1177,16 +1198,37 @@ PROBLEMS = {
     "robot_enabled_midrun": (HARD,
         lambda v: "the robot was ENABLED during the tune (%s) - aborted and put "
                   "the camera back. A match must never be interrupted." % v),
+    # over_blur_budget is HARD, and it was WARN. Motion blur is the ONE
+    # physical constraint in this design - the exposure is not searched for,
+    # it IS the blur budget - so an exposure the budget does not allow is the
+    # tool failing to do the only thing it promises, not a footnote to having
+    # done it.
+    #
+    # FORCED on 9796175: --max-blur-px 0.05 applied 188 us, 1.3 px, 26x the
+    # budget, and exited 0. The too-dark walk's ceiling was --max-exposure
+    # 25000 us, which is 174 px of smear at 360 deg/s and fx 1105.9 - shipped
+    # as a success with a warning.
+    #
+    # Both halves of the fix are deliberate, and they do different jobs. The
+    # OVER_BUDGET_LIMIT cap stops the walk landing somewhere the proxy says
+    # nothing survives; HARD stops any of it exiting 0. The camera is still
+    # LEFT at what the walk found, because a camera that can see while
+    # stationary beats a camera at the budget exposure that sees nothing - the
+    # tune stands as the best available answer, and the exit code says it is
+    # not the answer that was asked for. "Add light" is a human's job and the
+    # exit code is how a script tells them.
+    "over_blur_budget": (HARD,
+        lambda v: "%.1f px of motion blur at --blur-rate, over the budget - "
+                  "usable on a bench, smeared on a moving robot. The scene "
+                  "needed a longer exposure than the budget allows even at "
+                  "maximum gain. The camera has been left at this setting "
+                  "because it is the best available, but it is NOT within the "
+                  "blur budget. Add light." % v),
     # ---- warn ----
     "video_mode_switched": (WARN,
         lambda v: "VIDEO MODE CHANGED %s -> %s - this camera is now running a "
                   "different RESOLUTION than it was. It had no calibration for "
                   "the old one." % (v[0], v[1])),
-    "over_blur_budget": (WARN,
-        lambda v: "%.1f px of motion blur at --blur-rate, over the budget - "
-                  "fine on a bench, smeared on a moving robot. The scene needed "
-                  "a longer exposure than the budget allows even at maximum "
-                  "gain. Add light." % v),
 }
 
 HARD_KEYS = tuple(k for k, (sev, _) in PROBLEMS.items() if sev == HARD)
@@ -1767,16 +1809,27 @@ async def _rescue(pv, cam, cfg, st, log):
         ladder = geometric_sweep(st.t_budget, floor, EXPOSURE_WALK_STEPS + 1)[1:]
         gain = gains[0]
     else:
-        ceiling = min(hi_e, cfg.max_exposure)
+        # The walk is capped at OVER_BUDGET_LIMIT times the blur budget, not
+        # at --max-exposure. --max-exposure is 25000 us, which at 360 deg/s
+        # and fx 1105.9 is 174 px of smear; the proxy the budget comes from
+        # says multi-tag is gone by about 14 px. Walking past the point where
+        # nothing can work is not finding an answer, it is spending trials to
+        # produce one that fails on a moving robot - and it shipped as exit 0.
+        blur_cap = blur_budget_exposure(cfg.max_blur_px * OVER_BUDGET_LIMIT,
+                                        cfg.blur_rate, st.fx)
+        ceiling = min(hi_e, cfg.max_exposure, blur_cap)
         if ceiling <= st.t_budget * 1.001:
             log("   even gain %d cannot work at %.0f us, and there is no longer "
                 "exposure available (ceiling %.0f us)."
                 % (gains[-1], st.t_budget, ceiling))
             return None, None
         log("   even gain %d cannot see the tags at %.0f us - the scene is too "
-            "dark for the blur budget. Walking exposure UP at gain %d; whatever "
-            "this lands on is over budget by definition."
-            % (gains[-1], st.t_budget, gains[-1]))
+            "dark for the blur budget. Walking exposure UP at gain %d, as far "
+            "as %.0f us (%g px, %gx the budget - past that the blur proxy says "
+            "nothing survives). Whatever this lands on is over budget by "
+            "definition and the run will NOT report success."
+            % (gains[-1], st.t_budget, gains[-1], ceiling,
+               cfg.max_blur_px * OVER_BUDGET_LIMIT, OVER_BUDGET_LIMIT))
         ladder = geometric_sweep(st.t_budget, ceiling, EXPOSURE_WALK_STEPS + 1)[1:]
         gain = gains[-1]
 
@@ -2738,11 +2791,14 @@ def build_parser():
                         "1280x800 but 570.5 at 640x400, so a default carried "
                         "across a resolution change overstates blur by 1.94x.")
     p.add_argument("--max-exposure", type=float, default=25000.0,
-                   help="ceiling for the too-dark exposure walk ONLY. The tuned "
-                        "exposure is the blur budget; this bounds how far past it "
-                        "the tool may go when even maximum gain cannot see the "
-                        "tags, and anything it lands on is reported as over "
-                        "budget.")
+                   help="an ABSOLUTE ceiling for the too-dark exposure walk. "
+                        "It is rarely the binding one: that walk also stops at "
+                        "%gx the blur budget, because past there the proxy the "
+                        "budget comes from says multi-tag does not survive. "
+                        "25000 us is 174 px of smear at 360 deg/s and fx "
+                        "1105.9, and used to be the only ceiling there was. "
+                        "Anything either walk lands on is over budget and the "
+                        "run does NOT report success." % OVER_BUDGET_LIMIT)
 
     p.add_argument("--dwell", type=float, default=4.0,
                    help="seconds of data per trial (default %(default)s). "
