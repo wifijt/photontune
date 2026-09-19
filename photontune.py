@@ -1272,6 +1272,46 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
         st.trials.append(st.reference)
         log("   reference  gain %-4d exposure %6.0f  %s"
             % (top, st.exposure, st.reference.summary()))
+
+        # Read the camera back ONCE, here, before anything is compared to
+        # anything. Every trial writes gain and exposure and none of the others
+        # are verified - six confirms per camera would cost more than the tune -
+        # but the walk is only meaningful if the camera is actually at the
+        # settings the trials claim, and this is the one write that proves
+        # writes are landing at all. The predecessor verified the gain before
+        # its sweep for the same reason, and its log line for the failure was
+        # "the sweep below is NOT at the gain it claims - results are
+        # unreliable". Cheap here because the reference dwell has already let
+        # cameraSettings catch up, so the first look agrees.
+        bad, read_ok = await pv.confirm(
+            st.unique, {"cameraGain": int(top),
+                        "cameraExposureRaw": float(st.exposure)},
+            settle=0.2, log=log)
+        if not read_ok:
+            log("   !! PhotonVision is not reporting cameraSettings. Nothing "
+                "measured below could be attributed to a known gain.")
+            note_problem(rec, "unverified",
+                         "no cameraSettings from PhotonVision for %.0f s"
+                         % CONFIRM_TIMEOUT_S)
+            rec["error"] = "could not confirm what the camera is set to"
+            await pv.set_setting(st.unique, **st.original)
+            await asyncio.sleep(0.4)
+            PENDING_RESTORE.pop(st.unique, None)
+            return rec
+        if bad:
+            for k, want, have in bad:
+                log("   !! %s did not take (wanted %s, camera has %s)"
+                    % (k, want, have))
+            log("   !! the walk below would NOT be at the settings it claims. "
+                "Stopping rather than measuring something else.")
+            note_problem(rec, "setting_rejected",
+                         [list(map(str, x)) for x in bad])
+            rec["error"] = "the camera did not take the reference settings"
+            await pv.set_setting(st.unique, **st.original)
+            await asyncio.sleep(0.4)
+            PENDING_RESTORE.pop(st.unique, None)
+            return rec
+
         best_tags = st.reference.mean_tags
 
         # ---- 4. walk gain UP, stop at the first pass ----------------------
