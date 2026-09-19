@@ -21,6 +21,11 @@ ExecStart=/usr/bin/python3 /opt/photontune/photontune.py \
     --nt-table PhotonTune
 Restart=on-failure
 RestartSec=5
+# photontune exits 143 on SIGTERM (128 + 15, the shell's convention) so that a
+# script can tell an interruption from a clean finish. Declaring it a success
+# keeps `systemctl stop` from looking like a crash. It is NOT a blanket
+# amnesty: a camera the tool could not put back exits 1 specifically, so that
+# case still reaches the journal as a failure.
 # Never higher priority than the vision pipeline itself
 Nice=5
 

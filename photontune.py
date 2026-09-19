@@ -2946,6 +2946,30 @@ async def _guard_signals(coro):
         _install_signal_handlers()
 
 
+def _finish(code, host, port, log=print):
+    """Replay any pending restore, and let it MAKE THE EXIT CODE WORSE.
+
+    Every exit path in this file goes through here, because the thing that
+    kept going wrong was an exit code decided before the restore was tried.
+    FORCED on 9796175: daemon + SIGTERM + a camera whose websocket is gone
+    printed "!! COULD NOT RESTORE (...). Check the exposure by hand." and
+    exited 0, because sys.exit(0) ran before the `finally` that replays.
+
+    A camera we could not put back is exit 1 specifically, not 143 and not
+    130. Which signal arrived is interesting; a camera left at a trial
+    exposure is not interesting, it is broken, and a unit file is entitled to
+    declare 143 a clean stop (photontune.service does).
+    """
+    replay_pending(host, port, log=log)
+    if PENDING_RESTORE:
+        log("photontune: exiting 1, not %d - %d camera(s) are still at "
+            "whatever the tune was testing and could not be put back: %s"
+            % (code, len(PENDING_RESTORE),
+               ", ".join(u[:8] for u in PENDING_RESTORE)))
+        return 1
+    return code
+
+
 def main():
     _install_signal_handlers()
     args = build_parser().parse_args()
@@ -2954,35 +2978,47 @@ def main():
     if args.blur_rate <= 0:
         sys.exit("--blur-rate must be > 0")
     if args.daemon:
+        code = 0
         try:
-            try:
-                asyncio.run(_guard_signals(daemon(args)))
-            except (KeyboardInterrupt, Terminated):
-                # systemd stops the daemon with SIGTERM, and the daemon is the
-                # DEPLOYED mode. Without this the signal unwound to the top with a
-                # traceback and, worse, any camera left mid-sweep stayed there.
-                print("photontune: stopping - restoring any camera left mid-tune")
-                sys.exit(0)
-        finally:
-            replay_pending(args.host, args.port)
-        return
+            asyncio.run(_guard_signals(daemon(args)))
+        except (KeyboardInterrupt, Terminated) as exc:
+            # systemd stops the daemon with SIGTERM, and the daemon is the
+            # DEPLOYED mode. Without this the signal unwound to the top with a
+            # traceback and, worse, any camera left mid-sweep stayed there.
+            #
+            # 143 / 130, the same convention the CLI path uses, and NOT 0:
+            # sys.exit(0) here ran before the `finally` that replays the
+            # restore, so "!! COULD NOT RESTORE ... check the exposure by
+            # hand" was printed by a process exiting 0.
+            print("photontune: stopping - restoring any camera left mid-tune")
+            code = 143 if isinstance(exc, Terminated) else 130
+        except BaseException:
+            # Restore first, then let the traceback out intact.
+            _finish(1, args.host, args.port)
+            raise
+        sys.exit(_finish(code, args.host, args.port))
     cfg = Config.from_args(args)
     t0 = time.time()
-    # The `finally` is the whole fix. An interrupt was never the common case -
-    # a websocket death is caught inside tune_camera and returns NORMALLY, so
-    # the restore has to hang off the exit, not off an exception.
+    # Every return from here goes through _finish(), which replays the restore
+    # and can only make the code worse. An interrupt was never the common
+    # case - a websocket death is caught inside tune_camera and returns
+    # NORMALLY - so the restore hangs off the exit, not off an exception.
     try:
         try:
             results = asyncio.run(_guard_signals(run(cfg)))
         except (AlreadyRunning, ConnectionError, LookupError) as exc:
-            sys.exit("photontune: %s" % exc)
+            print("photontune: %s" % exc, file=sys.stderr)
+            sys.exit(_finish(1, args.host, args.port))
         except (KeyboardInterrupt, Terminated) as exc:
             # The interrupted loop could not complete the restore. Do it on a
-            # new one - see the `finally` below. Exit 130 for Ctrl-C and 143
-            # for SIGTERM, the shell's own conventions (128 + signal), so a
-            # script that launched this can tell WHICH interruption it was.
+            # new one - see _finish. Exit 130 for Ctrl-C and 143 for SIGTERM,
+            # the shell's own conventions (128 + signal), so a script that
+            # launched this can tell WHICH interruption it was - unless the
+            # restore itself failed, which _finish reports as 1 because that
+            # matters more than which key was pressed.
             print("\ninterrupted - putting camera settings back...")
-            sys.exit(143 if isinstance(exc, Terminated) else 130)
+            sys.exit(_finish(143 if isinstance(exc, Terminated) else 130,
+                             args.host, args.port))
         failed, warnings, code = run_verdict(results, cfg)
         if cfg.emit_json:
             print(json.dumps(results, indent=2))
@@ -3018,9 +3054,11 @@ def main():
             for text in notes:
                 if text not in why:
                     print("       %s" % text)
-        sys.exit(code)
+        sys.exit(_finish(code, args.host, args.port))
     finally:
-        # EVERY exit path, including the ordinary one and sys.exit above.
+        # EVERY exit path, including one this function did not anticipate.
+        # _finish is idempotent - replay_pending returns immediately when
+        # there is nothing pending - so calling it twice costs nothing.
         replay_pending(args.host, args.port)
 
 
