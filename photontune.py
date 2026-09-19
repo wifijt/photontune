@@ -502,6 +502,16 @@ def blur_px(exposure_us, blur_rate_deg_s, fx):
     return math.radians(blur_rate_deg_s) * (exposure_us / 1e6) * fx
 
 
+def fmt_px(px):
+    """Blur in px, with enough digits to still be a number at any budget.
+
+    "%.1f" is fine at the default 6 px budget and prints "0.0" at
+    --max-blur-px 0.00251, where the tool reported a 32% overage as zero.
+    Three significant figures says the same thing at both scales.
+    """
+    return "%.3g" % px
+
+
 def blur_budget_exposure(max_blur_px, blur_rate_deg_s, fx):
     """The longest exposure that stays inside the budget, in microseconds."""
     return 1e6 * max_blur_px / (math.radians(blur_rate_deg_s) * fx)
@@ -1313,12 +1323,12 @@ PROBLEMS = {
     # not the answer that was asked for. "Add light" is a human's job and the
     # exit code is how a script tells them.
     "over_blur_budget": (HARD,
-        lambda v: "%.1f px of motion blur at --blur-rate, over the budget - "
+        lambda v: "%s px of motion blur at --blur-rate, over the budget - "
                   "usable on a bench, smeared on a moving robot. The scene "
                   "needed a longer exposure than the budget allows even at "
                   "maximum gain. The camera has been left at this setting "
                   "because it is the best available, but it is NOT within the "
-                  "blur budget. Add light." % v),
+                  "blur budget. Add light." % fmt_px(v)),
     # ---- warn ----
     "reference_unusable": (WARN,
         lambda v: "the reference measurement did not itself pass (%s), so it "
@@ -1346,6 +1356,24 @@ def note_problem(rec, key, value=True):
     Raises on an unregistered key rather than accepting it: an unregistered key
     is a problem the verdict cannot see, which is the whole bug class this
     registry exists to close.
+
+    THE PRESENCE OF THE KEY IS THE RECORD. The value is evidence for the
+    human-readable text and nothing else - it is never consulted to decide
+    whether the problem happened. Every reader below tests `key in rec`.
+
+    FORCED on 17030ca: `--blur-rate 1 --max-blur-px 0.00251` applied 172 us
+    against a 130 us budget - 0.00332 px, 32% over - and exited 0. The value
+    reaching this function was `round(px, 1)`, which is 0.0, and both readers
+    tested it for truth. So the run printed "the run will NOT report success",
+    printed "0.0 px of smear", recorded a HARD problem, and exited 0.
+
+    That was never one bug about rounding. ANY hard problem carrying a falsy
+    value - 0, 0.0, "", [], {} - was invisible to both the verdict and the
+    report, and half the registry's describe() lambdas take a list or a dict
+    that is empty in exactly the degenerate cases most worth reporting. It
+    voided the registry's central claim, that a problem the verdict cannot see
+    is no longer expressible. Testing membership is what makes that claim true
+    again, and it holds for keys nobody has added yet.
     """
     if key not in PROBLEMS:
         raise KeyError("unregistered problem %r - add it to PROBLEMS, with a "
@@ -1358,9 +1386,12 @@ def problem_notes(rec, severity=None):
     """[(key, severity, text)] for every problem recorded on this record."""
     out = []
     for key, (sev, describe) in PROBLEMS.items():
-        v = rec.get(key)
-        if not v:
+        # `key in rec`, NOT `rec.get(key)`. See note_problem: a hard problem
+        # recorded with a falsy value used to be dropped here silently, so the
+        # summary omitted the one line explaining why the run failed.
+        if key not in rec:
             continue
+        v = rec[key]
         if severity is not None and sev != severity:
             continue
         try:
@@ -1388,7 +1419,9 @@ def tune_failed(r, cfg=None):
     rotated 90 degrees with a gain that never took still reported ok=true to the
     dashboard - the one signal a team actually trusts.
     """
-    if any(r.get(k) for k in HARD_KEYS):
+    # Membership, not truth. `r.get(k)` let every hard problem with a falsy
+    # value exit 0 - see note_problem for the forced case.
+    if any(k in r for k in HARD_KEYS):
         return True
     if cfg is not None and cfg.baseline_only:
         # --baseline-only never sets `applied`, by design, so "no applied"
@@ -1855,11 +1888,17 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
             return rec
 
         px = blur_px(st.exposure, cfg.blur_rate, st.fx)
-        log("   applied gain %d / exposure %.0f - confirmed. %.1f px of smear "
+        log("   applied gain %d / exposure %.0f - confirmed. %s px of smear "
             "at %.0f deg/s (budget %g)"
-            % (st.gain, st.exposure, px, cfg.blur_rate, cfg.max_blur_px))
+            % (st.gain, st.exposure, fmt_px(px), cfg.blur_rate, cfg.max_blur_px))
         if px > cfg.max_blur_px * 1.001:
-            note_problem(rec, "over_blur_budget", round(px, 1))
+            # The RAW px, not round(px, 1). Rounding is what produced the
+            # 0.0 that both readers then treated as "no problem"; the value
+            # is evidence for the text, so it should not be destroyed on the
+            # way in. Membership is what decides the verdict now, so this is
+            # belt and braces - and the belt is the one that prints a number
+            # a human can act on.
+            note_problem(rec, "over_blur_budget", px)
 
         # ---- 8. measure the point that was actually applied ---------------
         #

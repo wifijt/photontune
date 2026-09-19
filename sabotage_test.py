@@ -142,6 +142,47 @@ MATRIX_VALUES = {
     "reference_unusable":     ("camera", "multi-tag solved in 4% of 45 frames"),
 }
 
+# THE SAME KEYS, EACH WITH A FALSY VALUE OF ITS OWN NATURAL TYPE.
+#
+# Every case above carries a fat, truthy value - over_blur_budget was
+# hardcoded to 17.9 - so the matrix asserted 16 exit codes and never once
+# asked what happens when the value is 0, "", [] or {}. It happens: the
+# recorded value is `round(px, 1)`, and on 17030ca a real 32% overage rounded
+# to 0.0, whereupon `any(r.get(k) ...)` and `if not v: continue` both dropped
+# a HARD problem and the run exited 0 after printing "the run will NOT report
+# success".
+#
+# Falsy is not a hypothetical for most of these. baseline_failed,
+# setting_rejected and final_state_wrong carry lists, apply_mismatch and
+# applied_point_failed carry dicts, and half the tool's error strings are
+# formatted from an exception whose str() can be "". An empty list is exactly
+# what a degenerate detection produces, which is when the verdict matters
+# most.
+#
+# So the matrix now runs EVERY key twice. The exit code must not depend on
+# the value, only on membership, and the text must still reach the summary -
+# even when describe() raises on the empty value, which several of these do
+# on purpose. problem_notes has a try/except fallback for that; _describe()
+# below mirrors it, so the test checks what a human would actually see.
+MATRIX_FALSY = {
+    "baseline_failed":        ("camera", []),
+    "baseline_unconfirmed":   ("camera", ""),
+    "setting_rejected":       ("camera", []),
+    "unverified":             ("camera", ""),
+    "calibration_problem":    ("camera", ""),
+    "apply_mismatch":         ("camera", {}),
+    "apply_unconfirmed":      ("camera", ""),
+    "final_state_wrong":      ("camera", []),
+    "search_error":           ("camera", ""),
+    "no_workable_settings":   ("camera", ""),
+    "robot_enabled_midrun":   ("camera", ""),
+    "video_mode_switched":    ("camera", []),
+    "over_blur_budget":       ("camera", 0.0),
+    "applied_point_failed":   ("camera", {}),
+    "robot_state_unknown":    ("camera", ""),
+    "reference_unusable":     ("camera", ""),
+}
+
 _CHILD = r'''
 import json, sys
 sys.path.insert(0, sys.argv[1])
@@ -463,6 +504,14 @@ def verdict_matrix(src_dir):
     if extra:
         print("  !! matrix cases for unregistered keys: %s" % sorted(extra))
         bad += len(extra)
+    # A new problem with no FALSY case is a new problem nobody has asked the
+    # falsy question about, which is the question that was never asked.
+    no_falsy = set(pt.PROBLEMS) - set(MATRIX_FALSY)
+    if no_falsy:
+        print("  !! PROBLEMS has keys with no FALSY matrix case: %s "
+              "- add one, falsy in that key's own natural type"
+              % sorted(no_falsy))
+        bad += len(no_falsy)
     if set(MATRIX_SEVERITY) != set(MATRIX_VALUES):
         print("  !! MATRIX_SEVERITY and MATRIX_VALUES disagree about which "
               "keys exist: %s"
@@ -481,13 +530,33 @@ def verdict_matrix(src_dir):
                   % (key, declared.upper(), MATRIX_SEVERITY[key].upper()))
             bad += 1
 
-    cases = [(k, MATRIX_SEVERITY[k], MATRIX_VALUES[k][0], MATRIX_VALUES[k][1])
-             for k in sorted(set(pt.PROBLEMS) & set(MATRIX_VALUES)
-                             & set(MATRIX_SEVERITY))]
-    cases.append(("(nothing recorded)", "clean", "none", None))
-    print("%-26s %-6s %-6s %-6s %s" % ("problem", "sev", "want", "got", "text surfaced"))
-    print("-" * 66)
-    for key, sev, mode, value in cases:
+    def _describe(key, value):
+        """What a human would see - including problem_notes' own fallback.
+
+        Several describe() lambdas index into the value and raise on an empty
+        one. problem_notes catches that and prints "key=repr(value)" instead,
+        so that IS the text the summary shows, and it is what this test has
+        to look for. Recomputing it here rather than trusting the lambda is
+        the difference between testing the tool and testing the test.
+        """
+        try:
+            return pt.PROBLEMS[key][1](value)
+        except Exception:
+            return "%s=%r" % (key, value)
+
+    keys = sorted(set(pt.PROBLEMS) & set(MATRIX_VALUES) & set(MATRIX_SEVERITY))
+    cases = []
+    for k in keys:
+        cases.append((k, "typical", MATRIX_SEVERITY[k],
+                      MATRIX_VALUES[k][0], MATRIX_VALUES[k][1]))
+        if k in MATRIX_FALSY:
+            cases.append((k, "FALSY", MATRIX_SEVERITY[k],
+                          MATRIX_FALSY[k][0], MATRIX_FALSY[k][1]))
+    cases.append(("(nothing recorded)", "-", "clean", "none", None))
+    print("%-26s %-7s %-5s %-5s %-5s %s"
+          % ("problem", "value", "sev", "want", "got", "text surfaced"))
+    print("-" * 72)
+    for key, kind, sev, mode, value in cases:
         want = 1 if sev == HARD else 0
         proc = subprocess.run(
             [sys.executable, "-c", _CHILD, src_dir, key, mode, json.dumps(value)],
@@ -497,13 +566,13 @@ def verdict_matrix(src_dir):
         if sev == "clean":
             surfaced = True
         else:
-            text = pt.PROBLEMS[key][1](value)
+            text = _describe(key, value)
             # the whole sentence is often wrapped; check a distinctive slice
             surfaced = text.split(".")[0][:40] in out
         ok = (got == want) and surfaced
         bad += 0 if ok else 1
-        print("%-26s %-6s %-6d %-6d %s%s"
-              % (key, sev, want, got, "yes" if surfaced else "NO",
+        print("%-26s %-7s %-5s %-5d %-5d %s%s"
+              % (key, kind, sev, want, got, "yes" if surfaced else "NO",
                  "" if ok else "   <-- WRONG"))
         if not ok and out:
             print("      output: %s" % out.strip().replace("\n", " | ")[:300])
