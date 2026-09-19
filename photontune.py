@@ -53,6 +53,45 @@ except ImportError:
     sys.exit("need: pip install msgpack websockets")
 
 
+# ───────────────────────── shutdown ─────────────────────────
+
+class Terminated(BaseException):
+    """SIGTERM arrived. BaseException so it unwinds like KeyboardInterrupt does."""
+
+
+# Set the instant a SIGTERM or SIGHUP is SEEN, by both the plain signal handler
+# and the event loop's, and never cleared.
+#
+# The cancellation is still the mechanism; this is the belt to its braces, and
+# it exists because of a failure that was observed and NOT explained. One
+# SIGTERM in a sweep of kill positions through a live two-camera tune did not
+# interrupt anything: the process ran the remaining 20 s to completion, printed
+# "completed in 42 s" and exited 0. Nine repeats at the same and later
+# positions all interrupted correctly, so it is a race, not a dead path.
+#
+# The plausible mechanism is asyncio.wait_for: when its timeout fires it
+# cancels the inner future and converts THAT cancellation into TimeoutError, so
+# an outer task cancellation landing in the same instant can come out as a
+# timeout - and Photon._pump's `except asyncio.TimeoutError: return` then
+# swallows it and the tune carries on. Every sample runs a _pump with a 0.2 s
+# floor on its timeout, so there are hundreds of chances per run to hit it.
+#
+# Rather than chase one instance through the library, every loop that can run
+# for a while asks this question directly. A flag cannot be raced away.
+SHUTDOWN = {}
+
+
+def note_shutdown(signum):
+    SHUTDOWN.setdefault("sig", int(signum))
+
+
+def raise_if_shutdown(where=""):
+    """Abort promptly if a signal has been seen, whatever became of the cancel."""
+    sig = SHUTDOWN.get("sig")
+    if sig:
+        raise Terminated("signal %d%s" % (sig, (" during %s" % where) if where else ""))
+
+
 # ───────────────────────── scoring ─────────────────────────
 
 # One-sided 95% confidence. Used to ask "can this sample RULE OUT meeting the
@@ -394,6 +433,10 @@ class Photon:
     async def _pump(self, seconds, on_message, stop_when=None):
         t0 = time.time()
         while time.time() - t0 < seconds:
+            # Asked here rather than trusted to the cancellation: see SHUTDOWN.
+            # The restore paths do not go through _pump, so aborting here
+            # cannot stop the camera being put back.
+            raise_if_shutdown("sampling")
             remaining = seconds - (time.time() - t0)
             try:
                 raw = await asyncio.wait_for(self.ws.recv(), timeout=max(0.2, remaining))
@@ -1092,18 +1135,21 @@ class RobotEnabled(Exception):
     """The robot went enabled mid-tune. Abort and put the camera back."""
 
 
-def _check_not_enabled(cfg, where):
-    """Raise if the robot went enabled. Called BETWEEN steps, never inside one.
+def _check_abort(cfg, where):
+    """Both reasons to stop, asked BETWEEN steps and never inside one.
 
     robot_is_enabled was checked once before the run and never again during
     it, so a match starting mid-tune left a camera wherever the walk had got
     to. That violates "a match must never be interrupted" more directly than
-    any bug four audits found. RobotEnabled unwinds through tune_camera's
-    restore, so the camera goes back to what the user had.
+    any bug four audits found.
+
+    Both exceptions unwind through tune_camera's handler, which puts the
+    camera back to what the user had before returning or re-raising.
 
     cfg.nt_inst is None on the CLI path, where there is no NetworkTables
     client to ask - a human at a terminal is not a match.
     """
+    raise_if_shutdown(where)
     if cfg.nt_inst is not None and robot_is_enabled(cfg.nt_inst):
         raise RobotEnabled(where)
 
@@ -1204,7 +1250,7 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
         gains, margin_step = gain_grid(cfg.max_gain)
 
         # ---- 3. the reference: the best this scene can do inside the budget
-        _check_not_enabled(cfg, "before the reference measurement")
+        _check_abort(cfg, "before the reference measurement")
         top = gains[-1]
         st.reference = await trial(pv, cam, cfg, top, st.exposure, log)
         st.trials.append(st.reference)
@@ -1225,7 +1271,7 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
         for i, g in enumerate(gains):
             if progress:
                 progress(0.1 + 0.7 * i / float(len(gains)))
-            _check_not_enabled(cfg, "walking gain at %d" % g)
+            _check_abort(cfg, "walking gain at %d" % g)
             if g == top:
                 s = st.reference            # already measured; same operating point
             else:
@@ -1270,7 +1316,7 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
                 return rec
 
         # ---- 7. apply, confirm, and report the blur we ended up with ------
-        _check_not_enabled(cfg, "before the final write")
+        _check_abort(cfg, "before the final write")
         rec["gain"] = st.gain
         want_state = {"cameraGain": int(st.gain),
                       "cameraExposureRaw": float(st.exposure)}
@@ -1323,9 +1369,12 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
         # asyncio.CancelledError is the same family.
         interrupted = isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError,
                                        Terminated))
+        # str(exc), not `exc or ...`: an exception object is always truthy, so
+        # the old form printed "INTERRUPTED ()" for CancelledError, which
+        # carries no message. The TYPE is the only information there is.
         log("   %s (%s) - restoring original settings"
             % ("INTERRUPTED" if interrupted else "ERROR",
-               exc or type(exc).__name__))
+               str(exc) or type(exc).__name__))
         restored = False
         try:
             await pv.set_setting(st.unique, **st.original)
@@ -1351,7 +1400,7 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
             rec["error"] = "aborted: the robot went enabled (%s)" % exc
             return rec
         note_problem(rec, "search_error",
-                     "%s: %s" % (type(exc).__name__, exc or "no detail"))
+                     "%s: %s" % (type(exc).__name__, str(exc) or "no detail"))
         rec["error"] = str(exc) or type(exc).__name__
         return rec
     finally:
@@ -1411,7 +1460,7 @@ async def _rescue(pv, cam, cfg, st, log):
         gain = gains[-1]
 
     for i, e in enumerate(ladder):
-        _check_not_enabled(cfg, "walking exposure at %.0f us" % e)
+        _check_abort(cfg, "walking exposure at %.0f us" % e)
         e = min(max(e, lo_e), hi_e)
         s = await trial(pv, cam, cfg, gain, e, log)
         st.trials.append(s)
@@ -1691,10 +1740,6 @@ async def _tune_all(pv, cams, cfg, log, progress, on_camera):
 
 # ───────────────────────── B: NetworkTables trigger ─────────────────────────
 
-class Terminated(BaseException):
-    """SIGTERM arrived. BaseException so it unwinds like KeyboardInterrupt does."""
-
-
 # Cameras whose settings we have changed and not yet put back. Ctrl-C during a
 # sweep leaves the camera at whatever exposure was being tested - blind, if that
 # was the short end - so the restore must survive an interrupt. It cannot run on
@@ -1870,6 +1915,10 @@ class NTResults:
         # so poll and dedupe on sequenceID. At 500 Hz nothing is missed at 24 ms.
         while (time.time() < end
                or (0 < out["frames"] < min_frames and time.time() < hard_end)):
+            # This runs in an executor thread, where a task cancellation cannot
+            # reach it at all - the await in sample() unblocks but this loop
+            # keeps polling to the end of its dwell. The flag can reach it.
+            raise_if_shutdown("sampling over NetworkTables")
             raw = self.sub.get()
             if raw:
                 try:
@@ -2388,6 +2437,7 @@ def _install_signal_handlers():
     import signal
 
     def _raise(signum, _frame):
+        note_shutdown(signum)
         raise Terminated("signal %d" % signum)
 
     for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -2433,6 +2483,7 @@ async def _guard_signals(coro):
 
     def _cancel(signum):
         hit["sig"] = signum
+        note_shutdown(signum)
         task.cancel()
 
     installed = []
@@ -2448,6 +2499,9 @@ async def _guard_signals(coro):
         if hit:
             raise Terminated("signal %d" % hit["sig"]) from None
         raise
+        # A Terminated raised by raise_if_shutdown() inside a sampling loop the
+        # cancellation never reached needs no clause here: it is already the
+        # exception main() looks for, and it propagates on its own.
     finally:
         for sig in installed:
             try:
