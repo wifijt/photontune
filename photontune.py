@@ -432,6 +432,70 @@ def _median(xs):
 # A camera rotating at omega smears a point across blur_px = omega * t * fx.
 # Turn that around and the exposure is not a thing to search for at all: it is
 # whatever the blur budget allows, and the only free variable left is gain.
+#
+# ---------------------------------------------------------------------------
+# THE 6 PX IS A PROXY AND AN ATTEMPT TO BOUND IT BETTER FAILED. Read this
+# before trusting the number, and before repeating the attempt.
+#
+# Where 6 came from: PhotonVision's `blur` (the AprilTag detector's
+# quad_sigma) swept at fixed exposure and gain, multi-tag collapsing between
+# sigma 1.5 and 2.0; converted by equal high-frequency attenuation,
+# sigma = L/sqrt(12), to ~3.5 px of smear; then DOUBLED by an argument that
+# Gaussian blur damages edges in every direction while a smear only damages
+# the ones perpendicular to it. The doubling is a judgement, not a
+# measurement, and it is the difference between a 3.5 px budget and a 7 px
+# one - a factor of two on every exposure this tool sets.
+#
+# The attempt, on this rig, unattended (blurscale.py in the session
+# scratchpad): sweep `blur` over 0-7 at two decimate settings and record the
+# 50% detection point, sigma50, PER TAG - six tags across two cameras,
+# apparent side 45.5 to 86.3 px from PhotonVision's own `area`. Two questions,
+# because the four combinations of their answers predict four different
+# signatures:
+#
+#   (a) is sigma in full-resolution or DECIMATED pixels? quad_sigma is
+#       applied after quad_decimate in upstream apriltag, and if so a sweep
+#       taken at the default decimate=2 is out by a factor of two;
+#   (b) is tolerance a fixed number of pixels, as this budget assumes, or a
+#       fixed fraction of the tag - in which case the budget should scale
+#       with range and does not.
+#
+# WHAT IT MEASURED, and why it does not settle either question:
+#
+#   sigma50 at decimate=2, per tag, all six measured in the same session:
+#
+#       tag side 45.5 px -> 1.75      tag side 67.9 px -> 3.00
+#       tag side 54.7 px -> 3.00      tag side 74.9 px -> 1.63
+#       tag side 55.4 px -> 1.75      tag side 86.3 px -> 3.52
+#
+#   A 2.2x spread between tags IN THE SAME SCENE AT THE SAME MOMENT, with no
+#   relationship to apparent size - the 74.9 px tag has the lowest cliff of
+#   all six and the 54.7 px tag one of the highest. So the sweep the budget
+#   rests on did not measure a property of the detector; it measured whichever
+#   tag in that scene was worst. "multi-tag collapses between 1.5 and 2.0"
+#   reproduces here as camera 2 (1.63) while camera 1's tags survive to 3.0.
+#
+#   The decimate test came out inconsistent: sigma50(dec=1)/sigma50(dec=2) is
+#   2.16 for the one tag measured cleanly at both, which would say sigma is in
+#   decimated pixels, and 1.02 for the other camera. Both cameras also
+#   collapse totally and identically at exactly sigma 4.0 at decimate=1, which
+#   looks like an implementation limit rather than anything physical. So (a)
+#   is unresolved and the factor of two under it is still there.
+#
+# AND A CAUTION IN THE OTHER DIRECTION. Upstream apriltag blurs only the image
+# used for QUAD detection; the bit cells are decoded from the unblurred one.
+# That is consistent with what was measured here - tags surviving a sigma far
+# larger than their own bit-cell size, which decoding could not do. Motion
+# blur has no such exemption: it degrades the decode as well, and a bit cell
+# is an eighth of the tag. If that is right, the proxy measures the more
+# robust half of the detector, and the 2x that RAISED the budget from 3.5 to 6
+# is pushing against a correction that probably needs to go the other way.
+#
+# So 6 px stands, unchanged, because nothing measured here justifies a
+# different number - but it should be read as an ESTIMATE THAT MAY BE
+# OPTIMISTIC, not as a conservative one. The only thing that settles it is a
+# tag that actually moves: blurtest.py, with a human.
+# ---------------------------------------------------------------------------
 
 def blur_px(exposure_us, blur_rate_deg_s, fx):
     """Motion smear, in pixels, at this exposure and angular rate."""
@@ -2910,19 +2974,15 @@ def build_parser():
     p.add_argument("--max-blur-px", type=float, default=6.0,
                    help="motion-blur budget in pixels at --blur-rate (default "
                         "%(default)g). This SETS the exposure: "
-                        "t = max_blur_px / (radians(blur_rate) * fx). "
-                        "PROXY-DERIVED, not measured on a moving robot. "
-                        "PhotonVision's Gaussian blur swept at fixed exposure "
-                        "loses 12%% of tags by sigma 0.5 and all multi-tag "
-                        "between sigma 1.5 and 2.0; converting by equal "
-                        "high-frequency attenuation (sigma = L/sqrt(12)) puts "
-                        "the cliff near 3.5 px of smear. Gaussian blur damages "
-                        "edges in every direction while motion smear only "
-                        "damages the ones perpendicular to it, and a tag has "
-                        "edges in two orthogonal directions, so the proxy "
-                        "overstates the damage by roughly 2x - hence 6 rather "
-                        "than 3.5. blurtest.py measures the real thing, but it "
-                        "needs a human waving a tag.")
+                        "t = max_blur_px / (radians(blur_rate) * fx), so if "
+                        "this number is wrong every answer the tool gives is "
+                        "wrong by the same factor and nothing in the tool can "
+                        "tell. It is the weakest number in the file and it is "
+                        "STILL A PROXY - see the block comment above "
+                        "blur_px() for what an attempt to bound it better "
+                        "found, and for why the attempt failed. "
+                        "blurtest.py measures the real thing; it needs a human "
+                        "waving a tag.")
     p.add_argument("--blur-rate", type=float, default=360.0,
                    help="angular rate the blur budget is judged at, deg/s. 360 is "
                         "what robots actually do while aiming (CTRE default 270, "
