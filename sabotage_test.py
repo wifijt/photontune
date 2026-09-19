@@ -27,7 +27,7 @@ logged its own failure and carried on. Nothing but running it found that.
 The harness snapshots every setting it touches and restores them at the end,
 including after a failure or an interrupt.
 """
-import argparse, asyncio, json, os, subprocess, sys, time
+import argparse, asyncio, hashlib, json, os, re, subprocess, sys, time
 
 try:
     import msgpack, websockets
@@ -599,6 +599,69 @@ def verdict_matrix(src_dir):
     return 1 if bad else 0
 
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_TARGET = os.path.join(HERE, "photontune.py")
+
+
+def identify_target(cmd):
+    """Which photontune.py is actually about to run, and is it the right one?
+
+    The default used to be "python3 /opt/photontune/photontune.py" - the
+    DEPLOYED copy, which on this rig was days behind the tree this file lives
+    in. Run with the default it scored 17/0 while visibly executing code that
+    no longer exists: "raising gain 0 -> 100 and re-sweeping", "cliff ~1000
+    ... bias 1.50 -> 1500", "stopped the NetworkTables server we started"
+    (the stale build POSTs to /api/settings/general, which the current one
+    refuses to do because it drops every websocket). It left the camera at
+    1500 us / gain 80 and still printed PASS, because the only exposure
+    assertion was 0 < exp < 20000.
+
+    Nothing in the output said WHICH file had run, so every "17/0 on
+    hardware" claim made from it was unverifiable as written - not wrong
+    necessarily, just not evidence of anything in particular.
+
+    So: resolve the script out of the command, and print its path, size,
+    mtime and md5 in the header AND in the summary, where a pasted result
+    carries its own provenance. Refuse outright if it does not exist, and say
+    so loudly if it is not the file sitting next to this one.
+    """
+    script = next((t for t in cmd if t.endswith(".py")), None)
+    if script is None:
+        return {"script": None, "md5": "?", "note": "no .py in --photontune"}
+    script = os.path.abspath(script)
+    if not os.path.isfile(script):
+        sys.exit("--photontune points at %s, which does not exist. Refusing "
+                 "to run: a test that cannot say what it tested is not "
+                 "evidence." % script)
+    with open(script, "rb") as fh:
+        digest = hashlib.md5(fh.read()).hexdigest()
+    st = os.stat(script)
+    return {"script": script, "md5": digest, "size": st.st_size,
+            "mtime": time.strftime("%Y-%m-%d %H:%M:%S",
+                                   time.localtime(st.st_mtime)),
+            "is_sibling": os.path.exists(DEFAULT_TARGET) and
+                          os.path.samefile(script, DEFAULT_TARGET)}
+
+
+def print_target(info, where):
+    print("=" * 66)
+    print("PHOTONTUNE UNDER TEST  (%s)" % where)
+    print("  path  %s" % info.get("script"))
+    print("  md5   %s" % info.get("md5"))
+    if info.get("size") is not None:
+        print("  size  %d bytes, mtime %s" % (info["size"], info["mtime"]))
+    if info.get("script") and not info.get("is_sibling"):
+        sib = "(absent)"
+        if os.path.exists(DEFAULT_TARGET):
+            with open(DEFAULT_TARGET, "rb") as fh:
+                sib = hashlib.md5(fh.read()).hexdigest()
+        print("  !! THIS IS NOT THE photontune.py NEXT TO sabotage_test.py.")
+        print("  !! sibling would be %s (md5 %s)" % (DEFAULT_TARGET, sib))
+        print("  !! Whatever this run scores, it scores for the file above -")
+        print("  !! NOT for the tree this test came from. Say so if you quote it.")
+    print("=" * 66)
+
+
 class PV:
     def __init__(self, host, port=5800):
         self.uri = "ws://%s:%d/websocket_data" % (host, port)
@@ -673,6 +736,7 @@ async def main_async(a):
     uid, cam = targets[0]
     nick = cam.get("nickname")
     snapshot = dict(cam["currentPipelineSettings"])
+    tgt = a.target_info
     print("target camera: %s" % nick)
     print("snapshotting %d settings" % len(snapshot))
     # Do not restore a snapshot that is itself broken. This harness has been run
@@ -743,9 +807,48 @@ async def main_async(a):
         print("  ran photontune -> exit %d in %.0f s" % (proc2.returncode, dur))
         _, after2 = await read_settings(a.host, a.port, nick)
         exp = float(after2.get("cameraExposureRaw") or 0)
-        ok_exp = 0 < exp < 20000
+
+        # THE ASSERTION, and it was `0 < exp < 20000`.
+        #
+        # That band accepts every exposure this camera can physically hold
+        # except the sabotage value itself, so it passed a stale build that
+        # left the camera at 1500 us - the value it had BEFORE the tune - and
+        # it would pass any number a future bug invented. It asserted that
+        # something wrote an exposure, not that the tune was right.
+        #
+        # What the tool actually promises is ONE number: the exposure IS the
+        # blur budget, t = max_blur_px / (radians(blur_rate) * fx). So take
+        # the budget out of photontune's own log line, take the exposure it
+        # claims to have applied out of its own summary, and require all
+        # three to agree with the camera - plus exit 0, which was not checked
+        # at all. A build that lands anywhere else now has to exit non-zero
+        # to pass, which after the over_blur_budget and reference_unusable
+        # fixes is exactly what it does.
+        out2 = proc2.stdout + proc2.stderr
+        m_budget = re.search(r"allows\s+([\d.]+)\s*us", out2)
+        m_claim = re.search(r"exposure\s*->\s*([\d.]+)", out2)
+        budget = float(m_budget.group(1)) if m_budget else None
+        claim = float(m_claim.group(1)) if m_claim else None
+        why_exp = []
+        if proc2.returncode != 0:
+            why_exp.append("photontune exited %d" % proc2.returncode)
+        if budget is None:
+            why_exp.append("no 'allows N us' budget line in its output")
+        if claim is None:
+            why_exp.append("no 'exposure -> N' in its summary")
+        if claim is not None and abs(exp - claim) > 1.0:
+            why_exp.append("it SAYS it applied %.0f, camera reads %.0f"
+                           % (claim, exp))
+        if budget is not None and exp > 0 and abs(exp - budget) > max(1.0, 0.01 * budget):
+            why_exp.append("camera is at %.0f, its own blur budget is %.0f"
+                           % (exp, budget))
+        if not (0 < exp < 20000):
+            why_exp.append("exposure %.0f is not sane" % exp)
+        ok_exp = not why_exp
         results.append(("cameraExposureRaw", "PASS" if ok_exp else "FAIL",
-                        exp, "< 20000", TUNED["cameraExposureRaw"][1]))
+                        exp,
+                        "%.0f" % budget if budget is not None else "budget?",
+                        "; ".join(why_exp) or TUNED["cameraExposureRaw"][1]))
         # gain is tuned, not asserted, so "repaired" means "chosen deliberately",
         # which we can only judge as "the tune ran and set one"
         results.append(("cameraGain", "INFO", after2.get("cameraGain"),
@@ -780,6 +883,9 @@ async def main_async(a):
                  why if verdict in ("FAIL", "SKIP") else ""))
     print("=" * 66)
     print("%d passed, %d FAILED" % (npass, nfail))
+    # Again, at the bottom. A score pasted into a handoff carries the md5 of
+    # the thing it scored, or it is not a claim about anything.
+    print_target(tgt, "summary - this score is for THIS file")
     if nfail:
         print("\nA FAIL means a human can put the camera into that state and "
               "photontune will not fix it.")
@@ -792,8 +898,9 @@ def main():
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=5800)
     p.add_argument("--camera", default=None, help="nickname (default: first)")
-    p.add_argument("--photontune", default="python3 /opt/photontune/photontune.py",
-                   help="command that runs photontune")
+    p.add_argument("--photontune", default=None,
+                   help="command that runs photontune (default: python3 "
+                        "<the photontune.py next to this file>)")
     p.add_argument("--sample-floor", action="store_true",
                    help="offline: assert a sample too small to judge is refused.")
     p.add_argument("--cli-smoke", action="store_true",
@@ -817,7 +924,13 @@ def main():
         sys.exit(gain_walk_replay(a.src))
     if a.sample_floor:
         sys.exit(sample_floor(a.src))
-    a.photontune = a.photontune.split()
+    a.photontune = (a.photontune.split() if a.photontune
+                    else ["python3", DEFAULT_TARGET])
+    # BEFORE any hardware is touched, and before the camera is sabotaged.
+    # Refusing after the websocket is open means the operator finds out the
+    # target was wrong only once something is already half-broken.
+    a.target_info = identify_target(a.photontune)
+    print_target(a.target_info, "header")
     sys.exit(asyncio.run(main_async(a)))
 
 
