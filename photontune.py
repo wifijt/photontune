@@ -151,6 +151,30 @@ MIN_SAMPLE_FRAMES = 20
 # which is why the extension also requires at least one frame to have arrived.
 SAMPLE_EXTEND_S = 4.0
 
+# What the websocket delivers per camera when nobody has let a backlog build,
+# and how much faster than that counts as "still working off a backlog".
+#
+# MEASURED on this rig, one camera, both cameras streaming (backlog.py):
+#
+#     steady state, read continuously        8.3 results/s
+#     4 s read after 10 s unread            29.2 results/s   (117 frames)
+#     the 4 s after that                     8.5 results/s
+#     the 4 s after that                     8.2 results/s
+#
+# The two regimes are 3.5x apart, so a threshold anywhere between them
+# separates them; 1.8x the steady rate (15/s) is the midpoint in log terms and
+# is what drain_backlog() uses to decide it has caught up. These numbers are
+# only used to DETECT a backlog and drain it - nothing measures quality with
+# them - and the stale-frame gate in collect() is what makes a wrong answer
+# here harmless rather than silent.
+WS_STEADY_RATE = 8.3
+WS_BACKLOG_FACTOR = 1.8
+
+# A mark older than this means the reader was starved - something blocked the
+# event loop - so results have been queueing and the mark is not "now". Four
+# steady-state frame periods.
+WS_MARK_STALE_S = 0.5
+
 # Exposure bounds to use when a camera does not report its own. Only a
 # fallback: every camera on this rig reports 7-80000 us and those numbers are
 # what get used. A camera that reports nothing is rare enough that guessing a
@@ -193,6 +217,12 @@ class Sample:
         self.reproj = []
         self.tag_counts = []
         self.ambiguities = []
+        # Frames that arrived but were older than the write this trial is
+        # measuring. Nonzero is normal and healthy; ONLY nonzero, with
+        # frames == 0, means the gate rejected the whole dwell.
+        self.stale_dropped = 0
+        # False if the stale-frame gate could not be given a trustworthy mark.
+        self.mark_ok = True
 
     @property
     def solve_rate(self):
@@ -295,6 +325,11 @@ class Sample:
         if self.passes(min_tags, max_ambiguity, tag_reference, tag_z):
             return None
         if self.frames == 0:
+            if self.stale_dropped:
+                return ("%d frames arrived but every one was captured BEFORE "
+                        "this trial's write - the pipeline is running far "
+                        "behind, or its frame counter restarted"
+                        % self.stale_dropped)
             return "no frames arrived - nothing was being published"
         if self.frames < MIN_SAMPLE_FRAMES:
             return ("only %d frames - under the %d needed to classify (at %d "
@@ -405,9 +440,154 @@ def gain_grid(max_gain, steps=GAIN_GRID_STEPS):
 # ───────────────────────── PhotonVision link ─────────────────────────
 
 class Photon:
+    """The websocket link, with a reader that NEVER stops draining it.
+
+    The reader is not a tidiness measure, it is the fix for a measured
+    correctness bug. PhotonVision pushes updatePipelineResult continuously and
+    the socket is only read while a _pump is running, so every gap - a settle,
+    a confirm's backoff, the baseline - queues results that are then delivered
+    in a burst to whatever reads next. MEASURED on this rig, one camera:
+
+        steady state                       8.3 results/s
+        4 s read after 10 s unread       117 results  (29.2/s)
+        the next 4 s                      34 results  ( 8.5/s)
+
+    So the first trial after any pause scored most of its frames on the
+    PREVIOUS settings. The reference measurement is taken straight after the
+    baseline and the calibration check, which is the longest pause in the run,
+    and the audit measured it collecting 113-121 frames in a 4.0 s dwell where
+    every other trial collected 41-48: roughly 60% of the bar-setting sample
+    predated the write it claimed to measure. At --max-blur-px 0.05 that
+    reference reported "multitag 62%  tags 2.44" at an exposure where gains
+    0-80 all read 0.00 tags.
+
+    Draining to empty is not an alternative, and it was measured rather than
+    assumed: with two cameras interleaved the largest gap between messages at
+    steady state is 0.114 s, so a recv() timeout short enough to detect an
+    empty queue also fires constantly when the queue is merely idle. There is
+    no "the socket is drained now" signal to wait for - so the socket is read
+    the whole time instead, and a subscriber sees only what arrives while it is
+    subscribed.
+    """
+
     def __init__(self, host, port=5800):
         self.uri = "ws://%s:%d/websocket_data" % (host, port)
         self.ws = None
+        self._subs = []
+        self._reader_task = None
+        self._reader_error = None
+        self._tick = None
+        # uniqueName -> the newest sequenceID delivered for that camera. This
+        # is what makes a stale-frame gate possible on the websocket: the
+        # websocket carries no captureTimestampMicros (verified by dumping the
+        # message: multitagResult, latency, fps, classNames, sequenceID,
+        # targets) but sequenceID is a per-camera frame counter and was
+        # measured strictly monotonic over every read in the table above.
+        self._latest_seq = {}
+        # uniqueName -> when that sequenceID was DELIVERED. A mark is only
+        # "now" if the reader has been running; see WS_MARK_STALE_S.
+        self._latest_at = {}
+
+    async def _reader(self):
+        """Consume the socket forever. The only caller of ws.recv()."""
+        while True:
+            try:
+                raw = await self.ws.recv()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                self._reader_error = exc
+                if self._tick is not None:
+                    self._tick.set()
+                return
+            if not isinstance(raw, bytes):
+                continue
+            try:
+                msg = msgpack.unpackb(raw, raw=False)
+            except Exception:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            res = msg.get("updatePipelineResult")
+            if res:
+                now = time.time()
+                for uniq, c in res.items():
+                    if isinstance(c, dict) and c.get("sequenceID") is not None:
+                        self._latest_seq[uniq] = c["sequenceID"]
+                        self._latest_at[uniq] = now
+            for cb in list(self._subs):
+                try:
+                    cb(msg)
+                except BaseException as exc:
+                    # Do not let a subscriber's bug kill the reader silently;
+                    # hand it to the _pump that owns the subscriber instead.
+                    self._reader_error = exc
+            if self._tick is not None:
+                self._tick.set()
+
+    def newest_sequence(self, unique_name):
+        """The newest sequenceID seen for this camera, or None.
+
+        The websocket equivalent of NTResults.newest_capture(). It lags capture
+        by the pipeline latency (~128 ms measured here) exactly as the NT
+        timestamp does, and the reader means nothing older than it is still
+        sitting in a queue waiting to be counted.
+        """
+        return self._latest_seq.get(unique_name)
+
+    def mark_age(self, unique_name):
+        """Seconds since the newest sequenceID for this camera was delivered.
+
+        float('inf') if nothing has ever arrived for it. The gate in collect()
+        is only as good as the mark it is given, and the mark is only "now"
+        while the reader is actually being scheduled - so this is the question
+        that has to be asked before trusting one.
+        """
+        at = self._latest_at.get(unique_name)
+        return float("inf") if at is None else time.time() - at
+
+    async def drain_backlog(self, unique_name, log=None, max_wait=8.0,
+                            slice_s=0.5):
+        """Read and discard until this camera's results arrive at pipeline rate.
+
+        Only called when the mark is stale, i.e. when something blocked the
+        event loop long enough for results to queue. The reader normally makes
+        this a no-op, and it costs nothing when it is not needed.
+
+        "Caught up" is measured, not waited out: count this camera's frames
+        over a slice and compare the rate against WS_STEADY_RATE. The two
+        regimes are 8.3/s and 29.2/s, so a slice of 0.5 s sees about 4 frames
+        when caught up and about 15 while a backlog is still arriving.
+        Returns (frames_discarded, caught_up).
+        """
+        discarded = 0
+        t_end = time.time() + max_wait
+        while True:
+            got = {"n": 0}
+            def handle(msg, got=got):
+                res = msg.get("updatePipelineResult")
+                if res and unique_name in res:
+                    got["n"] += 1
+            t0 = time.time()
+            await self._pump(slice_s, handle)
+            el = max(1e-6, time.time() - t0)
+            discarded += got["n"]
+            rate = got["n"] / el
+            if rate <= WS_STEADY_RATE * WS_BACKLOG_FACTOR:
+                if discarded and log:
+                    log("   drained %d queued result(s) before marking - the "
+                        "event loop had been blocked, so results were sitting "
+                        "in the socket (now %.1f/s, pipeline rate)"
+                        % (discarded, rate))
+                return discarded, True
+            if time.time() >= t_end:
+                if log:
+                    log("   !! still receiving %.1f/s after draining %d "
+                        "result(s) for %.0f s - more than the %.1f/s this "
+                        "pipeline produces. The sample below may contain "
+                        "frames from before the write."
+                        % (rate, discarded, max_wait, WS_STEADY_RATE))
+                return discarded, False
 
     async def __aenter__(self):
         try:
@@ -424,31 +604,58 @@ class Photon:
             raise ConnectionError(
                 "could not reach PhotonVision at %s - check the host and that it is running (%s)"
                 % (self.uri, type(exc).__name__)) from None
+        self._tick = asyncio.Event()
+        self._reader_task = asyncio.ensure_future(self._reader())
         return self
 
     async def __aexit__(self, *a):
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except BaseException:
+                pass
+            self._reader_task = None
         if self.ws:
             await self.ws.close()
 
     async def _pump(self, seconds, on_message, stop_when=None):
+        """Subscribe on_message to the reader for `seconds`.
+
+        A subscriber sees messages that arrive WHILE IT IS SUBSCRIBED and
+        nothing else; anything that queued up beforehand was already consumed
+        and discarded by the reader. That is the whole point - see the class
+        docstring for the measurement.
+        """
         t0 = time.time()
-        while time.time() - t0 < seconds:
-            # Asked here rather than trusted to the cancellation: see SHUTDOWN.
-            # The restore paths do not go through _pump, so aborting here
-            # cannot stop the camera being put back.
-            raise_if_shutdown("sampling")
-            remaining = seconds - (time.time() - t0)
+        self._subs.append(on_message)
+        try:
+            while True:
+                # Asked here rather than trusted to the cancellation: see
+                # SHUTDOWN. The restore paths do not go through _pump, so
+                # aborting here cannot stop the camera being put back.
+                raise_if_shutdown("sampling")
+                if self._reader_error is not None:
+                    raise self._reader_error
+                if stop_when is not None and stop_when():
+                    return
+                remaining = seconds - (time.time() - t0)
+                if remaining <= 0:
+                    return
+                self._tick.clear()
+                try:
+                    # Capped at 0.2 s so the shutdown flag is asked ~5x a
+                    # second even on a silent socket, which is what the old
+                    # recv() timeout did.
+                    await asyncio.wait_for(self._tick.wait(),
+                                           timeout=min(0.2, remaining))
+                except asyncio.TimeoutError:
+                    pass
+        finally:
             try:
-                raw = await asyncio.wait_for(self.ws.recv(), timeout=max(0.2, remaining))
-            except asyncio.TimeoutError:
-                return
-            if not isinstance(raw, bytes):
-                continue
-            msg = msgpack.unpackb(raw, raw=False)
-            if isinstance(msg, dict):
-                on_message(msg)
-            if stop_when is not None and stop_when():
-                return
+                self._subs.remove(on_message)
+            except ValueError:
+                pass
 
     async def cameras(self, timeout=12):
         """[{uniqueName, nickname, settings, calibrations, formats, bounds}].
@@ -633,22 +840,38 @@ class Photon:
         return bad
 
     async def collect(self, unique_name, seconds, min_frames=0,
-                      extend=SAMPLE_EXTEND_S):
+                      extend=SAMPLE_EXTEND_S, after_sequence=None):
         """Gather pipeline results for one camera.
 
+        after_sequence: discard frames whose sequenceID is at or below this.
+        The same gate NTResults.collect has had all along, and for the same
+        reason - the pipeline runs ~128 ms behind, so a frame arriving just
+        after a write was EXPOSED before it. Sampled without the gate, the
+        first trial after a change inherited frames exposed at the previous
+        setting and read 0.96 tags where the truth was 0.17. The websocket
+        message carries no captureTimestampMicros, so the ordering comes from
+        sequenceID, which is a per-camera frame counter and was measured
+        strictly monotonic. Frames the gate rejects are COUNTED, not silently
+        dropped: a gate that rejected everything would otherwise look
+        identical to a dead pipeline.
+
         min_frames: keep collecting past `seconds` until this many frames have
-        arrived. The websocket is throttled to ~9-11 results/s, so a short
-        dwell can carry fewer than MIN_SAMPLE_FRAMES and nothing could be
-        classified at all. Extending is the cheap half of the fix. Only
-        extends when frames ARE arriving: at zero the pipeline is dead or the
-        scene is black, and waiting longer buys nothing but a slower tune.
+        arrived. Extending is the cheap half of the fix for a short dwell.
+        Only extends when frames ARE arriving: at zero the pipeline is dead or
+        the scene is black, and waiting longer buys nothing but a slower tune.
         """
-        out = {"frames": 0, "solves": 0, "reproj": [], "tags": [], "amb": []}
+        out = {"frames": 0, "solves": 0, "reproj": [], "tags": [], "amb": [],
+               "stale_dropped": 0}
         def handle(msg):
             res = msg.get("updatePipelineResult")
             if not res or unique_name not in res:
                 return
             c = res[unique_name]
+            seq = c.get("sequenceID")
+            if (after_sequence is not None and seq is not None
+                    and seq <= after_sequence):
+                out["stale_dropped"] += 1
+                return
             out["frames"] += 1
             targets = c.get("targets") or []
             out["tags"].append(len(targets))
@@ -668,21 +891,61 @@ class Photon:
 
 # ──────────────────── sampling and the camera ────────────────────
 
-async def sample(pv, cam, cfg, seconds, after_capture=None):
-    """Collect detections, preferring NetworkTables over the throttled websocket."""
+async def sample(pv, cam, cfg, seconds, mark=None):
+    """Collect detections, preferring NetworkTables over the throttled websocket.
+
+    `mark` comes from capture_mark() and is TAGGED with the transport that
+    produced it, because the two transports measure a frame's age in different
+    units - NetworkTables in captureTimestampMicros, the websocket in
+    sequenceID - and feeding one to the other would be a silent, plausible
+    number. The tag is asserted rather than trusted: this gate is the only
+    thing standing between the reference measurement and the previous
+    setting's frames, and it was inoperative on the websocket for exactly as
+    long as nobody checked which path it was on.
+    """
     reader = cfg.readers.get(cam["nickname"])
+    kind, value = mark if mark else (None, None)
     if reader is not None:
+        if mark is not None and kind != "nt":
+            raise AssertionError("NetworkTables sampling handed a %r mark" % kind)
         # ntcore blocks; keep the event loop free so nothing else stalls.
         return await asyncio.get_event_loop().run_in_executor(
-            None, reader.collect, seconds, after_capture, MIN_SAMPLE_FRAMES)
+            None, reader.collect, seconds, value, MIN_SAMPLE_FRAMES)
+    if mark is not None and kind != "ws":
+        raise AssertionError("websocket sampling handed a %r mark" % kind)
     return await pv.collect(cam["uniqueName"], seconds,
-                            min_frames=MIN_SAMPLE_FRAMES)
+                            min_frames=MIN_SAMPLE_FRAMES,
+                            after_sequence=value)
 
 
-def capture_mark(cfg, cam):
-    """Newest capture timestamp right now, to gate out pre-change frames."""
+async def capture_mark(pv, cfg, cam, log=None):
+    """How old a frame has to be to be stale, on whichever transport is in use.
+
+    ("nt", captureTimestampMicros) or ("ws", sequenceID). Both are read from
+    the newest frame ALREADY DELIVERED, so both lag capture by the pipeline
+    latency in the same way; see Photon.newest_sequence.
+
+    On the websocket the mark is only meaningful if the reader has been
+    running. If it has not - something blocked the event loop - the newest
+    delivered sequenceID is old, everything that queued behind it is NEWER
+    than the mark, and the gate would wave the whole backlog through. So the
+    mark's age is checked and a stale one is drained first. Returns
+    (mark, ok); ok is False only when the drain could not catch up.
+    """
     reader = cfg.readers.get(cam["nickname"])
-    return reader.newest_capture() if reader is not None else None
+    if reader is not None:
+        return ("nt", reader.newest_capture()), True
+    unique = cam["uniqueName"]
+    age = pv.mark_age(unique)
+    if age > WS_MARK_STALE_S:
+        if log:
+            log("   the results reader has not been scheduled for %s - "
+                "draining before measuring"
+                % ("%.1f s" % age if age != float("inf") else "this run"))
+        _n, ok = await pv.drain_backlog(unique, log=log)
+    else:
+        ok = True
+    return ("ws", pv.newest_sequence(unique)), ok
 
 
 
@@ -1132,7 +1395,7 @@ async def trial(pv, cam, cfg, gain, exposure, log=None):
     covers both with about 3x margin, which is what makes walking gain as cheap
     as walking exposure and therefore makes this design affordable at all.
     """
-    mark = capture_mark(cfg, cam)
+    mark, mark_ok = await capture_mark(pv, cfg, cam, log)
     await pv.set_setting(cam["uniqueName"], cameraAutoExposure=False,
                          cameraGain=int(round(gain)),
                          cameraExposureRaw=float(exposure))
@@ -1144,6 +1407,8 @@ async def trial(pv, cam, cfg, gain, exposure, log=None):
     s.reproj = raw["reproj"]
     s.tag_counts = raw["tags"]
     s.ambiguities = raw["amb"]
+    s.stale_dropped = raw.get("stale_dropped", 0)
+    s.mark_ok = mark_ok
     return s
 
 
@@ -1726,10 +1991,27 @@ async def _run_inner(cfg, log=print, progress=None, on_camera=None):
         if readers:
             log("   sampling over NetworkTables (~4.8x the frames of the websocket)")
         elif not cfg.baseline_only:
-            log("   sampling over the websocket - it is throttled to ~9 results/s")
-            log("   per camera (measured on this rig, both cameras streaming:")
-            log("   8.9 and 9.0), so a %.1f s dwell is ~%d frames."
-                % (cfg.dwell, int(cfg.dwell * 9)))
+            log("   sampling over the websocket - it is throttled to ~%.1f "
+                "results/s per camera" % WS_STEADY_RATE)
+            log("   (measured on this rig with both cameras streaming), so a "
+                "%.1f s dwell is ~%d frames."
+                % (cfg.dwell, int(cfg.dwell * WS_STEADY_RATE)))
+            # The frame count is the sample size, and the sample size IS the
+            # strictness of the 90% gate - see rate_upper_bound. A dwell that
+            # lands near MIN_SAMPLE_FRAMES makes collect() extend, and a trial
+            # that extended is judged against a different effective floor than
+            # the trial before it. Say so rather than quietly deciding on it.
+            n = cfg.dwell * WS_STEADY_RATE
+            if n < 1.5 * MIN_SAMPLE_FRAMES:
+                log("   !! a %.1f s dwell is only ~%d frames, under the %d that "
+                    "keeps every trial out of the extension in collect(). At "
+                    "%d frames the 90%% gate lets %.0f%% through, so trials in "
+                    "this walk will be judged by DIFFERENT standards depending "
+                    "on how many frames each happened to get. Raise --dwell to "
+                    "%.1f."
+                    % (cfg.dwell, int(n), int(1.5 * MIN_SAMPLE_FRAMES),
+                       max(1, int(n)), 100 * _effective_floor(max(1, int(n))),
+                       1.5 * MIN_SAMPLE_FRAMES / WS_STEADY_RATE))
         try:
             return await _tune_all(pv, cams, cfg, log, progress, on_camera)
         finally:
@@ -2424,11 +2706,20 @@ def build_parser():
                         "budget.")
 
     p.add_argument("--dwell", type=float, default=4.0,
-                   help="seconds of data per trial (default %(default)s). Over the "
-                        "websocket that is ~36 results at the ~9/s measured on "
-                        "this rig - the sampling error on the tag count is what "
-                        "decides a marginal gain, so this is not a knob to "
-                        "shorten casually.")
+                   help="seconds of data per trial (default %(default)s). "
+                        "DERIVED, and re-derived once the stale-frame gate "
+                        "made the frame count mean anything: at the measured "
+                        "gated rate of 8.3-9.3 results/s per camera this is "
+                        "33-37 frames. The floor is MIN_SAMPLE_FRAMES (20, "
+                        "i.e. 2.4 s), but a trial that lands near it triggers "
+                        "the extension in collect(), and a trial that extends "
+                        "is judged on a DIFFERENT sample size - and therefore "
+                        "a different effective gate - than its neighbours in "
+                        "the same walk. 1.5x the floor, 30 frames, is 3.6 s at "
+                        "the slow end; 4.0 s is that with 10%% margin. Past "
+                        "~30 frames the 90%% gate's effective floor plateaus "
+                        "at 0.82-0.85 and a longer dwell buys only tag-count "
+                        "precision, which falls as 1/sqrt(n).")
     p.add_argument("--settle", type=float, default=0.7,
                    help="seconds to wait after changing a setting (default "
                         "%(default)s). MEASURED on a Pi 5 / OV9281 against "
