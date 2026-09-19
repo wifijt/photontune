@@ -167,6 +167,22 @@ SAMPLE_EXTEND_S = 4.0
 # only used to DETECT a backlog and drain it - nothing measures quality with
 # them - and the stale-frame gate in collect() is what makes a wrong answer
 # here harmless rather than silent.
+# RE-MEASURED on this rig, both cameras streaming, six 4.0 s slices each
+# (the condition the number is for):
+#     OV9281      8.99 - 9.45 /s   36-38 frames per 4.0 s dwell
+#     OV9281 (1)  8.13 - 8.44 /s   33    frames per 4.0 s dwell
+# so the two cameras are NOT the same and 8.3 is not uniformly low: it is
+# right for the second camera and about 10% low for the first.
+#
+# The value stays at the BOTTOM of the measured range on purpose. It is used
+# for two things and they want opposite errors: drain_backlog() compares
+# against 1.8x it, where a low value is conservative (8.3*1.8 = 14.9, and a
+# healthy 8-9.5 is nowhere near it either way), and the startup line
+# estimates frames-per-dwell, where OVERestimating is the dangerous
+# direction - it is the number the "your dwell may be too short" warning is
+# computed from, and an optimistic estimate silences that warning for the
+# slower camera. 8.3 is the honest floor across both cameras; the log line
+# now reports the measured spread rather than a single figure.
 WS_STEADY_RATE = 8.3
 WS_BACKLOG_FACTOR = 1.8
 
@@ -239,8 +255,16 @@ class Sample:
         self.tag_counts = []
         self.ambiguities = []
         # Frames that arrived but were older than the write this trial is
-        # measuring. Nonzero is normal and healthy; ONLY nonzero, with
-        # frames == 0, means the gate rejected the whole dwell.
+        # measuring.
+        #
+        # This said "nonzero is normal and healthy". It is not: instrumented
+        # on this rig it is 0 on EVERY trial, and the first frame's
+        # sequenceID is already past the mark every time. The gate cannot
+        # fire in normal operation - see trial() - so nonzero here is not
+        # health, it is the event loop having been blocked long enough for
+        # results to queue behind the write. Worth looking at, not worth
+        # failing on, and `frames == 0` with this nonzero is the case
+        # why_failed() already reports.
         self.stale_dropped = 0
         # False if the stale-frame gate could not be given a trustworthy mark.
         self.mark_ok = True
@@ -674,8 +698,8 @@ class Photon:
 
         "Caught up" is measured, not waited out: count this camera's frames
         over a slice and compare the rate against WS_STEADY_RATE. The two
-        regimes are 8.3/s and 29.2/s, so a slice of 0.5 s sees about 4 frames
-        when caught up and about 15 while a backlog is still arriving.
+        regimes are 8.1-9.5/s and 29.2/s, so a slice of 0.5 s sees about 4-5
+        frames when caught up and about 15 while a backlog is still arriving.
         Returns (frames_discarded, caught_up).
         """
         discarded = 0
@@ -1474,6 +1498,29 @@ def tune_failed(r, cfg=None):
     return not r.get("applied")
 
 
+def failure_text(r):
+    """Why this camera failed, in words, for the daemon's NT dashboard.
+
+    The dashboard printed `r.get("error", "?")`, and rec["error"] is only set
+    on the paths that happen to set it - so over_blur_budget,
+    applied_point_failed and apply_mismatch all reached a team's dashboard as
+    "FAILED: OV9281 (?)". The one signal anybody reads said a camera failed
+    and would not say why.
+
+    Fixing it at those three callsites would leave the next problem to
+    rediscover it, so the text comes from the REGISTRY, which is already the
+    thing that decided the camera failed at all. Any HARD problem added later
+    gets dashboard text for free, and a run that failed with no recorded
+    problem at all still falls back to `error`. Kept short: NT strings are
+    truncated for the dashboard and the full text is in the CLI summary and
+    the log.
+    """
+    notes = [t for _k, _sev, t in problem_notes(r, HARD)]
+    if notes:
+        return "; ".join(n.split(" - ")[0].split(". ")[0] for n in notes)
+    return r.get("error") or "did not apply anything"
+
+
 def run_verdict(results, cfg=None):
     """(failed, warnings, exit_code) for a whole run. The CLI and daemon agree.
 
@@ -1611,12 +1658,31 @@ class Search:
 async def trial(pv, cam, cfg, gain, exposure, log=None):
     """Measure detection quality at ONE (gain, exposure). The only measurement.
 
-    Writes the pair, waits one settle, then samples from the first frame
-    CAPTURED after the write - see capture_mark(). MEASURED apply latency on
-    this rig: exposure 0.25-0.36 s over six trials, gain 0.234 s median
-    (0.197-0.241, n=8), symmetric in both directions. The 0.7 s default settle
-    covers both with about 3x margin, which is what makes walking gain as cheap
-    as walking exposure and therefore makes this design affordable at all.
+    Writes the pair, waits one settle, then samples.
+
+    THIS DOCSTRING USED TO SAY "samples from the first frame CAPTURED after
+    the write - see capture_mark()". That is not what happens, and an audit
+    instrumented it to be sure: stale_dropped was 0 and the first frame's
+    sequenceID was already greater than `mark` on EVERY trial. The gate
+    cannot fire. `mark` is the newest sequenceID already DELIVERED when the
+    mark is taken, and the continuous reader drains the socket as results
+    arrive, so by the time the write lands and the settle elapses every
+    frame in hand is newer than the mark by construction.
+
+    What actually keeps a trial from measuring the previous setting is the
+    continuous reader plus the 0.7 s settle - not the gate. The gate is kept
+    as a BACKSTOP for the one case that would defeat both (the event loop
+    blocked long enough for results to queue behind the write, which
+    drain_backlog also watches for), and it has never been observed to fire.
+    It is cheap and it is honest to keep, as long as nothing claims it is
+    what makes the sample clean.
+
+    MEASURED apply latency on this rig, write to the first frame actually at
+    the new setting: 0.204-0.277 s, median 0.246, n=12. Against the 0.700 s
+    default settle that is 2.5x margin on the slowest of the twelve and 2.8x
+    on the median - NOT the "about 3x" this said before. Still ample, and
+    still what makes walking gain as cheap as walking exposure, which is what
+    makes this design affordable at all.
     """
     mark, mark_ok = await capture_mark(pv, cfg, cam, log)
     await pv.set_setting(cam["uniqueName"], cameraAutoExposure=False,
@@ -2361,11 +2427,12 @@ async def _run_inner(cfg, log=print, progress=None, on_camera=None):
         if readers:
             log("   sampling over NetworkTables (~4.8x the frames of the websocket)")
         elif not cfg.baseline_only:
-            log("   sampling over the websocket - it is throttled to ~%.1f "
-                "results/s per camera" % WS_STEADY_RATE)
-            log("   (measured on this rig with both cameras streaming), so a "
-                "%.1f s dwell is ~%d frames."
-                % (cfg.dwell, int(cfg.dwell * WS_STEADY_RATE)))
+            log("   sampling over the websocket - it is throttled to "
+                "%.1f-%.1f results/s per camera" % (WS_STEADY_RATE, 9.5))
+            log("   (measured on this rig with both cameras streaming; the "
+                "two cameras differ), so a %.1f s dwell is %d-%d frames."
+                % (cfg.dwell, int(cfg.dwell * WS_STEADY_RATE),
+                   int(cfg.dwell * 9.5)))
             # The frame count is the sample size, and the sample size IS the
             # strictness of the 90% gate - see rate_upper_bound. A dwell that
             # lands near MIN_SAMPLE_FRAMES makes collect() extend, and a trial
@@ -2966,13 +3033,29 @@ async def daemon(args, log=print):
     boot_sum.setString("pending")
 
     async def boot_baseline():
-        """Wait for PhotonVision to answer, then assert the baseline. Seconds."""
+        """Wait for PhotonVision to answer, then assert the baseline. Seconds.
+
+        PROBE TIMEOUT, not the 12 s default. This loop runs exactly while
+        PhotonVision is starting, which is the one situation where it
+        ACCEPTS the websocket and then says nothing - the connection
+        succeeds, cameras() waits out its full 12 s for a cameraSettings
+        that is not coming yet, and the 2 s sleep is added on top. That is
+        14 s per attempt against a 90 s budget: six tries, most of the
+        budget spent inside a call that had already failed.
+
+        3 s is generous for the answer itself - PhotonVision sends
+        cameraSettings on connect, measured ~0.14 s once it is up - so a
+        probe that has not answered in 3 s has not finished booting, and the
+        right move is to go round again. Same total budget, ~18 attempts
+        instead of 6, and the baseline starts within a few seconds of
+        PhotonVision actually being ready instead of up to 14 s later.
+        """
         t0 = time.time()
         ready = False
         while time.time() - t0 < args.boot_timeout:
             try:
                 async with Photon(args.host, args.port) as probe:
-                    if await probe.cameras():
+                    if await probe.cameras(timeout=3):
                         ready = True
                         break
             except Exception:
@@ -3013,7 +3096,7 @@ async def daemon(args, log=print):
             for r in res)
         if failed:
             line += "; FAILED: " + ", ".join(
-                "%s (%s)" % (r["camera"], r.get("error", "?")) for r in failed)
+                "%s (%s)" % (r["camera"], failure_text(r)) for r in failed)
         boot_ran.setBoolean(True)
         boot_ok.setBoolean(code == 0)
         boot_sum.setString(line[:200])
@@ -3058,7 +3141,7 @@ async def daemon(args, log=print):
                                      for r in applied)
                     if failed:
                         line += ("; FAILED: " + ", ".join(
-                            "%s (%s)" % (r["camera"], r.get("error", "?"))
+                            "%s (%s)" % (r["camera"], failure_text(r))
                             for r in failed))
                     # Warnings reach the dashboard, not just the log. A camera
                     # whose RESOLUTION this tool changed, or one applied over
@@ -3164,7 +3247,7 @@ def build_parser():
                    help="seconds of data per trial (default %(default)s). "
                         "DERIVED, and re-derived once the stale-frame gate "
                         "made the frame count mean anything: at the measured "
-                        "gated rate of 8.3-9.3 results/s per camera this is "
+                        "gated rate of 8.1-9.5 results/s per camera this is "
                         "33-37 frames. The floor is MIN_SAMPLE_FRAMES (20, "
                         "i.e. 2.4 s), but a trial that lands near it triggers "
                         "the extension in collect(), and a trial that extends "
