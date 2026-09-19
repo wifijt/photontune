@@ -1983,7 +1983,7 @@ async def _run_inner(cfg, log=print, progress=None, on_camera=None):
         log("%s %d camera(s): %s"
             % ("baseline for" if cfg.baseline_only else "tuning", len(cams),
                ", ".join(c["nickname"] for c in cams)))
-        readers = {} if cfg.baseline_only else _open_readers(cfg, cams, log)
+        readers = {} if cfg.baseline_only else await _open_readers(cfg, cams, log)
         # The ONE place the frozen config gains its sampling wiring. After this
         # line nothing may write to cfg at all, which is what makes the gain
         # ratchet inexpressible rather than merely absent.
@@ -2019,7 +2019,7 @@ async def _run_inner(cfg, log=print, progress=None, on_camera=None):
                 r.close()
 
 
-def _open_readers(cfg, cams, log):
+async def _open_readers(cfg, cams, log):
     """NetworkTables readers for every camera, or {} if there is no server.
 
     photontune never CREATES a server - see NTResults. --nt-server points at
@@ -2027,7 +2027,23 @@ def _open_readers(cfg, cams, log):
     as well because running ON the coprocessor, --host defaults to
     photonvision.local and resolving its own mDNS name does not connect, so a
     bare invocation silently fell back to the slow path.
+
+    OFF THE EVENT LOOP. This is synchronous and, with no server reachable,
+    takes 4 s per candidate host. Run inline it blocked the loop for ~8 s, and
+    a blocked loop cannot run loop.add_signal_handler's callback - so SIGTERM
+    in that window neither cancelled the run nor even set the shutdown flag,
+    and the tool went on to write to the cameras afterwards. In an executor
+    the loop stays free: the signal callback runs, the flag is set, and
+    NTResults.available() reads the flag and unwinds this thread.
+
+    It also keeps the websocket reader being scheduled, which is what stops a
+    backlog building in front of the first trial - see Photon.
     """
+    return await asyncio.get_event_loop().run_in_executor(
+        None, _open_readers_blocking, cfg, cams, log)
+
+
+def _open_readers_blocking(cfg, cams, log):
     if cfg.no_nt:
         return {}
     cands = [cfg.nt_server or cfg.host]
@@ -2039,7 +2055,17 @@ def _open_readers(cfg, cams, log):
         try:
             for c in cams:
                 r = NTResults(ntsrv, c["nickname"])
-                if not r.available():
+                try:
+                    ok = r.available()
+                except BaseException:
+                    # Terminated included: close what this loop built before
+                    # letting it out, or a shutdown leaks an ntcore client per
+                    # camera.
+                    r.close()
+                    for done in readers.values():
+                        done.close()
+                    raise
+                if not ok:
                     r.close()
                     for done in readers.values():
                         done.close()
@@ -2049,6 +2075,8 @@ def _open_readers(cfg, cams, log):
             if readers:
                 log("   NetworkTables server: %s" % ntsrv)
                 return readers
+        except Terminated:
+            raise
         except Exception as exc:
             for done in readers.values():
                 done.close()
@@ -2233,9 +2261,20 @@ class NTResults:
             return None
 
     def available(self, wait=4.0):
-        """True if results are actually arriving - not merely that NT connected."""
+        """True if results are actually arriving - not merely that NT connected.
+
+        Asks the shutdown flag like every other long loop. MEASURED before it
+        did, with no NT server anywhere so each candidate host waits the full
+        4 s: SIGTERM at 2 s exited at 19.0 s, at 5 s exited at 16.0 s, at 20 s
+        exited at 7.2 s. A signal inside the first ~9 s did not stop the tool
+        going on to write to the cameras at all - the probe ran on the event
+        loop thread, so add_signal_handler's callback could not run either,
+        and the flag this now reads was never even set. The other half of that
+        fix is in _open_readers, which no longer runs here on the loop thread.
+        """
         end = time.time() + wait
         while time.time() < end:
+            raise_if_shutdown("probing for a NetworkTables server")
             if self.sub.get():
                 return True
             time.sleep(0.1)
