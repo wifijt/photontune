@@ -32,7 +32,7 @@ Modes:
   CLI     python photontune.py --host photonvision.local
   Daemon  python photontune.py --daemon --nt-server 10.TE.AM.2
 """
-import argparse, asyncio, json, math, sys, time
+import argparse, asyncio, copy, json, math, sys, time
 from collections import defaultdict
 
 try:
@@ -1807,8 +1807,30 @@ async def _run_inner(args, log=print, progress=None, on_camera=None):
         return await _tune_all(pv, cams, args, log, progress, on_camera, results)
 
 
-async def _tune_all(pv, cams, args, log, progress, on_camera, results):
+async def _tune_all(pv, cams, outer_args, log, progress, on_camera, results):
         for idx, cam in enumerate(cams):   # sequential: avoids cameras perturbing each other
+            # EVERY camera gets its own argument state. Not a save/restore around
+            # each call - a copy, so there is no door left to leave open.
+            #
+            # This bug arrived twice through two different doors. The first fix
+            # put a save/restore inside optimise_gain; _tune_all then called
+            # tune_camera DIRECTLY on the --no-optimise-gain path with no restore
+            # at all, and the same bug came straight back. FORCED: camera 1
+            # escalated 0 -> 10 -> 20 -> 30 and narrowed its sweep to a 4-point
+            # 200/471/1111/2620 grid; camera 2 then logged "gain is already at
+            # 30", never printed "resetting to baseline 0", and swept camera 1's
+            # leftover grid instead of its own range. Exit 0.
+            #
+            # tune_camera mutates args.gain, args.gain_steps, args.min_exposure,
+            # args.max_exposure and args.steps as it escalates. A shallow copy
+            # keeps those per camera while sharing _nt (the readers are meant to
+            # be shared) - so a third door cannot open.
+            # Rebinding `args` itself, not introducing a second name: every
+            # line below - and every line anyone adds below - uses the
+            # per-camera copy automatically. A `cam_args` alias standing next to
+            # a live `args` would leave the same door open for the next edit to
+            # walk through, and this bug has already come back once that way.
+            args = copy.copy(outer_args)
             def cam_progress(f, idx=idx):
                 if progress:
                     progress((idx + f) / float(len(cams)))
