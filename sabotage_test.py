@@ -86,7 +86,6 @@ MATRIX_VALUES = {
     "video_mode_switched":    ("camera", [0, 1]),
     "would_switch_video_mode": ("camera", [0, 1]),
     "over_blur_budget":       ("camera", 17.9),
-    "range_warning":          ("camera", {"measured": 1.0, "stated": 2.0}),
     "fellback":               ("camera", True),
     "would_baseline":         ("camera", ["numIterations", "decisionMargin"]),
 }

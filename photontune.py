@@ -123,8 +123,6 @@ class Sample:
         self.reproj = []
         self.tag_counts = []
         self.ambiguities = []
-        self.ref_seen = 0          # frames containing the reference tag
-        self.ref_ranges = []       # measured range to it, metres
 
     @property
     def solve_rate(self):
@@ -142,15 +140,7 @@ class Sample:
     def med_ambiguity(self):
         return _median([a for a in self.ambiguities if a >= 0])
 
-    @property
-    def ref_rate(self):
-        return self.ref_seen / self.frames if self.frames else 0.0
-
-    @property
-    def ref_range(self):
-        return _median(self.ref_ranges)
-
-    def passes(self, min_tags, max_ambiguity, ref_tag=None, tag_target=None):
+    def passes(self, min_tags, max_ambiguity, tag_target=None):
         if self.frames < MIN_SAMPLE_FRAMES:
             return False
         # Multi-tag solves happily on a subset, so "it solved" is not the same as
@@ -159,11 +149,6 @@ class Sample:
         # exposure that quietly drops the hardest (usually farthest) tags.
         if tag_target is not None and self.mean_tags < tag_target:
             return False
-        # Reference-tag mode: a single held tag cannot multi-tag, and its
-        # ambiguity is dominated by viewing angle rather than exposure, so
-        # detection RATE is the honest metric.
-        if ref_tag is not None:
-            return rate_upper_bound(self.ref_seen, self.frames) >= 0.95
         # Prefer the multi-tag criterion when multi-tag is actually running.
         # Judged on the upper confidence bound, not the point estimate: a rate
         # measured over ~60 frames cannot separate 88% from 90%.
@@ -175,7 +160,7 @@ class Sample:
         amb = self.med_ambiguity
         return amb is not None and amb <= max_ambiguity
 
-    def why_failed(self, min_tags, max_ambiguity, ref_tag=None, tag_target=None):
+    def why_failed(self, min_tags, max_ambiguity, tag_target=None):
         """One short phrase saying why this sample did not pass, or None.
 
         The gain search reported EVERY outcome as "no passing exposure": a dead
@@ -183,7 +168,7 @@ class Sample:
         room were indistinguishable, and six "sweeps" were seen completing in
         0.00 s total with nothing noticing.
         """
-        if self.passes(min_tags, max_ambiguity, ref_tag, tag_target):
+        if self.passes(min_tags, max_ambiguity, tag_target):
             return None
         if self.frames == 0:
             return "no frames arrived - nothing was being published"
@@ -195,11 +180,6 @@ class Sample:
                        100 * _effective_floor(self.frames)))
         if tag_target is not None and self.mean_tags < tag_target:
             return "saw %.2f tags, needed %.2f" % (self.mean_tags, tag_target)
-        if ref_tag is not None:
-            return ("reference tag %d in %.0f%% of %d frames (at best %.0f%%, "
-                    "under the 95%% floor)"
-                    % (ref_tag, 100 * self.ref_rate, self.frames,
-                       100 * rate_upper_bound(self.ref_seen, self.frames)))
         if self.multitag_solves:
             return ("multi-tag solved in %.0f%% of %d frames (at best %.0f%%, "
                     "under the 90%% floor)"
@@ -212,11 +192,7 @@ class Sample:
             return "no multi-tag solve and no usable ambiguity"
         return "ambiguity %.3f, over the %.2f limit" % (amb, max_ambiguity)
 
-    def summary(self, ref_tag=None):
-        if ref_tag is not None:
-            r = self.ref_range
-            return "tag %d seen %3.0f%%  range %s" % (
-                ref_tag, 100 * self.ref_rate, ("%.2f m" % r) if r else "n/a")
+    def summary(self):
         if self.multitag_solves:
             return "multitag %3.0f%%  reproj %7.3f  tags %.2f" % (
                 100 * self.solve_rate, self.med_reproj or float("nan"), self.mean_tags)
@@ -347,8 +323,7 @@ def baseline_contradiction(samples, base_exposure, base_tags):
     return worst
 
 
-def choose_exposure(samples, bias, min_tags, max_ambiguity, ref_tag=None,
-                    tag_fraction=0.85):
+def choose_exposure(samples, bias, min_tags, max_ambiguity, tag_fraction=0.85):
     """Estimate where detection actually fails, then sit a safety factor above it.
 
     Biasing off the shortest *tested* passing value double-counts margin: with a
@@ -364,9 +339,9 @@ def choose_exposure(samples, bias, min_tags, max_ambiguity, ref_tag=None,
     # How many tags did the BEST exposure in this sweep see? Anything much below
     # that is leaving detections on the table.
     best_tags = max((s.mean_tags for s in samples), default=0.0)
-    tag_target = best_tags * tag_fraction if (best_tags >= 2 and ref_tag is None) else None
+    tag_target = best_tags * tag_fraction if best_tags >= 2 else None
     passing = [s for s in samples
-               if s.passes(min_tags, max_ambiguity, ref_tag, tag_target)]
+               if s.passes(min_tags, max_ambiguity, tag_target)]
     if not passing:
         # chosen=None tells the caller to escalate gain. tag_target still comes
         # back so it can say WHY nothing passed.
@@ -374,7 +349,7 @@ def choose_exposure(samples, bias, min_tags, max_ambiguity, ref_tag=None,
     shortest = min(passing, key=lambda s: s.exposure)
     failing_below = [s for s in samples
                      if s.exposure < shortest.exposure
-                     and not s.passes(min_tags, max_ambiguity, ref_tag, tag_target)]
+                     and not s.passes(min_tags, max_ambiguity, tag_target)]
     if failing_below:
         highest_fail = max(failing_below, key=lambda s: s.exposure).exposure
         cliff = math.sqrt(highest_fail * shortest.exposure)
@@ -599,7 +574,7 @@ class Photon:
             return [(None, None, None)]
         return bad
 
-    async def collect(self, unique_name, seconds, ref_tag=None, min_frames=0,
+    async def collect(self, unique_name, seconds, min_frames=0,
                       extend=SAMPLE_EXTEND_S):
         """Gather pipeline results for one camera.
 
@@ -610,8 +585,7 @@ class Photon:
         Only extends when frames ARE arriving: at zero the pipeline is dead or
         the scene is black, and waiting longer buys nothing but a slower sweep.
         """
-        out = {"frames": 0, "solves": 0, "reproj": [], "tags": [], "amb": [],
-               "ref_seen": 0, "ref_ranges": []}
+        out = {"frames": 0, "solves": 0, "reproj": [], "tags": [], "amb": []}
         def handle(msg):
             res = msg.get("updatePipelineResult")
             if not res or unique_name not in res:
@@ -622,12 +596,6 @@ class Photon:
             out["tags"].append(len(targets))
             for t in targets:
                 out["amb"].append(t.get("ambiguity", -1))
-                if ref_tag is not None and t.get("fiducialId") == ref_tag:
-                    out["ref_seen"] += 1
-                    p = t.get("pose") or {}
-                    if "x" in p:
-                        out["ref_ranges"].append(
-                            math.sqrt(p["x"] ** 2 + p["y"] ** 2 + p["z"] ** 2))
             mt = c.get("multitagResult")
             if mt:
                 out["solves"] += 1
@@ -642,15 +610,14 @@ class Photon:
 
 # ───────────────────────── the sweep ─────────────────────────
 
-async def sample(pv, cam, args, seconds, ref_tag, after_capture=None):
+async def sample(pv, cam, args, seconds, after_capture=None):
     """Collect detections, preferring NetworkTables over the throttled websocket."""
     reader = getattr(args, "_nt", {}).get(cam["nickname"])
     if reader is not None:
         # ntcore blocks; keep the event loop free so nothing else stalls.
         return await asyncio.get_event_loop().run_in_executor(
-            None, reader.collect, seconds, ref_tag, after_capture,
-            MIN_SAMPLE_FRAMES)
-    return await pv.collect(cam["uniqueName"], seconds, ref_tag,
+            None, reader.collect, seconds, after_capture, MIN_SAMPLE_FRAMES)
+    return await pv.collect(cam["uniqueName"], seconds,
                             min_frames=MIN_SAMPLE_FRAMES)
 
 
@@ -809,7 +776,7 @@ async def ensure_calibrated_mode(pv, cam, args, log=print):
     # lighting problem it had caused itself. Wait for detections to come back.
     t0 = time.time()
     while time.time() - t0 < 20:
-        raw = await sample(pv, cam, args, 1.0, args.reference_tag)
+        raw = await sample(pv, cam, args, 1.0)
         if raw["tags"] and (sum(raw["tags"]) / len(raw["tags"])) > 0:
             log("   detections resumed %.0f s after the mode change" % (time.time() - t0))
             break
@@ -926,10 +893,6 @@ PROBLEMS = {
     "over_blur_budget": (WARN,
         lambda v: "%.1f px of motion blur, over the budget - fine on a bench, "
                   "smeared on a moving robot. Add light, or raise --max-gain." % v),
-    "range_warning": (WARN,
-        lambda v: "reference tag: %s"
-                  % (("measured %.2f m against a stated %.2f m"
-                      % (v["measured"], v["stated"])) if isinstance(v, dict) else v)),
     "fellback": (WARN,
         lambda v: "the chosen exposure failed its own verification; fell back to "
                   "the shortest exposure that had already passed"),
@@ -1176,8 +1139,7 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
         if base_exposure > 0:
             await pv.set_setting(unique, cameraExposureRaw=base_exposure)
             await asyncio.sleep(args.settle)
-        base_raw = await sample(pv, cam, args, max(1.5, args.dwell * 0.6),
-                                args.reference_tag, mark0)
+        base_raw = await sample(pv, cam, args, max(1.5, args.dwell * 0.6), mark0)
         base_tags = (sum(base_raw["tags"]) / len(base_raw["tags"])) if base_raw["tags"] else 0.0
         log("   baseline: at its current %.0f the camera sees %.2f tags"
             % (base_exposure, base_tags))
@@ -1205,7 +1167,7 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
             mark = capture_mark(args, cam)
             await pv.set_setting(unique, cameraExposureRaw=float(exposure))
             await asyncio.sleep(args.settle)
-            raw = await sample(pv, cam, args, args.dwell, args.reference_tag, mark)
+            raw = await sample(pv, cam, args, args.dwell, mark)
 
             s = Sample(exposure)
             s.frames = raw["frames"]
@@ -1213,12 +1175,10 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
             s.reproj = raw["reproj"]
             s.tag_counts = raw["tags"]
             s.ambiguities = raw["amb"]
-            s.ref_seen = raw["ref_seen"]
-            s.ref_ranges = raw["ref_ranges"]
             samples.append(s)
-            ok = s.passes(args.min_tags, args.max_ambiguity, args.reference_tag)
+            ok = s.passes(args.min_tags, args.max_ambiguity)
             mark = "ok " if ok else "   "
-            log("   %s exposure %8.0f   %s" % (mark, exposure, s.summary(args.reference_tag)))
+            log("   %s exposure %8.0f   %s" % (mark, exposure, s.summary()))
 
             # Overexposure is monotonic: once the image is too bright to detect a
             # tag, every LONGER exposure is worse. The sweep climbs, so a run of
@@ -1230,8 +1190,8 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
             # never fires and the sweep runs to the top anyway.
             if not ok:
                 blanks += 1
-                if blanks >= 2 and any(x.passes(args.min_tags, args.max_ambiguity,
-                                                args.reference_tag) for x in samples):
+                if blanks >= 2 and any(x.passes(args.min_tags, args.max_ambiguity)
+                                       for x in samples):
                     skipped = len(sweep) - step_i - 1
                     if skipped > 0:
                         log("   (stopping: 2 failed steps, %d longer exposure%s skipped "
@@ -1245,34 +1205,10 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
             {"exposure": s.exposure, "frames": s.frames, "solve_rate": s.solve_rate,
              "mean_tags": s.mean_tags, "med_reproj": s.med_reproj,
              "med_ambiguity": s.med_ambiguity,
-             "ref_rate": s.ref_rate, "ref_range": s.ref_range,
-             "passes": s.passes(args.min_tags, args.max_ambiguity, args.reference_tag)}
+             "passes": s.passes(args.min_tags, args.max_ambiguity)}
             for s in samples
         ]
 
-        # Sanity-check the held tag really is at the distance the string says.
-        if args.reference_tag is not None and args.reference_range:
-            seen = [s for s in samples if s.ref_range]
-            if seen:
-                measured = _median([s.ref_range for s in seen])
-                ratio = measured / args.reference_range
-                log("   reference tag %d measured at %.2f m (string says %.2f m)"
-                    % (args.reference_tag, measured, args.reference_range))
-                if not 0.8 <= ratio <= 1.25:
-                    log("   WARNING: measured range is %.0f%% of the stated range."
-                        % (100 * ratio))
-                    log("            Tuning at the wrong distance biases exposure badly -")
-                    log("            too close under-exposes you for real field tags.")
-                    note_problem(result, "range_warning",
-                                 {"measured": measured,
-                                  "stated": args.reference_range})
-            else:
-                log("   WARNING: reference tag %d never seen at any exposure." % args.reference_tag)
-                note_problem(result, "range_warning", "never detected")
-
-        # A single held tag is detected at shorter exposures than a full multi-tag
-        # solve needs, so held-card mode measures a LOWER cliff than field
-        # conditions require. Carry extra margin to compensate.
         contra = baseline_contradiction(samples, base_exposure, base_tags)
         if contra:
             log("   *** SWEEP CONTRADICTS THE CAMERA'S OWN STARTING STATE - NOT APPLYING ***")
@@ -1305,13 +1241,8 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
             return result
 
         bias = args.bias
-        if args.reference_tag is not None:
-            bias *= args.reference_bias
-            log("   held-card mode: bias %.2f x %.2f = %.2f (single-tag detection is "
-                "easier than a multi-tag solve)" % (args.bias, args.reference_bias, bias))
         chosen, shortest, cliff, tag_target = choose_exposure(
-            samples, bias, args.min_tags, args.max_ambiguity, args.reference_tag,
-            args.tag_fraction)
+            samples, bias, args.min_tags, args.max_ambiguity, args.tag_fraction)
         if tag_target:
             log("   best exposure saw %.2f tags - requiring >= %.2f (%.0f%%)"
                 % (max(s.mean_tags for s in samples), tag_target, 100*args.tag_fraction))
@@ -1419,17 +1350,16 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
             await pv.set_setting(unique, cameraExposureRaw=float(chosen), cameraGain=gain,
                                  cameraAutoExposure=False)
             await asyncio.sleep(args.settle)
-            raw = await sample(pv, cam, args, args.dwell, args.reference_tag, mark)
+            raw = await sample(pv, cam, args, args.dwell, mark)
             check = Sample(chosen)
             check.frames = raw["frames"]; check.multitag_solves = raw["solves"]
             check.reproj = raw["reproj"]; check.tag_counts = raw["tags"]
             check.ambiguities = raw["amb"]
-            check.ref_seen = raw["ref_seen"]; check.ref_ranges = raw["ref_ranges"]
-            if check.passes(args.min_tags, args.max_ambiguity, args.reference_tag):
-                log("   applied %.0f - verified: %s" % (chosen, check.summary(args.reference_tag)))
+            if check.passes(args.min_tags, args.max_ambiguity):
+                log("   applied %.0f - verified: %s" % (chosen, check.summary()))
                 result["applied"] = chosen
             else:
-                log("   %.0f FAILED verification (%s)" % (chosen, check.summary(args.reference_tag)))
+                log("   %.0f FAILED verification (%s)" % (chosen, check.summary()))
                 log("   falling back to shortest verified pass: %.0f" % shortest.exposure)
                 await pv.set_setting(unique, cameraExposureRaw=float(shortest.exposure))
                 await asyncio.sleep(args.settle)
@@ -1470,76 +1400,6 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
         return result
 
 
-async def calibrate_reference_bias(args, log=print):
-    """Measure YOUR reference-bias by running both modes back to back.
-
-    A single held tag is an easier detection problem than a full multi-tag solve,
-    so held-card mode measures a lower cliff than field conditions require. The
-    ratio is NOT a universal constant - it depends on how many field tags your
-    camera sees and how far away the hardest one is - so it has to be measured
-    per camera, once, with representative tags in view.
-    """
-    if args.reference_tag is None:
-        sys.exit("--calibrate-reference-bias needs --reference-tag (the card you will hold)")
-
-    held_tag, held_range = args.reference_tag, args.reference_range
-    dry, bias_in = args.dry_run, args.reference_bias
-    args.dry_run = True          # never disturb the camera's settings while calibrating
-    args.reference_bias = 1.0    # measure the raw cliffs, unbiased
-
-    log("=" * 66)
-    log("STEP 1/2  held card - hold tag %d steady%s" % (
-        held_tag, (" at %.2f m" % held_range) if held_range else ""))
-    log("=" * 66)
-    held = await run(args, log=log)
-
-    log("")
-    log("=" * 66)
-    log("STEP 2/2  field tags - you can put the card down now")
-    log("=" * 66)
-    args.reference_tag, args.reference_range = None, None
-    field = await run(args, log=log)
-
-    args.dry_run, args.reference_bias = dry, bias_in
-    args.reference_tag, args.reference_range = held_tag, held_range
-
-    log("")
-    log("=" * 66)
-    log("RESULT")
-    log("=" * 66)
-    by_name = {r["camera"]: r for r in field}
-    out = []
-    for h in held:
-        f = by_name.get(h["camera"])
-        hc, fc = h.get("cliff"), (f or {}).get("cliff")
-        if not hc or not fc:
-            log("  %-14s could not measure both modes - skipped" % h["camera"])
-            continue
-        ratio = fc / hc
-        out.append((h["camera"], hc, fc, ratio))
-        log("  %-14s held-card cliff %7.0f   field cliff %7.0f   ratio %.2f"
-            % (h["camera"], hc, fc, ratio))
-        if ratio < 1.0:
-            log("     SUSPECT: the held card needed MORE exposure than the field tags.")
-            log("     A single close tag should be EASIER, so this usually means the card")
-            log("     was not presented consistently - drooping, tilted, glare, or moved")
-            log("     mid-sweep. Re-run holding it square and steady, or tape it up.")
-    if not out:
-        log("  nothing measured. Are field tags visible, and was the card held throughout?")
-        return out
-    worst = max(r for _, _, _, r in out)
-    log("")
-    if len(out) > 1:
-        log("  Cameras differ; using the largest ratio so no camera is under-exposed.")
-    log("  Put this in your systemd unit / command line:")
-    log("")
-    log("      --reference-bias %.2f" % worst)
-    log("")
-    log("  Valid while your camera geometry stays similar. Re-measure if you move")
-    log("  or re-aim a camera, or if the tags you rely on change distance.")
-    return out
-
-
 async def _gain_trial(pv, cam, args, gain, exposure, settle_extra=0.0):
     """Detection quality at ONE gain, with the exposure held where it is."""
     mark = capture_mark(args, cam)
@@ -1547,15 +1407,13 @@ async def _gain_trial(pv, cam, args, gain, exposure, settle_extra=0.0):
                          cameraGain=int(round(gain)),
                          cameraExposureRaw=float(exposure))
     await asyncio.sleep(args.settle + settle_extra)
-    raw = await sample(pv, cam, args, args.dwell, args.reference_tag, mark)
+    raw = await sample(pv, cam, args, args.dwell, mark)
     s = Sample(exposure)
     s.frames = raw["frames"]
     s.multitag_solves = raw["solves"]
     s.reproj = raw["reproj"]
     s.tag_counts = raw["tags"]
     s.ambiguities = raw["amb"]
-    s.ref_seen = raw["ref_seen"]
-    s.ref_ranges = raw["ref_ranges"]
     return s
 
 
@@ -1655,7 +1513,7 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
                          % (type(exc).__name__, len(gains) - i))
             break
         measured.append((gv, s))
-        log("       gain %-5d  %s" % (gv, s.summary(args.reference_tag)))
+        log("       gain %-5d  %s" % (gv, s.summary()))
 
     # The SAME tag-count floor the exposure sweep applies, for the same reason.
     # The scan used to pass no tag_target at all, so a gain that had started
@@ -1668,7 +1526,7 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
     # from the sweep's own best, so the two halves of the tune judge alike.
     best_tags = max((s.mean_tags for _g, s in measured), default=0.0)
     tag_target = (best_tags * args.tag_fraction
-                  if (best_tags >= 2 and args.reference_tag is None) else None)
+                  if best_tags >= 2 else None)
     if tag_target:
         log("   best gain saw %.2f tags - requiring >= %.2f (%.0f%%) of every "
             "other gain" % (best_tags, tag_target, 100 * args.tag_fraction))
@@ -1676,8 +1534,7 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
     trials = []
     reasons = {}
     for gv, s in measured:
-        why = s.why_failed(args.min_tags, args.max_ambiguity, args.reference_tag,
-                           tag_target)
+        why = s.why_failed(args.min_tags, args.max_ambiguity, tag_target)
         trials.append((gv, s.med_reproj if why is None else None, s))
         if why is not None:
             reasons[gv] = why
@@ -1726,14 +1583,14 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
                              "%s during the repeat that measures the noise"
                              % type(exc).__name__)
                 break
-            if again.passes(args.min_tags, args.max_ambiguity, args.reference_tag,
+            if again.passes(args.min_tags, args.max_ambiguity,
                             tag_target) and again.med_reproj:
                 repeats.append(again.med_reproj)
             else:
                 # A repeat that no longer passes is not a missing measurement,
                 # it is evidence the leader is not repeatable. Say so.
                 log("   repeat %d of gain %d did NOT pass this time (%s)"
-                    % (k + 1, leader[0], again.summary(args.reference_tag)))
+                    % (k + 1, leader[0], again.summary()))
     if len(repeats) > 1:
         log("   gain %d repeated %d times: %s - %.0f%% spread AT THE DECIDING "
             "POINT" % (leader[0], len(repeats),
@@ -2160,11 +2017,6 @@ async def _tune_all(pv, cams, outer_args, log, progress, on_camera, results):
                     await verify_final_state(pv, cam, rec, args, log)
                     results.append(rec)
                     continue
-            # Held-card mode: the card is only visible to one camera at a time,
-            # so give whoever is holding it a chance to move before we sweep.
-            if args.reference_tag is not None and idx > 0 and args.move_pause > 0:
-                log("   move the card to '%s' - %.0fs" % (cam["nickname"], args.move_pause))
-                await asyncio.sleep(args.move_pause)
             merge_failures(rec, await tune_camera(pv, cam, args, log,
                                                   cam_progress, carry=rec))
             await verify_final_state(pv, cam, rec, args, log)
@@ -2332,7 +2184,7 @@ class NTResults:
             time.sleep(0.1)
         return False
 
-    def collect(self, seconds, ref_tag=None, after_capture=None, min_frames=0,
+    def collect(self, seconds, after_capture=None, min_frames=0,
                 extend=SAMPLE_EXTEND_S):
         """after_capture: discard frames CAPTURED at or before this timestamp.
 
@@ -2344,7 +2196,7 @@ class NTResults:
         timestamps are stamped at the sensor, so gating on them is exact.
         """
         out = {"frames": 0, "solves": 0, "reproj": [], "tags": [], "amb": [],
-               "ref_seen": 0, "ref_ranges": [], "stale_dropped": 0}
+               "stale_dropped": 0}
         seen = set()
         end = time.time() + seconds
         # Keep ONE dedupe set across the extension rather than calling collect
@@ -2373,12 +2225,6 @@ class NTResults:
                     out["tags"].append(len(targets))
                     for t in targets:
                         out["amb"].append(getattr(t, "poseAmbiguity", -1))
-                        if ref_tag is not None and int(getattr(t, "fiducialId", -1)) == ref_tag:
-                            out["ref_seen"] += 1
-                            p = getattr(t, "bestCameraToTarget", None)
-                            if p is not None:
-                                out["ref_ranges"].append(
-                                    math.sqrt(p.X() ** 2 + p.Y() ** 2 + p.Z() ** 2))
                     mt = getattr(r, "multitagResult", None)
                     if mt is not None and hasattr(mt, "isPresent"):
                         mt = mt.get() if mt.isPresent() else None
@@ -2592,23 +2438,14 @@ async def daemon(args, log=print):
     progress_e = tbl.getEntry("progress")    # <- 0..1, for a progress bar
     heartbeat = tbl.getEntry("heartbeat")    # <- proves the service is alive
     result_entry = tbl.getEntry("result")    # full JSON
-    # Held-card mode, settable from the dashboard before pressing run.
-    ref_tag_e = tbl.getEntry("referenceTag")      # tag ID, -1 = off (use field tags)
-    ref_range_e = tbl.getEntry("referenceRange")  # string length, metres
-    hold_e = tbl.getEntry("holdCard")             # <- true while you must hold it steady
-    hold_for_e = tbl.getEntry("holdFor")          # <- WHICH camera to hold it in front of
     camera_e = tbl.getEntry("camera")             # <- camera being tuned, "2 of 3"
     # Automatic tune shortly after boot, so nobody has to remember to press run.
     boot_ran = tbl.getEntry("bootTuneRan")        # <- did the automatic run happen at all
     boot_ok = tbl.getEntry("bootTuneOk")          # <- did it succeed
     boot_sum = tbl.getEntry("bootTuneSummary")    # <- what it did, or why it did not
-    ref_tag_e.setDefaultDouble(-1 if args.reference_tag is None else args.reference_tag)
-    ref_range_e.setDefaultDouble(args.reference_range or 0.0)
-    hold_e.setBoolean(False)
     status.setString("idle")
     summary.setString("never run")
     warnings_e.setString("")
-    hold_e.setBoolean(False)
     busy.setBoolean(False)
     ok_entry.setBoolean(False)
     progress_e.setDouble(0.0)
@@ -2664,39 +2501,18 @@ async def daemon(args, log=print):
                     boot_ran.setBoolean(False); boot_ok.setBoolean(False)
                     boot_sum.setString("skipped: robot was enabled at boot")
             else:
-                # Read held-card settings written by the dashboard.
-                nt_tag = int(ref_tag_e.getDouble(-1))
-                nt_range = ref_range_e.getDouble(0.0)
-                args.reference_tag = nt_tag if nt_tag >= 0 else None
-                args.reference_range = nt_range if nt_range > 0 else None
-
                 run_ok = {"value": False, "summary": ""}
                 busy.setBoolean(True)
                 warnings_e.setString("")
                 ok_entry.setBoolean(False)
                 progress_e.setDouble(0.0)
-                if args.reference_tag is not None:
-                    hold_e.setBoolean(True)
-                    msg = ("HOLD tag %d steady at %.2f m" % (args.reference_tag, args.reference_range)
-                           if args.reference_range else
-                           "HOLD tag %d steady" % args.reference_tag)
-                    status.setString(msg)
-                    summary.setString(msg)
-                    log(msg)
-                else:
-                    status.setString("tuning on field tags...")
-                    summary.setString("running...")
+                status.setString("tuning on the tags in view...")
+                summary.setString("running...")
                 lines = []
                 def cap(msg):
                     lines.append(str(msg)); log(msg); status.setString(str(msg)[:120])
                 def announce(nick, idx, total):
                     camera_e.setString("%s (%d of %d)" % (nick, idx + 1, total))
-                    if args.reference_tag is not None:
-                        hold_for_e.setString(nick)
-                        note = "HOLD tag %d in front of %s" % (args.reference_tag, nick)
-                        if args.reference_range:
-                            note += " at %.2f m" % args.reference_range
-                        status.setString(note); summary.setString(note); cap(note)
 
                 try:
                     res = await run(args, log=cap, progress=lambda f: progress_e.setDouble(f),
@@ -2760,8 +2576,6 @@ async def daemon(args, log=print):
                     except Exception as rexc:
                         log("restore replay failed: %s" % rexc)
                     busy.setBoolean(False)
-                    hold_e.setBoolean(False)
-                    hold_for_e.setString("")
                     camera_e.setString("")
                     run_entry.setBoolean(False)
                     if boot_fire:
@@ -2844,18 +2658,6 @@ def build_parser():
                    help="require at least this fraction of the tags the best exposure "
                         "in the sweep saw (default 0.85); 0 disables")
     p.add_argument("--fx", type=float, default=1105.9, help="focal length in px, for the blur estimate")
-    p.add_argument("--reference-tag", type=int, default=None,
-                   help="tag ID held in front of the camera; score on its detection rate")
-    p.add_argument("--reference-bias", type=float, default=1.6,
-                   help="extra margin in held-card mode; a single tag is detected at "
-                        "shorter exposures than a multi-tag solve needs (default 1.6)")
-    p.add_argument("--move-pause", type=float, default=8.0,
-                   help="seconds to move the held card between cameras (held-card mode)")
-    p.add_argument("--reference-range", type=float, default=None,
-                   help="string length in metres - the tool verifies the tag really is there")
-    p.add_argument("--calibrate-reference-bias", action="store_true",
-                   help="measure YOUR held-card vs field-tag ratio (needs --reference-tag "
-                        "and representative field tags in view). Changes no settings.")
     p.add_argument("--dry-run", action="store_true", help="measure and report, change nothing")
     p.add_argument("--json", action="store_true", help="emit JSON results")
     p.add_argument("--daemon", action="store_true", help="NT-triggered service mode")
@@ -2983,12 +2785,6 @@ def main():
         args.settle = min(args.settle, 0.5)
     if args.min_exposure <= 0 or args.max_exposure <= args.min_exposure:
         sys.exit("--max-exposure must exceed --min-exposure, both > 0")
-    if args.calibrate_reference_bias:
-        try:
-            asyncio.run(calibrate_reference_bias(args))
-        except (AlreadyRunning, ConnectionError, LookupError) as exc:
-            sys.exit("photontune: %s" % exc)
-        return
     if args.daemon:
         try:
             try:
