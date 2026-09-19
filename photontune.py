@@ -1158,7 +1158,28 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
         # What is the camera doing RIGHT NOW, before we touch the exposure? Used
         # afterwards to tell a bad measurement from a genuine detection cliff.
         base_exposure = float(original.get("cameraExposureRaw") or 0.0)
-        base_raw = await sample(pv, cam, args, max(1.5, args.dwell * 0.6), args.reference_tag)
+        # Measure the baseline AT the baseline exposure, rather than wherever the
+        # camera happens to be sitting.
+        #
+        # On a gain escalation this function re-enters with the camera parked at
+        # the LAST exposure the previous sweep tested - 25000 us - while this
+        # line goes on to claim it measured "its current 1500". base_tags then
+        # described a state the camera was not in, and baseline_contradiction()
+        # compared the new sweep against it and aborted the tune.
+        #
+        # FORCED on this rig with --no-optimise-gain: camera OV9281 escalated
+        # gain 0 -> 10, re-entered with the camera at 25000 us, logged "at its
+        # current 1500 the camera sees 4.00 tags", and then failed the whole
+        # camera with "sweep contradicts baseline (2871 saw 0.00 tags vs 4.00 at
+        # 1500)". Reproduced identically on the previous revision, so it is not
+        # a regression - it is the same class as the read-backs in D6: a number
+        # recorded against a state that was never true.
+        mark0 = capture_mark(args, cam)
+        if base_exposure > 0:
+            await pv.set_setting(unique, cameraExposureRaw=base_exposure)
+            await asyncio.sleep(args.settle)
+        base_raw = await sample(pv, cam, args, max(1.5, args.dwell * 0.6),
+                                args.reference_tag, mark0)
         base_tags = (sum(base_raw["tags"]) / len(base_raw["tags"])) if base_raw["tags"] else 0.0
         log("   baseline: at its current %.0f the camera sees %.2f tags"
             % (base_exposure, base_tags))
