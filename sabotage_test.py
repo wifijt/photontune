@@ -62,17 +62,65 @@ TUNED = {
 
 # ───────────────────── the verdict matrix (no hardware) ─────────────────────
 #
-# One sample value per registered problem. The test asserts three things:
+# One sample value per registered problem, and - INDEPENDENTLY - the severity
+# each one is expected to carry. The test asserts four things:
 #   1. every key in photontune.PROBLEMS has a case here - a new problem cannot
 #      be added without deciding what it does to the exit code;
-#   2. a HARD key makes the real main() exit 1, a WARN key exits 0;
-#   3. the text of every problem appears in the output. "Nothing the tool
+#   2. the severity photontune declares for a key MATCHES the one written
+#      down here;
+#   3. a key expected HARD makes the real main() exit 1, a key expected WARN
+#      exits 0;
+#   4. the text of every problem appears in the output. "Nothing the tool
 #      detected may vanish" is the actual requirement, and an exit code alone
 #      does not check it.
 #
+# 2 is the whole point of MATRIX_SEVERITY existing, and it is the thing this
+# test did not do. `want` used to be derived from pt.PROBLEMS[key][0], which
+# is the table under test - so the matrix validated the table against itself.
+# An auditor flipped apply_mismatch from HARD to WARN and the matrix reported
+# "all 14 cases correct". The historical bug it was built to catch - the tool
+# printing "*** MISMATCH ***" on its own write and exiting 0 - would have
+# passed it. A severity written down in the test, by hand, is the only kind
+# that can disagree with the code.
+#
+# So: to move a problem between HARD and WARN you have to change this file
+# too, deliberately, and the diff says which way it went.
+#
 # It runs the REAL main() in a subprocess with run() stubbed out, so what is
-# asserted is the process exit status, not a helper's return value. Six failure
-# modes used to be recorded and then exit 0.
+# asserted is the process exit status, not a helper's return value. Six
+# failure modes used to be recorded and then exit 0.
+HARD, WARN = "hard", "warn"
+
+MATRIX_SEVERITY = {
+    "baseline_failed":        HARD,
+    "baseline_unconfirmed":   HARD,
+    "setting_rejected":       HARD,
+    "unverified":             HARD,
+    "calibration_problem":    HARD,
+    "apply_mismatch":         HARD,
+    "apply_unconfirmed":      HARD,
+    "final_state_wrong":      HARD,
+    "search_error":           HARD,
+    "no_workable_settings":   HARD,
+    "robot_enabled_midrun":   HARD,
+    "applied_point_failed":   HARD,
+    # Motion blur is the one physical constraint in the design and the
+    # exposure is not searched for, it IS the budget - so exceeding it is a
+    # failure to do the only thing the tool promises. It was WARN, and a
+    # camera at 26x the budget exited 0.
+    "over_blur_budget":       HARD,
+    # The tune stands; a human has to be told the camera is no longer on the
+    # resolution they chose.
+    "video_mode_switched":    WARN,
+    # The tune stands; the robot-enabled guard could not be consulted, which
+    # a human has to know because the safety argument rests on it.
+    "robot_state_unknown":    WARN,
+    # The bar the walk compares against did not itself pass. The walk falls
+    # back to its own rate gate, which still has to be met, so the answer is
+    # defensible - but the reference is the thing the tune is built on.
+    "reference_unusable":     WARN,
+}
+
 MATRIX_VALUES = {
     "baseline_failed":        ("camera", [["cameraBrightness", "40", "5"]]),
     "baseline_unconfirmed":   ("camera", "no cameraSettings for 12 s"),
@@ -87,6 +135,11 @@ MATRIX_VALUES = {
     "robot_enabled_midrun":   ("camera", "walking gain at 40"),
     "video_mode_switched":    ("camera", [0, 1]),
     "over_blur_budget":       ("camera", 17.9),
+    "applied_point_failed":   ("camera", {"gain": 40, "exposure": 863.5,
+                                          "why": "multi-tag solved in 41% of "
+                                                 "36 frames"}),
+    "robot_state_unknown":    ("camera", "no NetworkTables server is reachable"),
+    "reference_unusable":     ("camera", "multi-tag solved in 4% of 45 frames"),
 }
 
 _CHILD = r'''
@@ -245,58 +298,100 @@ def gain_walk_replay(src_dir):
 # stubbed out, and require a clean exit with no traceback. This test does NOT
 # reproduce a bug that ever reached a commit; it closes the path that let one
 # get close.
+# (argv, expected exit, a string the output MUST contain, a string it must NOT)
+#
+# The record the stub returns now DEPENDS ON THE FLAGS, which it did not.
+# It always carried applied: 864.0, so main() always took the
+# `if r.get("applied")` branch - and the two --baseline-only cases printed
+# "CAM exposure -> 864, gain 40", which is nonsense for a mode that by design
+# never applies an exposure. The baseline-only summary branch and the
+# `"baseline only" not in error` clause in tune_failed were never executed by
+# anything, in a file whose whole purpose is that every path is executed by
+# something. The must-contain column is what stops that coming back: an exit
+# code alone could not tell the two branches apart, because both are 0.
 CLI_CASES = [
-    ([], 0),
-    (["--json"], 0),
-    (["--baseline-only"], 0),
-    (["--baseline-only", "--json"], 0),
-    (["--no-baseline"], 0),
-    (["--no-nt"], 0),
-    (["--brightness", "55"], 0),
-    (["--cameras", "CAM"], 0),
-    (["--max-blur-px", "3", "--blur-rate", "270"], 0),
-    (["--max-gain", "60"], 0),
-    (["--dwell", "2", "--settle", "0.4"], 0),
-    (["--nt-server", "10.0.0.2"], 0),
-    (["--max-blur-px", "0"], 1),      # the budget IS the exposure; 0 is refused
-    (["--blur-rate", "-1"], 1),
+    ([], 0, "exposure -> 864", None),
+    (["--json"], 0, '"applied": 864.0', None),
+    (["--baseline-only"], 0, "baseline asserted (1 changed)", "exposure ->"),
+    (["--baseline-only", "--json"], 0, '"applied": null', None),
+    (["--no-baseline"], 0, "exposure -> 864", None),
+    (["--no-nt"], 0, "exposure -> 864", None),
+    (["--brightness", "55"], 0, "exposure -> 864", None),
+    (["--cameras", "CAM"], 0, "exposure -> 864", None),
+    (["--max-blur-px", "3", "--blur-rate", "270"], 0, "exposure -> 864", None),
+    (["--max-gain", "60"], 0, "exposure -> 864", None),
+    (["--dwell", "2", "--settle", "0.4"], 0, "exposure -> 864", None),
+    (["--nt-server", "10.0.0.2"], 0, "exposure -> 864", None),
+    (["--max-blur-px", "0"], 1, None, None),  # the budget IS the exposure
+    (["--blur-rate", "-1"], 1, None, None),
+    # --baseline-only with a real failure recorded. This is the
+    # `"baseline only" not in error` clause in tune_failed(): the benign
+    # "baseline only - not tuned" error must not be read as a failure, and
+    # anything else must. Both directions, because a clause that always
+    # answers the same way is not a clause.
+    (["--baseline-only", "--fail"], 1, "FAILED CAM", None),
 ]
 
 _CLI_CHILD = r'''
 import sys
 sys.path.insert(0, sys.argv[1])
 import photontune as pt
-rec = {"camera": "CAM", "uniqueName": "u", "applied": 864.0, "gain": 40,
+argv = sys.argv[2:]
+fail = "--fail" in argv
+argv = [a for a in argv if a != "--fail"]
+baseline_only = "--baseline-only" in argv
+
+# The stub answers the way the REAL tune_camera answers for these flags.
+# --baseline-only never sets `applied` - that is the whole shape of the mode -
+# and it leaves the benign "baseline only - not tuned" in `error`.
+rec = {"camera": "CAM", "uniqueName": "u", "gain": None, "applied": None,
        "baseline_changed": ["cameraBrightness"], "trials": []}
+if baseline_only:
+    rec["error"] = "baseline only - not tuned"
+    if fail:
+        # A baseline that did not take. HARD, and it must survive the
+        # baseline-only branch rather than being excused by it.
+        pt.note_problem(rec, "baseline_failed", [["cameraBrightness", "40", "5"]])
+        rec["error"] = "structural settings did not take"
+else:
+    rec["applied"] = 864.0
+    rec["gain"] = 40
+
 async def fake_run(cfg, log=print, progress=None, on_camera=None):
     return [rec]
 pt.run = fake_run
-sys.argv = ["photontune.py", "--host", "127.0.0.1"] + sys.argv[2:]
+sys.argv = ["photontune.py", "--host", "127.0.0.1"] + argv
 pt.main()
 '''
 
 
 def cli_smoke(src_dir):
-    print("=" * 70)
+    print("=" * 78)
     print("CLI PATHS  - the real main(), every flag combination, run() stubbed")
-    print("=" * 70)
+    print("=" * 78)
     bad = 0
-    print("%-42s %-5s %-5s %s" % ("arguments", "want", "got", "clean"))
-    print("-" * 70)
-    for argv, want in CLI_CASES:
+    print("%-42s %-5s %-5s %-6s %s"
+          % ("arguments", "want", "got", "clean", "output"))
+    print("-" * 78)
+    for argv, want, must, must_not in CLI_CASES:
         proc = subprocess.run(
             [sys.executable, "-c", _CLI_CHILD, src_dir] + argv,
             capture_output=True, text=True, timeout=120)
         out = proc.stdout + proc.stderr
         clean = "Traceback" not in out
-        ok = clean and proc.returncode == want
+        said = (must is None or must in out) and \
+               (must_not is None or must_not not in out)
+        ok = clean and said and proc.returncode == want
         bad += 0 if ok else 1
-        print("%-42s %-5d %-5d %s%s"
+        print("%-42s %-5d %-5d %-6s %s%s"
               % (" ".join(argv) or "(no flags)", want, proc.returncode,
-                 "yes" if clean else "NO", "" if ok else "   <-- WRONG"))
+                 "yes" if clean else "NO",
+                 "ok" if said else ("MISSING %r" % must if must and must not in out
+                                    else "SAID %r" % must_not),
+                 "" if ok else "   <-- WRONG"))
         if not ok:
             print("      %s" % out.strip().replace("\n", " | ")[:300])
-    print("=" * 70)
+    print("=" * 78)
     print("cli paths: %s"
           % ("all %d correct" % len(CLI_CASES) if not bad else "%d WRONG" % bad))
     return 1 if bad else 0
@@ -368,14 +463,32 @@ def verdict_matrix(src_dir):
     if extra:
         print("  !! matrix cases for unregistered keys: %s" % sorted(extra))
         bad += len(extra)
+    if set(MATRIX_SEVERITY) != set(MATRIX_VALUES):
+        print("  !! MATRIX_SEVERITY and MATRIX_VALUES disagree about which "
+              "keys exist: %s"
+              % sorted(set(MATRIX_SEVERITY) ^ set(MATRIX_VALUES)))
+        bad += 1
 
-    cases = [(k, pt.PROBLEMS[k][0], MATRIX_VALUES[k][0], MATRIX_VALUES[k][1])
-             for k in sorted(set(pt.PROBLEMS) & set(MATRIX_VALUES))]
+    # The severity comes from THIS FILE, not from pt.PROBLEMS. Deriving it
+    # from the table under test is what let a HARD -> WARN downgrade report
+    # "all 14 cases correct".
+    for key in sorted(set(pt.PROBLEMS) & set(MATRIX_SEVERITY)):
+        declared = pt.PROBLEMS[key][0]
+        if declared != MATRIX_SEVERITY[key]:
+            print("  !! %s is %s in photontune.PROBLEMS but this test expects "
+                  "%s. A severity change is a deliberate decision: change it "
+                  "here too, and say why in the commit."
+                  % (key, declared.upper(), MATRIX_SEVERITY[key].upper()))
+            bad += 1
+
+    cases = [(k, MATRIX_SEVERITY[k], MATRIX_VALUES[k][0], MATRIX_VALUES[k][1])
+             for k in sorted(set(pt.PROBLEMS) & set(MATRIX_VALUES)
+                             & set(MATRIX_SEVERITY))]
     cases.append(("(nothing recorded)", "clean", "none", None))
     print("%-26s %-6s %-6s %-6s %s" % ("problem", "sev", "want", "got", "text surfaced"))
     print("-" * 66)
     for key, sev, mode, value in cases:
-        want = 1 if sev == pt.HARD else 0
+        want = 1 if sev == HARD else 0
         proc = subprocess.run(
             [sys.executable, "-c", _CHILD, src_dir, key, mode, json.dumps(value)],
             capture_output=True, text=True, timeout=120)
@@ -507,8 +620,19 @@ async def main_async(a):
         await asyncio.sleep(3)
         _, after_sab = await read_settings(a.host, a.port, nick)
         applied = [k for k in STRUCTURAL if not same(after_sab.get(k), STRUCTURAL[k][1])]
-        print("  sabotaged %d/%d settings (the rest already differed or were refused)\n"
-              % (len(applied), len(STRUCTURAL)))
+        refused = [k for k in STRUCTURAL if k not in applied]
+        print("  sabotaged %d/%d settings\n" % (len(applied), len(STRUCTURAL)))
+        # ASSERT it. This was a count and nothing read it: had PhotonVision
+        # refused all 15 writes the harness would have printed "0/15", found
+        # every setting already correct, marked all 15 SKIP and still reported
+        # a clean run. A repair test that passes when nothing was broken is
+        # not a test - it is the happy path wearing the costume of one.
+        results.append(("(sabotage applied)",
+                        "PASS" if not refused else "FAIL",
+                        "%d/%d" % (len(applied), len(STRUCTURAL)),
+                        "%d/%d" % (len(STRUCTURAL), len(STRUCTURAL)),
+                        "PhotonVision refused %s, so nothing below tests a "
+                        "repair of them" % ", ".join(refused)))
 
         t0 = time.time()
         cmd = a.photontune + ["--cameras", nick, "--baseline-only"]
