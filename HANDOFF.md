@@ -136,7 +136,7 @@ PhotonVision's NT server running, which that build started for itself:
 | the answer it gives | 1500 us at gain 80 and 100 - **10.4 px of blur, over its own budget**, and the two cameras disagree in the same room | 863/860 us at gain 40 on both - 6.0 px, inside budget |
 | baseline-only (the boot path) | ~131 s, a full tune | **8-10 s** |
 | six consecutive runs, two cameras | gain 60/80/60/80/100/100 on one camera | **the same gain twelve times out of twelve** |
-| `photontune.py` | 3229 lines | 2624 |
+| `photontune.py` | 3229 lines | 2642 |
 
 Deleted: the gain scan and its decision machinery, NT-server management,
 held-card mode, `--dry-run`, `baseline_contradiction`, sweep narrowing and gain
