@@ -705,7 +705,7 @@ def calibrated_modes(cam):
 async def ensure_calibrated_mode(pv, cam, args, log=print):
     """Move the camera onto a calibrated video mode if it is not on one.
 
-    Returns (cam, problem, would_switch). When a calibrated resolution EXISTS in
+    Returns (cam, problem). When a calibrated resolution EXISTS in
     videoFormatList but the active one is uncalibrated, switching to it is the
     difference between a tool that tells a human what to do and a tool that just
     works - which is the whole point of running unattended. Only refuses when no
@@ -717,11 +717,11 @@ async def ensure_calibrated_mode(pv, cam, args, log=print):
     """
     problem = calibration_problem(cam, assume_solvepnp=True)
     if not problem:
-        return cam, None, None
+        return cam, None
     options = calibrated_modes(cam)
     fmt = active_format(cam) or {}
     if not options:
-        return cam, problem, None
+        return cam, problem
     now_px = float(fmt.get("width") or 0) * float(fmt.get("height") or 0)
 
     def closeness(o):
@@ -737,21 +737,6 @@ async def ensure_calibrated_mode(pv, cam, args, log=print):
         "calibrated." % (idx, newfmt.get("width", 0), newfmt.get("height", 0)))
     log("   !! That is a real change to your pipeline, made deliberately: it is "
         "the difference between a camera that works and one that needs a human.")
-    if getattr(args, "dry_run", False):
-        # --dry-run changed the video mode anyway and left it changed. It is a
-        # PERMANENT change to which resolution the camera runs at, which is
-        # exactly the kind of thing the flag exists to promise it will not do.
-        was = (cam.get("settings") or {}).get("cameraVideoModeIndex")
-        log("   dry run - the mode switch above was NOT made.")
-        log("   With solvePNP on and no calibration for the mode it is actually "
-            "running, PhotonVision publishes nothing, so there is no honest "
-            "measurement to report for this camera without making the change.")
-        return cam, ("--dry-run: the active mode %gx%g has no calibration. "
-                     "Re-run without --dry-run to switch to video mode %d "
-                     "(%gx%g), which is calibrated."
-                     % (fmt.get("width", 0), fmt.get("height", 0), idx,
-                        newfmt.get("width", 0), newfmt.get("height", 0))), \
-               [was, int(idx)]
     bad = await pv.set_and_verify(cam["uniqueName"], settle=max(args.settle, 2.0),
                                   log=log, cameraVideoModeIndex=int(idx))
     fresh = await pv.cameras_fresh(timeout=8)
@@ -763,7 +748,7 @@ async def ensure_calibrated_mode(pv, cam, args, log=print):
     if problem:
         log("   !! the switch did not take (%s) - %s"
             % ([b for b in bad if b[0]] or "no rejection reported", problem))
-        return cam, problem, None
+        return cam, problem
     ci = (cal.get("cameraIntrinsics") or {})
     data = ci.get("data") or ci.get("dataValue") or []
     log("   now on a calibrated mode: %gx%g, fx %s"
@@ -785,7 +770,7 @@ async def ensure_calibrated_mode(pv, cam, args, log=print):
         log("   NOTE: no tags seen in the %.0f s after the mode change - "
             "continuing anyway, but the sweep below may be measuring a camera "
             "that is still restarting." % (time.time() - t0))
-    return cam, None, None
+    return cam, None
 
 
 def calibration_problem(cam, assume_solvepnp=False):
@@ -887,17 +872,12 @@ PROBLEMS = {
         lambda v: "VIDEO MODE CHANGED %s -> %s - this camera is now running a "
                   "different RESOLUTION than it was. It had no calibration for "
                   "the old one." % (v[0], v[1])),
-    "would_switch_video_mode": (WARN,
-        lambda v: "would switch the video mode %s -> %s (not done: --dry-run)"
-                  % (v[0], v[1])),
     "over_blur_budget": (WARN,
         lambda v: "%.1f px of motion blur, over the budget - fine on a bench, "
                   "smeared on a moving robot. Add light, or raise --max-gain." % v),
     "fellback": (WARN,
         lambda v: "the chosen exposure failed its own verification; fell back to "
                   "the shortest exposure that had already passed"),
-    "would_baseline": (WARN,
-        lambda v: "would change %s (not done: --dry-run)" % ", ".join(sorted(v))),
 }
 
 HARD_KEYS = tuple(k for k, (sev, _) in PROBLEMS.items() if sev == HARD)
@@ -971,11 +951,6 @@ def tune_failed(r, args=None):
         return True
     if getattr(args, "baseline_only", False):
         return bool(r.get("error")) and "baseline only" not in str(r.get("error"))
-    if getattr(args, "dry_run", False):
-        # --dry-run applies nothing by design, so `applied` cannot be the test.
-        # It used to skip the check altogether, which is how a dry run that
-        # measured nothing at all still exited 0.
-        return not r.get("would_apply")
     return not r.get("applied")
 
 
@@ -1055,10 +1030,8 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
         # Structural settings FIRST. Tuning exposure against a crushed brightness
         # just answers with a long, blurry exposure and calls it a success.
         if getattr(args, "baseline", True) and not skip_baseline:
-            _changed, _failed, _unconfirmed, _would_base = await assert_baseline(
+            _changed, _failed, _unconfirmed = await assert_baseline(
                 pv, cam, args, log)
-            if _would_base:
-                note_problem(result, "would_baseline", _would_base)
             if _changed:
                 fresh = await pv.cameras_fresh(timeout=8)
                 newer = next((c for c in fresh if c["uniqueName"] == unique), None)
@@ -1075,12 +1048,10 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
         # checking first meant the gate was blind on exactly the fresh camera it
         # exists for. Judge on what the camera will be, not what it was.
         _was = (cam.get("settings") or {}).get("cameraVideoModeIndex")
-        cam, problem, would_switch = await ensure_calibrated_mode(pv, cam, args, log)
+        cam, problem = await ensure_calibrated_mode(pv, cam, args, log)
         if (cam.get("settings") or {}).get("cameraVideoModeIndex") != _was:
             note_problem(result, "video_mode_switched",
                          [_was, cam["settings"].get("cameraVideoModeIndex")])
-        if would_switch:
-            note_problem(result, "would_switch_video_mode", would_switch)
         if problem:
             log("   !! CALIBRATION: %s" % problem)
             result["error"] = "no calibration for the active resolution"
@@ -1335,36 +1306,25 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
                 " to explore further, or add light.")
             note_problem(result, "over_blur_budget", round(predicted, 1))
 
-        if args.dry_run:
-            log("   dry run - would set exposure %.0f at gain %g; restoring original"
-                % (chosen, gain))
-            # Record the choice where the harvester looks. The gain search
-            # harvested on r["applied"], which dry-run never sets, so
-            # --optimise-gain --dry-run logged "no passing exposure" for every
-            # candidate while the suppressed trial log showed each one
-            # succeeding, then fell through to yet another full sweep.
-            result["would_apply"] = chosen
-            await pv.set_setting(unique, **original)
+        mark = capture_mark(args, cam)
+        await pv.set_setting(unique, cameraExposureRaw=float(chosen), cameraGain=gain,
+                             cameraAutoExposure=False)
+        await asyncio.sleep(args.settle)
+        raw = await sample(pv, cam, args, args.dwell, mark)
+        check = Sample(chosen)
+        check.frames = raw["frames"]; check.multitag_solves = raw["solves"]
+        check.reproj = raw["reproj"]; check.tag_counts = raw["tags"]
+        check.ambiguities = raw["amb"]
+        if check.passes(args.min_tags, args.max_ambiguity):
+            log("   applied %.0f - verified: %s" % (chosen, check.summary()))
+            result["applied"] = chosen
         else:
-            mark = capture_mark(args, cam)
-            await pv.set_setting(unique, cameraExposureRaw=float(chosen), cameraGain=gain,
-                                 cameraAutoExposure=False)
+            log("   %.0f FAILED verification (%s)" % (chosen, check.summary()))
+            log("   falling back to shortest verified pass: %.0f" % shortest.exposure)
+            await pv.set_setting(unique, cameraExposureRaw=float(shortest.exposure))
             await asyncio.sleep(args.settle)
-            raw = await sample(pv, cam, args, args.dwell, mark)
-            check = Sample(chosen)
-            check.frames = raw["frames"]; check.multitag_solves = raw["solves"]
-            check.reproj = raw["reproj"]; check.tag_counts = raw["tags"]
-            check.ambiguities = raw["amb"]
-            if check.passes(args.min_tags, args.max_ambiguity):
-                log("   applied %.0f - verified: %s" % (chosen, check.summary()))
-                result["applied"] = chosen
-            else:
-                log("   %.0f FAILED verification (%s)" % (chosen, check.summary()))
-                log("   falling back to shortest verified pass: %.0f" % shortest.exposure)
-                await pv.set_setting(unique, cameraExposureRaw=float(shortest.exposure))
-                await asyncio.sleep(args.settle)
-                result["applied"] = shortest.exposure
-                note_problem(result, "fellback", True)
+            result["applied"] = shortest.exposure
+            note_problem(result, "fellback", True)
         PENDING_RESTORE.pop(unique, None)
         return result
 
@@ -1466,7 +1426,7 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
         args.min_exposure, args.max_exposure, args.steps = saved_bounds
         args._gain_scan_follows = saved_follows
 
-    exposure = r.get("applied") or r.get("would_apply")
+    exposure = r.get("applied")
     if not exposure:
         return r                 # the sweep already said why, in the real log
 
@@ -1636,7 +1596,7 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
 
     # Explicitly apply the winner. The scan leaves whichever gain was tried LAST
     # on the camera - the repeat, in fact - which is the winner only by luck.
-    if not args.dry_run:
+    if True:
         # Guarded for the same reason as the trials: if the socket died during
         # the scan, the apply cannot succeed, and a traceback out of here loses
         # the whole run's result. PENDING_RESTORE is deliberately left in place
@@ -1691,14 +1651,6 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
         log("   applied gain %d / exposure %.0f - confirmed" % (pick[0], exposure))
         r["applied"] = exposure
         PENDING_RESTORE.pop(unique, None)
-    else:
-        log("   dry run - would set gain %d at exposure %.0f; restoring original"
-            % (pick[0], exposure))
-        r["would_apply"] = exposure
-        r["would_gain"] = pick[0]
-        await pv.set_setting(unique, **original)
-        await asyncio.sleep(0.4)
-        PENDING_RESTORE.pop(unique, None)
     if progress:
         progress(1.0)
     return r
@@ -1719,8 +1671,6 @@ async def verify_final_state(pv, cam, rec, args, log):
     is deliberately put back to the user's own settings, which legitimately do
     not match the baseline.
     """
-    if getattr(args, "dry_run", False):
-        return
     baseline_only = getattr(args, "baseline_only", False)
     if not rec.get("applied") and not baseline_only:
         return
@@ -1976,9 +1926,7 @@ async def _tune_all(pv, cams, outer_args, log, progress, on_camera, results):
                 # camera that was broken in a way the tool already knew how to fix,
                 # and the fix only landed afterwards in the fallback path.
                 if getattr(args, "baseline", True):
-                    _ch, _fl, _un, _wb = await assert_baseline(pv, cam, args, log)
-                    if _wb:
-                        note_problem(rec, "would_baseline", _wb)
+                    _ch, _fl, _un = await assert_baseline(pv, cam, args, log)
                     if _ch:
                         fresh = await pv.cameras_fresh(timeout=8)
                         newer = next((c for c in fresh
@@ -1998,12 +1946,10 @@ async def _tune_all(pv, cams, outer_args, log, progress, on_camera, results):
                 # AFTER the baseline, because the baseline is what turns solvePNP
                 # on, and the gate was silent while it was off.
                 was = (cam.get("settings") or {}).get("cameraVideoModeIndex")
-                cam, _prob, _would = await ensure_calibrated_mode(pv, cam, args, log)
+                cam, _prob = await ensure_calibrated_mode(pv, cam, args, log)
                 if (cam.get("settings") or {}).get("cameraVideoModeIndex") != was:
                     note_problem(rec, "video_mode_switched",
                                  [was, cam["settings"].get("cameraVideoModeIndex")])
-                if _would:
-                    note_problem(rec, "would_switch_video_mode", _would)
                 if _prob:
                     log("   !! CALIBRATION: %s" % _prob)
                     rec["error"] = "no calibration for the active resolution"
@@ -2341,12 +2287,7 @@ async def assert_baseline(pv, cam, args, log=print):
     """Put the structural settings where they must be, before tuning anything.
 
     Reports every change and its reason, so 'blindly applied' is visible rather
-    than implicit. Returns (changed, failed, unconfirmed, would_change).
-
-    Under --dry-run it writes NOTHING and returns what it would have changed.
-    It used to write regardless: seeded numIterations=222, decisionMargin=100,
-    cameraRedGain=50, a --dry-run left them at 40 / 35 / 0 - permanently. "Change
-    nothing" is the entire contract of the flag.
+    than implicit. Returns (changed, failed, unconfirmed).
     """
     unique = cam["uniqueName"]
     # send-form vs readback-form. PhotonVision accepts "DEG_0" and reports 0;
@@ -2371,16 +2312,12 @@ async def assert_baseline(pv, cam, args, log=print):
         todo[k] = v
     if not todo:
         log("   baseline: already correct")
-        return [], [], None, []
+        return [], [], None
 
     for k, v in todo.items():
         why = (BASELINE_ALWAYS.get(k) or BASELINE_DEFAULT.get(k))[2]
-        log("   baseline: %s %s -> %s%s"
-            % (k, live.get(k), v, "  (WOULD - dry run)" if args.dry_run else ""))
+        log("   baseline: %s %s -> %s" % (k, live.get(k), v))
         log("             %s" % why.split(". ")[0] + ".")
-    if getattr(args, "dry_run", False):
-        log("   dry run - the %d baseline change(s) above were NOT made." % len(todo))
-        return [], [], None, sorted(todo)
 
     await pv.set_setting(unique, **todo)
     # Poll, do not snapshot. A single look 1.5 s later saw a value that a
@@ -2400,7 +2337,7 @@ async def assert_baseline(pv, cam, args, log=print):
             failed.append((k, want, have))
             log("   !! baseline %s did NOT take (wanted %s, camera has %s)"
                 % (k, want, have))
-    return list(todo), failed, unconfirmed, []
+    return list(todo), failed, unconfirmed
 
 
 def robot_is_enabled(inst):
@@ -2658,7 +2595,6 @@ def build_parser():
                    help="require at least this fraction of the tags the best exposure "
                         "in the sweep saw (default 0.85); 0 disables")
     p.add_argument("--fx", type=float, default=1105.9, help="focal length in px, for the blur estimate")
-    p.add_argument("--dry-run", action="store_true", help="measure and report, change nothing")
     p.add_argument("--json", action="store_true", help="emit JSON results")
     p.add_argument("--daemon", action="store_true", help="NT-triggered service mode")
     p.add_argument("--nt-server", default=None, help="NT server host (daemon mode)")
@@ -2826,12 +2762,9 @@ def main():
                     print("  %-14s exposure -> %.0f, gain %s%s"
                           % (r["camera"], r["applied"], r.get("gain"),
                              "  (fallback)" if r.get("fellback") else ""))
-                elif r.get("would_apply"):
-                    print("  %-14s would set exposure -> %.0f, gain %s  (dry run)"
-                          % (r["camera"], r["would_apply"],
-                             r.get("would_gain", r.get("gain"))))
                 else:
-                    print("  %-14s unchanged (%s)" % (r["camera"], r.get("error", "dry run")))
+                    print("  %-14s unchanged (%s)"
+                          % (r["camera"], r.get("error", "nothing applied")))
             # Warnings are NOT failures and are NOT footnotes. A camera left on a
             # resolution nobody chose, or applied with 17.9 px of blur against a
             # 1 px budget, both used to exit 0 with nothing in the summary at all.

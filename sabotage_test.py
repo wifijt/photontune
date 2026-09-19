@@ -84,10 +84,8 @@ MATRIX_VALUES = {
     "final_state_wrong":      ("camera", [["cameraRedGain", 0, 50]]),
     "gain_scan_error":        ("camera", "ConnectionClosed, 4 candidates untried"),
     "video_mode_switched":    ("camera", [0, 1]),
-    "would_switch_video_mode": ("camera", [0, 1]),
     "over_blur_budget":       ("camera", 17.9),
     "fellback":               ("camera", True),
-    "would_baseline":         ("camera", ["numIterations", "decisionMargin"]),
 }
 
 _CHILD = r'''
