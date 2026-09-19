@@ -1681,8 +1681,8 @@ class Search:
     home, this object, and it is constructed fresh per camera. A line added
     later cannot reintroduce the bug, because there is nowhere to write it.
     """
-    __slots__ = ("cam", "unique", "nickname", "original", "fx", "t_budget",
-                 "exposure", "gain", "reference", "trials")
+    __slots__ = ("cam", "unique", "nickname", "original", "fx", "budget_px",
+                 "t_budget", "exposure", "gain", "reference", "trials")
 
     def __init__(self, cam):
         self.cam = cam

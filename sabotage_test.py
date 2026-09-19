@@ -422,11 +422,38 @@ pt.main()
 '''
 
 
+def slots_check(src_dir):
+    """Every `st.<attr> =` in the module is declared in Search.__slots__.
+
+    Search uses __slots__, so assigning an attribute nobody declared is an
+    AttributeError - at RUNTIME, on hardware, in the middle of a tune. It
+    happened: adding st.budget_px for --max-range passed --verdict-matrix,
+    --cli-smoke, --gain-walk and --sample-floor and then died on the first
+    real camera, because cli_smoke stubs run() out and nothing offline ever
+    constructs a Search. Cheap, static, and it closes that hole.
+    """
+    import re as _re
+    src = open(os.path.join(src_dir, "photontune.py")).read()
+    m = _re.search(r"__slots__\s*=\s*\((.*?)\)", src, _re.S)
+    declared = set(_re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"', m.group(1))) if m else set()
+    assigned = set(_re.findall(r"\bst\.([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)", src))
+    missing = sorted(assigned - declared)
+    print("Search.__slots__ declares %d names; the module assigns %d to st."
+          % (len(declared), len(assigned)))
+    if missing:
+        print("  !! assigned but NOT in __slots__ (AttributeError on hardware): %s"
+              % missing)
+    else:
+        print("  every st.<attr> assignment is declared: ok")
+    return len(missing)
+
+
 def cli_smoke(src_dir):
     print("=" * 78)
     print("CLI PATHS  - the real main(), every flag combination, run() stubbed")
     print("=" * 78)
-    bad = 0
+    bad = slots_check(src_dir)
+    print("-" * 78)
     print("%-42s %-5s %-5s %-6s %s"
           % ("arguments", "want", "got", "clean", "output"))
     print("-" * 78)
