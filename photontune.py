@@ -1615,9 +1615,8 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
     if original:
         PENDING_RESTORE[unique] = dict(original)
 
-    steps = len(gains) + (1 if len(gains) > 1 else 0)
-    trials = []
-    reasons = {}
+    steps = len(gains) + GAIN_REPEATS
+    measured = []
     for i, gv in enumerate(gains):
         if progress:
             progress(0.55 + 0.45 * i / steps)
@@ -1632,47 +1631,38 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
             log("   stopping the gain scan with %d candidate(s) untried - a dead "
                 "connection is not a dark room. Keeping the sweep's answer."
                 % (len(gains) - i))
-            r["gain_scan_error"] = "%s during the gain scan" % type(exc).__name__
+            note_problem(r, "gain_scan_error",
+                         "%s aborted it with %d candidate(s) untried"
+                         % (type(exc).__name__, len(gains) - i))
             break
-        why = s.why_failed(args.min_tags, args.max_ambiguity, args.reference_tag)
-        trials.append((gv, s.med_reproj if why is None else None, s))
-        if why is None:
-            log("   ok  gain %-5d  %s" % (gv, s.summary(args.reference_tag)))
-        else:
-            reasons[gv] = why
-            log("       gain %-5d  %s  - %s" % (gv, s.summary(args.reference_tag), why))
+        measured.append((gv, s))
+        log("       gain %-5d  %s" % (gv, s.summary(args.reference_tag)))
 
-    # ---- phase 3: how much of that spread is just measurement noise? -----
-    # Re-measure the FIRST candidate at the end of the scan. That is the honest
-    # unit to compare the others against: it is the same quantity, measured
-    # twice, across exactly the interval the scan itself spans.
-    noise = None
-    # Repeat a gain that actually PASSED, not blindly the first candidate.
-    # Repeating a candidate that saw nothing yields no reprojection and so no
-    # noise estimate at all - measured: gain 0 failed on OV9281 (1), the repeat
-    # was wasted, and the fallback band then picked gain 20 (reproj 2.052) over
-    # gain 100 (1.597), calling a 28% difference insignificant.
-    repeatable = next((g for g, rp, _ in trials if rp is not None), None)
-    if len(gains) > 1 and repeatable is not None and not r.get("gain_scan_error"):
-        if progress:
-            progress(0.55 + 0.45 * len(gains) / steps)
-        try:
-            again = await _gain_trial(pv, cam, args, repeatable, exposure)
-        except Exception as exc:
-            log("   repeat of gain %d failed: %s - no noise estimate this run"
-                % (repeatable, type(exc).__name__))
-            r["gain_scan_error"] = "%s during the repeat" % type(exc).__name__
-            again = None
-        first_rp = next(rp for g, rp, _ in trials if g == repeatable)
-        rp2 = (again.med_reproj
-               if (again is not None
-                   and again.passes(args.min_tags, args.max_ambiguity, args.reference_tag))
-               else None)
-        if first_rp and rp2:
-            noise = abs(math.log(rp2 / first_rp))
-            log("   repeat of gain %d: reproj %.3f then %.3f - this run's own "
-                "repeat noise is %.0f%%"
-                % (repeatable, first_rp, rp2, 100 * (math.exp(noise) - 1)))
+    # The SAME tag-count floor the exposure sweep applies, for the same reason.
+    # The scan used to pass no tag_target at all, so a gain that had started
+    # losing tags could still win on reprojection - and fitting four corners of
+    # three tags well is not better than fitting four tags. OBSERVED: the scan
+    # pinned gain at the top of the range while mean tags fell from 4.00 to
+    # 3.5-3.8. A gain that loses tags is not a better gain.
+    #
+    # Computed from the scan's own best, exactly as choose_exposure() computes it
+    # from the sweep's own best, so the two halves of the tune judge alike.
+    best_tags = max((s.mean_tags for _g, s in measured), default=0.0)
+    tag_target = (best_tags * args.tag_fraction
+                  if (best_tags >= 2 and args.reference_tag is None) else None)
+    if tag_target:
+        log("   best gain saw %.2f tags - requiring >= %.2f (%.0f%%) of every "
+            "other gain" % (best_tags, tag_target, 100 * args.tag_fraction))
+
+    trials = []
+    reasons = {}
+    for gv, s in measured:
+        why = s.why_failed(args.min_tags, args.max_ambiguity, args.reference_tag,
+                           tag_target)
+        trials.append((gv, s.med_reproj if why is None else None, s))
+        if why is not None:
+            reasons[gv] = why
+            log("   rejected gain %-5d - %s" % (gv, why))
 
     good = [t for t in trials if t[1] is not None]
     if not good:
@@ -1683,19 +1673,62 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
         PENDING_RESTORE.pop(unique, None)
         return r
 
-    best_rp = min(t[1] for t in good)
-    # --reproj-tolerance keeps its own job: REJECT a gain whose fit is clearly
-    # worse than the best. It is not a noise estimate and must not be used as
-    # one - at its 1.5 default it declares a 28% difference insignificant.
-    usable = [t for t in good if t[1] <= best_rp * float(args.reproj_tolerance)]
-    # One repeat is a crude estimate, so floor the band at 5%: a fluke pair of
-    # near-identical readings must not make every 1% difference "significant".
-    # With no repeat at all, 5% is also the fallback - claiming a wider band
-    # without having measured it is exactly the dishonesty this replaces.
-    band = max(math.exp(noise) if noise is not None else 1.0, 1.05)
-    contenders = [t for t in usable if t[1] <= best_rp * band]
-    pick = min(contenders, key=lambda t: t[0])       # LOWEST gain wins a tie
-    best = min(good, key=lambda t: t[1])
+    # ---- phase 3: how much of that spread is just measurement noise? -----
+    #
+    # Measured AT THE CANDIDATE THAT IS ABOUT TO WIN, not at the first one that
+    # passed. This is the whole of D4. The old code repeated the first passing
+    # gain - in practice gain 0, the quietest operating point on the sensor -
+    # measured 0% repeat noise there, and then floored the band at 5% and used
+    # that 5% to judge a decision being made at gain 100. FORCED by the audit:
+    # three identical runs in the same room and the same light chose 100, 100,
+    # 60, because at the deciding point gain 100 read 0.378 / 0.393 / 0.510 - a
+    # 35% swing - while every gain that was NOT deciding anything was stable to
+    # 0.2% (gain 60: 0.478 / 0.479 / 0.478). The noise was real; it was simply
+    # never measured where the decision was made.
+    #
+    # Two consequences, both deliberate:
+    #  - the leader's reprojection becomes the MEDIAN of its repeats, so a single
+    #    lucky reading cannot win the scan;
+    #  - the noise band is the spread actually observed at that point, so a lead
+    #    smaller than it is reported as a tie and the LOWER gain takes it.
+    leader = min(good, key=lambda t: t[1])
+    repeats = [leader[1]]
+    if len(good) > 1 and not r.get("gain_scan_error"):
+        for k in range(GAIN_REPEATS):
+            if progress:
+                progress(0.55 + 0.45 * (len(gains) + k) / steps)
+            try:
+                again = await _gain_trial(pv, cam, args, leader[0], exposure)
+            except Exception as exc:
+                log("   repeat %d of gain %d failed: %s - noise estimated from "
+                    "%d reading(s)" % (k + 1, leader[0], type(exc).__name__,
+                                       len(repeats)))
+                note_problem(r, "gain_scan_error",
+                             "%s during the repeat that measures the noise"
+                             % type(exc).__name__)
+                break
+            if again.passes(args.min_tags, args.max_ambiguity, args.reference_tag,
+                            tag_target) and again.med_reproj:
+                repeats.append(again.med_reproj)
+            else:
+                # A repeat that no longer passes is not a missing measurement,
+                # it is evidence the leader is not repeatable. Say so.
+                log("   repeat %d of gain %d did NOT pass this time (%s)"
+                    % (k + 1, leader[0], again.summary(args.reference_tag)))
+    if len(repeats) > 1:
+        log("   gain %d repeated %d times: %s - %.0f%% spread AT THE DECIDING "
+            "POINT" % (leader[0], len(repeats),
+                       " / ".join("%.3f" % x for x in repeats),
+                       100 * (math.exp(abs(math.log(max(repeats) / min(repeats)))) - 1)))
+        if abs(_median(repeats) - leader[1]) > 1e-9:
+            log("      using the median of those, %.3f, not the single reading "
+                "%.3f that happened to lead" % (_median(repeats), leader[1]))
+
+    by_gain = {g: s for g, _rp, s in good}
+    pick, best, band, noise, pairs = gain_decision(
+        [(g, rp) for g, rp, _s in good], repeats, leader[0],
+        args.reproj_tolerance)
+    good = [(g, rp, by_gain[g]) for g, rp in pairs]
 
     log("      %s" % ", ".join("gain %d -> %.3f" % (g, rp) for g, rp, _ in good))
     if len(good) == 1:
@@ -1703,7 +1736,7 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
             % (pick[0], pick[1], exposure))
     elif pick[0] == best[0]:
         log("   chose gain %d at exposure %.0f - reproj %.3f, the best measured "
-            "and outside this run's %.0f%% noise band"
+            "and outside the %.0f%% noise measured at that gain"
             % (pick[0], exposure, pick[1], 100 * (band - 1)))
         if pick[0] >= max(t[0] for t in trials) and len(trials) > 1:
             log("      NOTE: that is the TOP of the search range - the optimum "
@@ -1711,14 +1744,17 @@ async def optimise_gain(pv, cam, args, log=print, progress=None, skip_baseline=F
     else:
         log("   chose gain %d (reproj %.3f) over gain %d (reproj %.3f) at "
             "exposure %.0f" % (pick[0], pick[1], best[0], best[1], exposure))
-        log("      the difference is INSIDE this run's %.0f%% measurement noise, "
-            "so it is NOT significant - and the lower gain is the one with less "
-            "sensor noise." % (100 * (band - 1)))
+        log("      NOT SIGNIFICANT: the difference is inside the %.0f%% noise "
+            "measured at gain %d itself, so the two cannot be separated - and "
+            "the lower gain is the one with less sensor noise."
+            % (100 * (band - 1), leader[0]))
 
     r["gain_trials"] = [{"gain": g, "reproj": rp, "frames": s.frames,
                          "mean_tags": s.mean_tags, "solve_rate": s.solve_rate,
                          "why_failed": reasons.get(g)}
                         for g, rp, s in trials]
+    r["gain_tag_target"] = tag_target
+    r["gain_repeats"] = {"gain": leader[0], "reproj": repeats}
     r["gain_noise_pct"] = None if noise is None else round(100 * (math.exp(noise) - 1), 1)
     r["gain_significant"] = (pick[0] == best[0])
 
