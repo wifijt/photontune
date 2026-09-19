@@ -227,16 +227,17 @@ EXPOSURE_WALK_STEPS = 5
 # 360 deg/s and fx 1105.9 is 174 px of smear: FORCED, and it shipped as a
 # success with a warning.
 #
-# The number comes from the same proxy the budget does, read at the other end
-# of the table. PhotonVision's Gaussian blur swept at fixed exposure:
-# multi-tag survives sigma 1.5 (50% solve rate) and is gone by sigma 2.0 (0%).
-# Converting by equal high-frequency attenuation, sigma = L/sqrt(12), sigma
-# 1.5 is 5.2 px of smear and sigma 2.0 is 6.9 px. Applying the same 2x
-# correction for edge orientation that gives the 6 px budget, multi-tag is
-# gone somewhere around 14 px of motion smear and already halved by 10 px.
+# The number comes from the same measurement the budget does, read at the
+# other end. Tolerance scales with tag size: sigma_fail = 0.050 x side for
+# the worst tag, so L_fail = 0.173 x side (see the block comment above
+# blur_px()). A budget set at 1x is set AT that failure point for the
+# smallest tag the user cares about; by 2x, a tag at that range is at twice
+# the smear that already took the worst tag to a 50% detection rate, and the
+# larger tags in the same scene are at or past theirs. Nothing multi-tag
+# needs two of survives there.
 #
-# 2x the budget - 12 px at the default - is therefore the last point the proxy
-# says anything survives at. Past it there is nothing to walk towards, so the
+# 2x the budget - 12 px at the default - is therefore the last point the
+# measurement says anything survives at. Past it there is nothing to walk towards, so the
 # walk stops rather than spending trials on exposures that cannot work on a
 # moving robot. It is a MULTIPLE of the budget rather than an absolute number
 # so that lowering --max-blur-px lowers this too: a user who asks for 0.05 px
@@ -458,67 +459,88 @@ def _median(xs):
 # whatever the blur budget allows, and the only free variable left is gain.
 #
 # ---------------------------------------------------------------------------
-# THE 6 PX IS A PROXY AND AN ATTEMPT TO BOUND IT BETTER FAILED. Read this
-# before trusting the number, and before repeating the attempt.
+# THE BLUR BUDGET IS NOW MEASURED, NOT A PROXY - except for one factor of two,
+# which is named at the bottom. Read this before changing the number.
 #
-# Where 6 came from: PhotonVision's `blur` (the AprilTag detector's
-# quad_sigma) swept at fixed exposure and gain, multi-tag collapsing between
-# sigma 1.5 and 2.0; converted by equal high-frequency attenuation,
-# sigma = L/sqrt(12), to ~3.5 px of smear; then DOUBLED by an argument that
-# Gaussian blur damages edges in every direction while a smear only damages
-# the ones perpendicular to it. The doubling is a judgement, not a
-# measurement, and it is the difference between a 3.5 px budget and a 7 px
-# one - a factor of two on every exposure this tool sets.
+# Five things were settled, from PhotonVision's and upstream apriltag's source
+# and from this rig. Each one corrected something this comment used to assert.
 #
-# The attempt, on this rig, unattended (blurscale.py in the session
-# scratchpad): sweep `blur` over 0-7 at two decimate settings and record the
-# 50% detection point, sigma50, PER TAG - six tags across two cameras,
-# apparent side 45.5 to 86.3 px from PhotonVision's own `area`. Two questions,
-# because the four combinations of their answers predict four different
-# signatures:
+# 1. WHAT `blur` ACTUALLY IS. PhotonVision's `blur` is apriltag's quad_sigma,
+#    and it is applied AFTER quad_decimate, to the DECIMATED image
+#    (AprilTagPipeline.java:93-94; apriltag.c:1024-1031). At the deployed
+#    decimate=2 a setting of sigma therefore means 2*sigma FULL-RESOLUTION
+#    pixels. That factor of two was missing from every number under the old
+#    budget. (a) in the old note is resolved: decimated pixels.
 #
-#   (a) is sigma in full-resolution or DECIMATED pixels? quad_sigma is
-#       applied after quad_decimate in upstream apriltag, and if so a sweep
-#       taken at the default decimate=2 is out by a factor of two;
-#   (b) is tolerance a fixed number of pixels, as this budget assumes, or a
-#       fixed fraction of the tag - in which case the budget should scale
-#       with range and does not.
+# 2. AT decimate >= 2 THE PAYLOAD DECODE READS THE UNBLURRED IMAGE
+#    (apriltag.c:1150). At decimate == 1 the blur is in place and the decode
+#    does see it. Confirmed on hardware: at decimate=2 every tag's
+#    decision-margin bracket is FLAT in blur - tags vanish, but the survivors'
+#    margins do not fall - while at decimate=1 they fall monotonically
+#    (/tmp/aud/margin.log, six tags, two cameras). So a decimate=2 sweep
+#    measures the quad detector alone. Motion blur has no such exemption; it
+#    degrades the decode too. All the scaling below is therefore taken from
+#    the decimate=1 sweep, which is the one that exercises both halves.
 #
-# WHAT IT MEASURED, and why it does not settle either question:
+# 3. sigma < 0.5 IS A COMPLETE NO-OP. ksz = 4*sigma, gated on ksz > 1, so
+#    sigma 0.4 gives ksz 1 and no filter runs at all. Corroborated on
+#    hardware: blur 0.4 and blur 0.0 produce identical margin brackets for
+#    all six tags at both decimate settings. (Source-level claim; the
+#    brackets are too coarse to prove bit-identity, only to be consistent
+#    with it.)
 #
-#   sigma50 at decimate=2, per tag, all six measured in the same session:
+# 4. THERE IS NO CLAMP AT sigma 4.0. The old "both cameras collapse totally
+#    and identically at exactly 4.0, an implementation limit" was the sweep's
+#    LAST GRID POINT, plus multi-tag needing two tags. Extended to sigma 7 at
+#    decimate=1, two tags are still detected at 100% at sigma 4.0 and one of
+#    them survives to 5.0. Nothing physical happens at 4.
 #
-#       tag side 45.5 px -> 1.75      tag side 67.9 px -> 3.00
-#       tag side 54.7 px -> 3.00      tag side 74.9 px -> 1.63
-#       tag side 55.4 px -> 1.75      tag side 86.3 px -> 3.52
+# 5. THE "2.2x SPREAD WITH NO RELATIONSHIP TO APPARENT SIZE" WAS A
+#    DATA-READING ERROR. blurscale.json omits a row entirely when a tag scores
+#    zero, and absent rows were read as end-of-series instead of as zero, so
+#    each series was truncated at a different place. Re-read with absent == 0,
+#    at decimate=1, interpolating to the 50% crossing:
 #
-#   A 2.2x spread between tags IN THE SAME SCENE AT THE SAME MOMENT, with no
-#   relationship to apparent size - the 74.9 px tag has the lowest cliff of
-#   all six and the 54.7 px tag one of the highest. So the sweep the budget
-#   rests on did not measure a property of the detector; it measured whichever
-#   tag in that scene was worst. "multi-tag collapses between 1.5 and 2.0"
-#   reproduces here as camera 2 (1.63) while camera 1's tags survive to 3.0.
+#        side 45.5 px -> sigma_fail 2.48    ratio 0.0545
+#        side 54.6 px -> sigma_fail 3.26    ratio 0.0596
+#        side 55.2 px -> sigma_fail 3.75    ratio 0.0680
+#        side 67.9 px -> sigma_fail 4.75    ratio 0.0700
+#        side 74.8 px -> sigma_fail 3.76    ratio 0.0503
+#        side 86.3 px -> sigma_fail 5.51    ratio 0.0639
 #
-#   The decimate test came out inconsistent: sigma50(dec=1)/sigma50(dec=2) is
-#   2.16 for the one tag measured cleanly at both, which would say sigma is in
-#   decimated pixels, and 1.02 for the other camera. Both cameras also
-#   collapse totally and identically at exactly sigma 4.0 at decimate=1, which
-#   looks like an implementation limit rather than anything physical. So (a)
-#   is unresolved and the factor of two under it is still there.
+#    Tolerance IS proportional to tag size - (b) in the old note is resolved,
+#    and resolved AGAINST the constant budget this tool uses. The worst tag
+#    gives sigma_fail = 0.050 x side, the mean 0.061, and the spread across
+#    the six is 1.39x. A budget should be built on the worst tag, so 0.050 is
+#    the number to use; it is 0.4 of a bit cell (a 36h11 tag is 8 cells
+#    across). NOTE: an earlier reading of this same data reported the spread
+#    as 1.18x. It is 1.39x. The worst-tag coefficient is unaffected.
 #
-# AND A CAUTION IN THE OTHER DIRECTION. Upstream apriltag blurs only the image
-# used for QUAD detection; the bit cells are decoded from the unblurred one.
-# That is consistent with what was measured here - tags surviving a sigma far
-# larger than their own bit-cell size, which decoding could not do. Motion
-# blur has no such exemption: it degrades the decode as well, and a bit cell
-# is an eighth of the tag. If that is right, the proxy measures the more
-# robust half of the detector, and the 2x that RAISED the budget from 3.5 to 6
-# is pushing against a correction that probably needs to go the other way.
+# CONVERTING TO A SMEAR. Equal variance, L = sigma*sqrt(12), taking NO credit
+# for motion blur being one-dimensional:
 #
-# So 6 px stands, unchanged, because nothing measured here justifies a
-# different number - but it should be read as an ESTIMATE THAT MAY BE
-# OPTIMISTIC, not as a conservative one. The only thing that settles it is a
-# tag that actually moves: blurtest.py, with a human.
+#        L_fail  =  0.173 x (tag side in px)
+#
+# For a 6.5 in tag at fx 1105.9: 15.9 px at 2 m, 7.9 at 4 m, 6.4 at 5 m,
+# 4.5 at 7 m, 4.0 at 8 m.
+#
+# SO THE DEFAULT 6 px IS CONSERVATIVE INSIDE ABOUT 5 m AND OPTIMISTIC BEYOND
+# IT. A budget that is one number cannot be right at both ends; the right
+# shape is 0.17 x side_px - about 1.4 bit-cell widths - pinned to the longest
+# range the team actually needs. That is what --max-range does. It is OFF by
+# default, because turning it on would change the answer this tool gives.
+#
+# WHAT IS STILL NOT MEASURED, and it is now the largest remaining lever: the
+# 2x credit for motion blur being ONE-DIMENSIONAL. A Gaussian blurs every
+# edge; a smear only blurs the edges perpendicular to it, and a tag has edges
+# in two orthogonal directions. PhotonVision's blur is isotropic and cannot
+# test this, so no sweep of it ever will. Note what that means for the numbers
+# above: L_fail = 0.173 x side takes NO such credit, so using 0.17 x side as
+# the BUDGET puts the operating point at the measured failure point of the
+# worst tag, and the whole of the margin is the unmeasured 2x. That is a
+# deliberate, stated bet, not a conservative choice.
+#
+# blurtest.py, with a human waving a tag, is the only thing that settles it.
 # ---------------------------------------------------------------------------
 
 def blur_px(exposure_us, blur_rate_deg_s, fx):
@@ -534,6 +556,40 @@ def fmt_px(px):
     Three significant figures says the same thing at both scales.
     """
     return "%.3g" % px
+
+
+# Tolerance is proportional to the tag's apparent SIZE, which is why a
+# constant budget cannot be right at every range. MEASURED - see the block
+# comment above blur_px() and REDESIGN.md.
+BLUR_BUDGET_PER_PX_OF_SIDE = 0.17
+
+
+def blur_budget_px(cfg, fx):
+    """The blur budget for THIS camera, in full-resolution pixels.
+
+    Without --max-range this is just cfg.max_blur_px, a constant, which is
+    what this tool has always done and what it still does by default.
+
+    With --max-range it is BLUR_BUDGET_PER_PX_OF_SIDE times the apparent side
+    of a tag at that range - about 1.4 bit-cell widths - because the measured
+    tolerance scales with the tag, not with the camera. A constant budget is
+    therefore conservative close in and optimistic far out: 6 px is the right
+    answer at about 5 m for a 6.5 in tag at fx 1105.9, too strict at 2 m and
+    too generous at 8 m.
+
+    Note what happens to fx when this feeds blur_budget_exposure():
+
+        t = 1e6 * (0.17 * fx * tag / range) / (radians(rate) * fx)
+          = 1e6 *  0.17 * tag / (range * radians(rate))
+
+    fx CANCELS. Under --max-range the exposure depends only on the tag size,
+    the range and the rate - not on the lens - which is the sense in which it
+    is a physical budget rather than a per-camera tuning constant.
+    """
+    if cfg.max_range is None:
+        return cfg.max_blur_px
+    side_px = fx * cfg.tag_size / float(cfg.max_range)
+    return BLUR_BUDGET_PER_PX_OF_SIDE * side_px
 
 
 def blur_budget_exposure(max_blur_px, blur_rate_deg_s, fx):
@@ -1339,7 +1395,7 @@ PROBLEMS = {
     # as a success with a warning.
     #
     # Both halves of the fix are deliberate, and they do different jobs. The
-    # OVER_BUDGET_LIMIT cap stops the walk landing somewhere the proxy says
+    # OVER_BUDGET_LIMIT cap stops the walk landing somewhere the blur data says
     # nothing survives; HARD stops any of it exiting 0. The camera is still
     # LEFT at what the walk found, because a camera that can see while
     # stationary beats a camera at the budget exposure that sees nothing - the
@@ -1567,6 +1623,11 @@ class Config:
     max_gain: float = 100.0
     max_blur_px: float = 6.0
     blur_rate: float = 360.0
+    # None keeps the constant budget above - today's behaviour, unchanged.
+    # A range in metres makes the budget proportional to the tag's apparent
+    # size at that range instead. See blur_budget_px().
+    max_range: object = None
+    tag_size: float = 0.1651        # 6.5 in, the FRC tag, metres
     fx: float = 1105.9              # fallback only; camera_fx() reads the real one
     max_exposure: float = 25000.0   # ceiling for the over-budget walk only
 
@@ -1598,6 +1659,7 @@ class Config:
         return cls(host=a.host, port=a.port, cameras=a.cameras,
                    max_gain=a.max_gain, max_blur_px=a.max_blur_px,
                    blur_rate=a.blur_rate, fx=a.fx, max_exposure=a.max_exposure,
+                   max_range=a.max_range, tag_size=a.tag_size,
                    dwell=a.dwell, settle=a.settle, min_tags=a.min_tags,
                    max_ambiguity=a.max_ambiguity, baseline=a.baseline,
                    baseline_only=a.baseline_only, brightness=a.brightness,
@@ -1633,6 +1695,7 @@ class Search:
             "cameraAutoExposure": st["cameraAutoExposure"],
         }
         self.fx = None
+        self.budget_px = None      # the blur budget, in pixels (see blur_budget_px)
         self.t_budget = None       # the blur budget, in microseconds
         self.exposure = None       # the exposure actually being tried
         self.gain = None           # the gain actually being tried
@@ -1807,21 +1870,33 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
         own_fx = camera_fx(cam)
         st.fx = own_fx if own_fx else cfg.fx
         lo_e, hi_e = st.exposure_bounds()
-        want = blur_budget_exposure(cfg.max_blur_px, cfg.blur_rate, st.fx)
+        # PER CAMERA, because under --max-range the budget depends on this
+        # camera's fx. Without --max-range this is cfg.max_blur_px and
+        # nothing about the answer changes.
+        st.budget_px = blur_budget_px(cfg, st.fx)
+        want = blur_budget_exposure(st.budget_px, cfg.blur_rate, st.fx)
         st.t_budget = min(max(want, lo_e), hi_e)
         rec["budget"] = {"fx": st.fx, "fx_from_calibration": bool(own_fx),
-                         "max_blur_px": cfg.max_blur_px,
+                         "max_blur_px": st.budget_px,
+                         "max_range": cfg.max_range,
+                         "tag_size": cfg.tag_size if cfg.max_range else None,
                          "blur_rate": cfg.blur_rate, "wanted": want,
                          "exposure": st.t_budget}
         # Say WHERE fx came from. It sets the whole scale of the budget, and a
         # line claiming "from this camera's calibration" over a --fx fallback
         # would be the tool asserting something it had not checked.
-        log("   fx %.1f %s; %g px at %.0f deg/s allows %.0f us"
+        log("   fx %.1f %s; %s px at %.0f deg/s allows %.0f us"
             % (st.fx,
                "from this camera's active calibration" if own_fx
                else "from --fx (this camera reports NO calibration for its "
                     "active mode, so the budget is a guess)",
-               cfg.max_blur_px, cfg.blur_rate, want))
+               fmt_px(st.budget_px), cfg.blur_rate, want))
+        if cfg.max_range is not None:
+            log("   budget is %g x the %.1f px side of a %.0f mm tag at %g m "
+                "(--max-range), not a constant"
+                % (BLUR_BUDGET_PER_PX_OF_SIDE,
+                   st.fx * cfg.tag_size / float(cfg.max_range),
+                   cfg.tag_size * 1000.0, cfg.max_range))
         if abs(st.t_budget - want) > 1.0:
             log("   clamped to the camera's reported range %.0f-%.0f us -> %.0f us"
                 % (lo_e, hi_e, st.t_budget))
@@ -2000,8 +2075,8 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
         px = blur_px(st.exposure, cfg.blur_rate, st.fx)
         log("   applied gain %d / exposure %.0f - confirmed. %s px of smear "
             "at %.0f deg/s (budget %g)"
-            % (st.gain, st.exposure, fmt_px(px), cfg.blur_rate, cfg.max_blur_px))
-        if px > cfg.max_blur_px * 1.001:
+            % (st.gain, st.exposure, fmt_px(px), cfg.blur_rate, st.budget_px))
+        if px > st.budget_px * 1.001:
             # The RAW px, not round(px, 1). Rounding is what produced the
             # 0.0 that both readers then treated as "no problem"; the value
             # is evidence for the text, so it should not be destroyed on the
@@ -2186,11 +2261,11 @@ async def _rescue(pv, cam, cfg, st, log):
     else:
         # The walk is capped at OVER_BUDGET_LIMIT times the blur budget, not
         # at --max-exposure. --max-exposure is 25000 us, which at 360 deg/s
-        # and fx 1105.9 is 174 px of smear; the proxy the budget comes from
-        # says multi-tag is gone by about 14 px. Walking past the point where
+        # and fx 1105.9 is 174 px of smear; the measurement the budget comes
+        # from says nothing multi-tag needs two of survives past 2x it. Walking past the point where
         # nothing can work is not finding an answer, it is spending trials to
         # produce one that fails on a moving robot - and it shipped as exit 0.
-        blur_cap = blur_budget_exposure(cfg.max_blur_px * OVER_BUDGET_LIMIT,
+        blur_cap = blur_budget_exposure(st.budget_px * OVER_BUDGET_LIMIT,
                                         cfg.blur_rate, st.fx)
         ceiling = min(hi_e, cfg.max_exposure, blur_cap)
         if ceiling <= st.t_budget * 1.001:
@@ -2200,11 +2275,11 @@ async def _rescue(pv, cam, cfg, st, log):
             return None, None
         log("   even gain %d cannot see the tags at %.0f us - the scene is too "
             "dark for the blur budget. Walking exposure UP at gain %d, as far "
-            "as %.0f us (%g px, %gx the budget - past that the blur proxy says "
+            "as %.0f us (%s px, %gx the budget - past that the blur data says "
             "nothing survives). Whatever this lands on is over budget by "
             "definition and the run will NOT report success."
             % (gains[-1], st.t_budget, gains[-1], ceiling,
-               cfg.max_blur_px * OVER_BUDGET_LIMIT, OVER_BUDGET_LIMIT))
+               fmt_px(st.budget_px * OVER_BUDGET_LIMIT), OVER_BUDGET_LIMIT))
         ladder = geometric_sweep(st.t_budget, ceiling, EXPOSURE_WALK_STEPS + 1)[1:]
         gain = gains[-1]
 
@@ -3211,12 +3286,32 @@ def build_parser():
                         "t = max_blur_px / (radians(blur_rate) * fx), so if "
                         "this number is wrong every answer the tool gives is "
                         "wrong by the same factor and nothing in the tool can "
-                        "tell. It is the weakest number in the file and it is "
-                        "STILL A PROXY - see the block comment above "
-                        "blur_px() for what an attempt to bound it better "
-                        "found, and for why the attempt failed. "
-                        "blurtest.py measures the real thing; it needs a human "
-                        "waving a tag.")
+                        "tell. A CONSTANT budget cannot be right at every "
+                        "range: tolerance is proportional to the tag's "
+                        "apparent size, so 6 px is conservative inside about "
+                        "5 m and optimistic beyond it (6.5 in tag, fx 1105.9). "
+                        "Use --max-range to make it proportional. The one "
+                        "factor still unmeasured is the 2x credit for motion "
+                        "blur being one-dimensional, which PhotonVision's "
+                        "isotropic blur cannot test; blurtest.py, with a human "
+                        "waving a tag, is the only thing that settles it. See "
+                        "the block comment above blur_px().")
+    p.add_argument("--max-range", type=float, default=None,
+                   help="longest range this camera must read tags at, in "
+                        "metres. When given, the blur budget stops being a "
+                        "constant and becomes %g x the apparent side of a "
+                        "--tag-size tag at that range (about 1.4 bit-cell "
+                        "widths), which is how the measured tolerance actually "
+                        "scales. DEFAULT IS UNSET, which keeps --max-blur-px "
+                        "and the answer this tool has always given. Note the "
+                        "budget then sits AT the measured failure point of the "
+                        "worst tag in the sweep, with no margin of its own - "
+                        "what is left over is the 2x for motion blur being "
+                        "one-dimensional, and that 2x is NOT measured."
+                        % BLUR_BUDGET_PER_PX_OF_SIDE)
+    p.add_argument("--tag-size", type=float, default=0.1651,
+                   help="tag side in metres, used only by --max-range "
+                        "(default %(default)g = 6.5 in, the FRC tag).")
     p.add_argument("--blur-rate", type=float, default=360.0,
                    help="angular rate the blur budget is judged at, deg/s. 360 is "
                         "what robots actually do while aiming (CTRE default 270, "
@@ -3236,7 +3331,7 @@ def build_parser():
     p.add_argument("--max-exposure", type=float, default=25000.0,
                    help="an ABSOLUTE ceiling for the too-dark exposure walk. "
                         "It is rarely the binding one: that walk also stops at "
-                        "%gx the blur budget, because past there the proxy the "
+                        "%gx the blur budget, because past there the data the "
                         "budget comes from says multi-tag does not survive. "
                         "25000 us is 174 px of smear at 360 deg/s and fx "
                         "1105.9, and used to be the only ceiling there was. "
@@ -3418,6 +3513,18 @@ def main():
     args = build_parser().parse_args()
     if args.max_blur_px <= 0:
         sys.exit("--max-blur-px must be > 0: it is what SETS the exposure")
+    if args.max_range is not None and args.max_range <= 0:
+        sys.exit("--max-range must be > 0 metres")
+    if args.tag_size <= 0:
+        sys.exit("--tag-size must be > 0 metres")
+    # Both given is ambiguous and the answer would differ silently depending
+    # on which one won. Refuse rather than pick.
+    if args.max_range is not None and any(
+            t == "--max-blur-px" or t.startswith("--max-blur-px=")
+            for t in sys.argv[1:]):
+        sys.exit("--max-range and --max-blur-px both set the SAME number and "
+                 "would disagree. Pass one: --max-blur-px for a fixed budget, "
+                 "--max-range to derive it from the tag's apparent size.")
     if args.blur_rate <= 0:
         sys.exit("--blur-rate must be > 0")
     if args.daemon:

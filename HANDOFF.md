@@ -234,42 +234,103 @@ the previous, higher-gain setting.
   state SIGKILL left (863.5 us / gain 0) is a perfectly legal-looking pair and
   only a record of what was intended can tell it apart.
 
-### The 6 px blur budget: an unattended attempt to bound it, and why it failed
+### The blur budget: now MEASURED, and what it changes
 
-`blurscale.py` sweeps `blur` at two `decimate` settings and finds the 50%
-detection point **per tag**, using the six tags in view (apparent side 45.5 to
-86.3 px) as the lever. It did not settle the number, and how it failed matters:
+An audit settled this from PhotonVision's and upstream apriltag's source and
+from this rig. It replaces the "unattended attempt that failed" that stood
+here, and it corrects that attempt on two points of fact.
+
+**What `blur` is.** It is apriltag's `quad_sigma`, applied **after**
+`quad_decimate`, to the **decimated** image (`AprilTagPipeline.java:93-94`;
+`apriltag.c:1024-1031`). At the deployed `decimate=2`, σ means **2σ
+full-resolution pixels** — a factor of two that was missing under the budget.
+The old note called this "unresolved"; it is resolved, in the direction of
+decimated pixels.
+
+**At `decimate ≥ 2` the payload decode reads the UNBLURRED image**
+(`apriltag.c:1150`); at `decimate == 1` the blur is in place and the decode
+sees it. Confirmed on hardware (`/tmp/aud/margin.log`, six tags, two cameras):
+at decimate=2 every tag's decision-margin bracket is flat in blur — tags
+vanish, but the survivors' margins do not fall — while at decimate=1 they fall
+monotonically. So a decimate=2 sweep measures the quad detector alone. The old
+note guessed this as "one caution the data supports"; it is now the reason all
+scaling below comes from the decimate=1 sweep.
+
+**σ < 0.5 is a complete no-op.** `ksz = 4*sigma`, gated on `ksz > 1`, so σ 0.4
+runs no filter. Corroborated: blur 0.4 and blur 0.0 give identical margin
+brackets for all six tags at both decimate settings.
+
+**There is no clamp at σ 4.0.** The old "both cameras collapse totally and
+identically at exactly 4.0, which looks like an implementation limit" was the
+sweep's **last grid point**, plus multi-tag needing two tags. Extended to σ 7
+at decimate=1, two tags are still detected at 100% at σ 4.0 and one survives
+to 5.0.
+
+**The "2.2× spread with no relationship to apparent size" was a data-reading
+error.** `blurscale.json` omits a row entirely when a tag scores zero, and
+absent rows were read as end-of-series rather than as zero — so every series
+was truncated at a different place, which is exactly what manufactures a
+spread uncorrelated with size. Re-read with absent = 0, at decimate=1,
+interpolated to the 50% crossing:
+
+| tag side | σ_fail | σ_fail / side |
+|---|---|---|
+| 45.5 px | 2.48 | 0.0545 |
+| 54.6 px | 3.26 | 0.0596 |
+| 55.2 px | 3.75 | 0.0680 |
+| 67.9 px | 4.75 | 0.0700 |
+| 74.8 px | 3.76 | 0.0503 |
+| 86.3 px | 5.51 | 0.0639 |
+
+Tolerance **is** proportional to tag size, at about **0.4 of a bit cell**.
+Worst tag **σ_fail = 0.050 × side**, mean 0.061, spread **1.39×**.
+
+> One correction to the brief this round worked from: it gave the spread as
+> **1.18×**. Recomputed from `/tmp/pt/blurscale.json` + `blurscale_d1.json`
+> it is **1.39×**. The 0.050 coefficient is the **worst tag**, not the
+> typical one (the mean is 0.061) — which is the right basis for a budget,
+> but it should be labelled as worst-case. The distance table below is
+> unaffected and reproduces the brief's numbers exactly.
+
+Converting by equal variance, `L = σ√12`, with **no** credit for motion blur
+being one-dimensional: **L_fail ≈ 0.173 × (tag side in px)**. For a 6.5 in tag
+at fx 1105.9:
+
+| range | tag side | L_fail |
+|---|---|---|
+| 2 m | 91.3 px | 15.9 px |
+| 4 m | 45.6 px | 7.9 px |
+| 5 m | 36.5 px | **6.4 px** |
+| 7 m | 26.1 px | 4.5 px |
+| 8 m | 22.8 px | 4.0 px |
+
+**So 6 px is conservative inside ~5 m and optimistic beyond it.** The budget
+should not be a constant: `0.17 × side_px` (~1.4 bit-cell widths) pinned to
+the longest range the team needs.
+
+**Implemented as `--max-range METRES`** (with `--tag-size`, default 0.1651 m =
+6.5 in). **It is OFF by default and the default answer is unchanged at
+863 µs / gain 40.** With it set, `max_blur_px` becomes `0.17 × fx × tag /
+range` per camera — and note that `fx` then cancels out of the exposure:
 
 ```
-sigma50 at the deployed decimate=2, all six tags, same scene, same session
-    side 45.5 px -> 1.75      side 67.9 px -> 3.00
-    side 54.7 px -> 3.00      side 74.9 px -> 1.63
-    side 55.4 px -> 1.75      side 86.3 px -> 3.52
+t = 1e6 * (0.17 * fx * tag / range) / (radians(rate) * fx)
+  = 1e6 *  0.17 * tag / (range * radians(rate))
 ```
 
-A **2.2x spread between tags at the same moment**, with no relationship to
-apparent size. So the sweep the budget rests on never measured a property of
-the detector - it measured whichever tag in that scene was worst. REDESIGN's
-"multi-tag collapses between sigma 1.5 and 2.0" reproduces exactly, as camera 2
-at 1.63, while camera 1's tags survive to 3.0.
+so under `--max-range` the exposure depends only on tag size, range and rate,
+not on the lens. Verified on all three calibrations on this rig: fx 1105.88,
+1110.75 and 570.49 all give **893.4 µs** at `--max-range 5`. Passing both
+`--max-range` and `--max-blur-px` is refused rather than silently resolved.
 
-The decimate test was inconsistent - the ratio `sigma50(dec=1)/sigma50(dec=2)`
-is 2.16 for the one tag measured cleanly at both and 1.02 for the other camera
-- so whether `blur` is in full-resolution or decimated pixels is **still
-unresolved**, and that is a factor of two sitting directly under the budget.
-Both cameras also collapse totally at exactly sigma 4.0 at decimate=1, which
-looks like an implementation limit rather than anything physical.
-
-One caution the data supports: upstream apriltag blurs only the image used for
-**quad** detection and decodes bit cells from the unblurred one, which is how
-tags here survive a sigma larger than their own bit cell. Motion blur gets no
-such exemption. If that is right, the proxy measures the more robust half of
-the detector and the 2x that raised the budget from 3.5 to 6 pushes against a
-correction that probably needs to go the other way.
-
-**6 px is unchanged and relabelled: an estimate that may be OPTIMISTIC.**
-`blurtest.py`, with a human waving a tag, is still the only thing that settles
-it.
+**Still unmeasured, and now the largest remaining lever: the 2× credit for
+motion blur being one-dimensional.** PhotonVision's blur is isotropic and
+cannot test it, so no sweep of it ever will. And note what that means:
+`L_fail = 0.173 × side` takes no such credit, so using `0.17 × side` as the
+**budget** puts the operating point at the measured failure point of the worst
+tag, with the entire margin being that unmeasured 2×. That is a deliberate,
+stated bet, not a conservative choice. `blurtest.py`, with a human waving a
+tag, is the only thing that settles it.
 
 ## Round 3 outcome (2026-09-19): the rebuild in REDESIGN.md, implemented
 
@@ -350,9 +411,14 @@ than the rotation value. Worth watching; worth reporting upstream if it recurs.
   (it clears on the upper confidence bound). One camera drifting below that
   would move the answer from gain 40 to gain 60. The decision is stable in
   THIS light; it has not been tested in another.
-- **The 6 px blur budget is still a proxy**, halved from a Gaussian-blur sweep
-  by an argument about edge orientation. It is the weakest number in the tool
-  and `blurtest.py` measures the real one.
+- **The 6 px blur budget is no longer a proxy — it is measured**, and it is
+  the right number at about 5 m for a 6.5 in tag: tolerance scales with tag
+  size as `L_fail ≈ 0.173 × side_px`, so 6 px is conservative inside ~5 m and
+  optimistic beyond it. `--max-range` expresses that properly and is off by
+  default. What remains unmeasured is the **2× for motion blur being
+  one-dimensional**, which PhotonVision's isotropic blur cannot test;
+  `blurtest.py`, with a human waving a tag, is the only thing that settles it.
+  See "The blur budget: now MEASURED" above.
 - **~8 s of every run is the NetworkTables probe** finding no server (4 s per
   candidate host). It now says so. `--no-nt` skips it.
 - **The whole tune is `raise_if_shutdown`-guarded but not `robot_is_enabled`-

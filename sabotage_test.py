@@ -372,6 +372,14 @@ CLI_CASES = [
     (["--dwell", "2", "--settle", "0.4"], 0, "exposure -> 864", None),
     (["--nt-server", "10.0.0.2"], 0, "exposure -> 864", None),
     (["--max-blur-px", "0"], 1, None, None),  # the budget IS the exposure
+    # --max-range derives the budget from the tag's apparent size instead of
+    # taking a constant. It must not change the default answer, so the
+    # no-flags case above still has to read "exposure -> 864".
+    (["--max-range", "5"], 0, "exposure -> 864", None),
+    (["--max-range", "0"], 1, None, None),
+    (["--tag-size", "0"], 1, None, None),
+    # both set the same number and would disagree silently
+    (["--max-range", "5", "--max-blur-px", "6"], 1, "would disagree", None),
     (["--blur-rate", "-1"], 1, None, None),
     # --baseline-only with a real failure recorded. This is the
     # `"baseline only" not in error` clause in tune_failed(): the benign

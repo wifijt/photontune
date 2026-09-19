@@ -46,32 +46,75 @@ period. The light had shifted so gain 0 still saw tags, the edge never fired,
 and the timer caught a frame already in flight. Rejected. The retry first probes
 for an exposure where gain 0 genuinely sees nothing, found 600 µs.)*
 
-**Blur tolerance** — a PROXY, and it must be labelled as one. PhotonVision's
-Gaussian `blur` swept at fixed exposure and gain:
+**Blur tolerance** — MEASURED, as of 2026-09-19, except for one factor of two
+that is named at the end. This replaces the proxy reasoning that stood here.
+
+What `blur` is, from PhotonVision's and upstream apriltag's source:
+
+- It is apriltag's `quad_sigma`, applied **after** `quad_decimate`, to the
+  **decimated** image (`AprilTagPipeline.java:93-94`; `apriltag.c:1024-1031`).
+  At the deployed `decimate=2`, a setting of σ means **2σ full-resolution
+  pixels** — a factor of two that was missing from the old budget.
+- At `decimate ≥ 2` the payload decode reads the **unblurred** image
+  (`apriltag.c:1150`); at `decimate == 1` the blur is in place and the decode
+  sees it. Confirmed on hardware: at decimate=2 every tag's decision-margin
+  bracket is flat in blur, while at decimate=1 it falls monotonically
+  (`/tmp/aud/margin.log`, six tags, two cameras). A decimate=2 sweep therefore
+  measures only the quad detector; motion blur gets no such exemption, so all
+  scaling below is taken from the **decimate=1** sweep.
+- **σ < 0.5 is a complete no-op**: `ksz = 4*sigma`, gated on `ksz > 1`, so
+  σ 0.4 runs no filter at all. Corroborated on hardware — blur 0.4 and blur
+  0.0 give identical margin brackets for all six tags at both decimates.
+- **There is no clamp at σ 4.0.** The earlier "both cameras collapse at
+  exactly 4.0, an implementation limit" was the sweep's last grid point plus
+  multi-tag needing two tags. Extended to σ 7, two tags are still detected at
+  100% at σ 4.0 and one survives to 5.0.
+
+How tolerance scales. The earlier "2.2× spread with no relationship to
+apparent size" was **a data-reading error**: `blurscale.json` omits a row
+when a tag scores zero, and absent rows were read as end-of-series rather
+than as zero, truncating each series at a different place. Re-read with
+absent = 0, at decimate=1, interpolated to the 50% crossing:
 
 ```
-blur   tags   multitag        blur   tags   multitag
-0.0    3.96     100%          2.0    1.00       0%
-0.5    3.47     100%          2.5    1.00       0%
-1.0    2.00     100%          3.0    0.76       0%
-1.5    1.50      50%          4.0    0.00       0%
+tag side   σ_fail    σ_fail/side
+  45.5 px    2.48       0.0545
+  54.6 px    3.26       0.0596
+  55.2 px    3.75       0.0680
+  67.9 px    4.75       0.0700
+  74.8 px    3.76       0.0503
+  86.3 px    5.51       0.0639
 ```
 
-Detection degrades immediately (12% of tags lost by sigma 0.5) and multi-tag
-collapses between sigma 1.5 and 2.0. Converting by equal high-frequency
-attenuation, a box smear of length L matches a Gaussian of sigma = L/sqrt(12),
-so sigma 1.0 ~ 3.5 px of smear.
+Tolerance **is** proportional to tag size. Worst tag σ_fail = **0.050 × side**
+(about 0.4 of a bit cell — a 36h11 tag is 8 cells across); mean 0.061; spread
+across the six **1.39×**. *(An earlier reading of this same data reported the
+spread as 1.18×; it is 1.39×. The worst-tag coefficient is unaffected, and a
+budget should be built on the worst tag.)*
 
-**The proxy overstates the damage**, and by roughly a factor of two: Gaussian
-blur degrades edges in every direction, while motion smear only degrades edges
-perpendicular to the motion — and a tag has edges in two orthogonal directions,
-so a smear damages about half of them. Best estimate of real tolerance:
-**5–8 px**, against a current budget of 10 px that the code itself labels
-"JUDGEMENT, not a measurement".
+Converting by equal variance, `L = σ√12`, taking **no** credit for motion blur
+being one-dimensional:
 
-**So: set the default budget to 6 px, and say in the help that it is a
-proxy-derived estimate.** `blurtest.py` measures the real thing but needs a
-human waving a tag; run it when someone is available and correct this number.
+**L_fail ≈ 0.173 × (tag side in px)**
+
+For a 6.5 in tag at fx 1105.9: 15.9 px at 2 m, 7.9 at 4 m, **6.4 at 5 m**,
+4.5 at 7 m, 4.0 at 8 m.
+
+**So 6 px is conservative inside ~5 m and optimistic beyond it.** A single
+number cannot be right at both ends. The right shape is `0.17 × side_px`
+(~1.4 bit-cell widths) pinned to the longest range the team needs — which is
+what `--max-range` does. It is **off by default**, because turning it on
+changes the answer.
+
+**Still unmeasured, and now the largest remaining lever:** the 2× credit for
+motion blur being one-dimensional. A Gaussian blurs every edge; a smear only
+blurs edges perpendicular to it, and a tag has edges in two orthogonal
+directions. PhotonVision's blur is isotropic and cannot test this, so no sweep
+of it ever will. Note the consequence: `L_fail = 0.173 × side` takes no such
+credit, so using `0.17 × side` as the **budget** puts the operating point at
+the measured failure point of the worst tag, and the entire margin is that
+unmeasured 2×. That is a deliberate, stated bet, not a conservative choice.
+`blurtest.py`, with a human waving a tag, is the only thing that settles it.
 
 ## The algorithm
 
@@ -94,8 +137,21 @@ Per camera. Exposure is FIXED at the blur budget; gain is the only search.
    gain 0 AND fails at gain 100 with `mean_tags` FALLING as gain rises — walk
    exposure DOWN from `t_budget` at gain 0 until it passes.
 6. **If gain 100 at `t_budget` fails:** walk exposure UP at gain 100 to the
-   shortest that passes, apply it, and raise `over_blur_budget` (WARN).
+   shortest that passes, apply it, and raise `over_blur_budget` — **HARD**,
+   since 2026-09-19. It was WARN, and a camera at 26x the budget exited 0.
+   The camera is still LEFT at what the walk found (the best available answer
+   beats none); the exit code says it is not the answer that was asked for.
 7. **Confirm** the write, run `verify_final_state`, publish the verdict.
+
+Note on steps 5 and 6: they are reachable **only when the reference is
+unusable**. If the reference passes, gain 100 IS the reference, is judged
+against its own mean, and passes — so the walk always picks at least gain
+100 and never falls through. Every rescue is therefore a run whose tag-count
+floor was dropped, which is why `reference_unusable` is **HARD** rather than
+WARN: without a reference nothing in the run checks that the chosen settings
+see *every* tag, and two tags satisfy the 90% multi-tag gate as well as four.
+Forced on hardware: a rescue landed on 2.00 tags in a scene showing 4.00 and
+exited 0.
 
 Cost: 1 + 6 + confirm ~= 8 trials x ~2.7 s ~= **25 s per camera**, deterministic,
 no reprojection in the decision, no recursion.
