@@ -230,6 +230,78 @@ def gain_walk_replay(src_dir):
     return 1 if bad else 0
 
 
+# ─────────────────── every CLI path, no hardware ───────────────────
+#
+# main() reads its settings off the frozen Config, and Config.from_args has to
+# copy each one across BY HAND. A field main() reads that from_args never sets
+# is an AttributeError on a real invocation, and --help does not touch it:
+# argparse is satisfied, the parser tests pass, and the crash waits for
+# whoever actually uses the flag. That happened once while this rebuild was
+# being written - cfg.json read a field that was called emit_json - and it was
+# caught by inspection rather than by anything running, which is exactly the
+# way defects have survived in this file before.
+#
+# So: run the REAL main() in a subprocess for each flag combination, with run()
+# stubbed out, and require a clean exit with no traceback. This test does NOT
+# reproduce a bug that ever reached a commit; it closes the path that let one
+# get close.
+CLI_CASES = [
+    ([], 0),
+    (["--json"], 0),
+    (["--baseline-only"], 0),
+    (["--baseline-only", "--json"], 0),
+    (["--no-baseline"], 0),
+    (["--no-nt"], 0),
+    (["--brightness", "55"], 0),
+    (["--cameras", "CAM"], 0),
+    (["--max-blur-px", "3", "--blur-rate", "270"], 0),
+    (["--max-gain", "60"], 0),
+    (["--dwell", "2", "--settle", "0.4"], 0),
+    (["--nt-server", "10.0.0.2"], 0),
+    (["--max-blur-px", "0"], 1),      # the budget IS the exposure; 0 is refused
+    (["--blur-rate", "-1"], 1),
+]
+
+_CLI_CHILD = r'''
+import sys
+sys.path.insert(0, sys.argv[1])
+import photontune as pt
+rec = {"camera": "CAM", "uniqueName": "u", "applied": 864.0, "gain": 40,
+       "baseline_changed": ["cameraBrightness"], "trials": []}
+async def fake_run(cfg, log=print, progress=None, on_camera=None):
+    return [rec]
+pt.run = fake_run
+sys.argv = ["photontune.py", "--host", "127.0.0.1"] + sys.argv[2:]
+pt.main()
+'''
+
+
+def cli_smoke(src_dir):
+    print("=" * 70)
+    print("CLI PATHS  - the real main(), every flag combination, run() stubbed")
+    print("=" * 70)
+    bad = 0
+    print("%-42s %-5s %-5s %s" % ("arguments", "want", "got", "clean"))
+    print("-" * 70)
+    for argv, want in CLI_CASES:
+        proc = subprocess.run(
+            [sys.executable, "-c", _CLI_CHILD, src_dir] + argv,
+            capture_output=True, text=True, timeout=120)
+        out = proc.stdout + proc.stderr
+        clean = "Traceback" not in out
+        ok = clean and proc.returncode == want
+        bad += 0 if ok else 1
+        print("%-42s %-5d %-5d %s%s"
+              % (" ".join(argv) or "(no flags)", want, proc.returncode,
+                 "yes" if clean else "NO", "" if ok else "   <-- WRONG"))
+        if not ok:
+            print("      %s" % out.strip().replace("\n", " | ")[:300])
+    print("=" * 70)
+    print("cli paths: %s"
+          % ("all %d correct" % len(CLI_CASES) if not bad else "%d WRONG" % bad))
+    return 1 if bad else 0
+
+
 def sample_floor(src_dir):
     """2 of 3 frames must not clear a 90% gate. Offline."""
     sys.path.insert(0, src_dir)
@@ -523,6 +595,9 @@ def main():
                    help="command that runs photontune")
     p.add_argument("--sample-floor", action="store_true",
                    help="offline: assert a sample too small to judge is refused.")
+    p.add_argument("--cli-smoke", action="store_true",
+                   help="offline: run the real main() over every flag "
+                        "combination with run() stubbed. No hardware.")
     p.add_argument("--gain-walk", action="store_true",
                    help="offline: drive the real pass/reject rule with recorded "
                         "samples and show which gain the walk lands on. No "
@@ -535,6 +610,8 @@ def main():
     a = p.parse_args()
     if a.verdict_matrix:
         sys.exit(verdict_matrix(a.src))
+    if a.cli_smoke:
+        sys.exit(cli_smoke(a.src))
     if a.gain_walk:
         sys.exit(gain_walk_replay(a.src))
     if a.sample_floor:

@@ -1052,6 +1052,10 @@ class Config:
     no_nt: bool = False
     nt_server: object = None
 
+    # output. Named emit_json rather than json so nothing inside this class
+    # can shadow the module of that name.
+    emit_json: bool = False
+
     # wiring, filled in once by _run_inner and by the daemon. Not policy.
     readers: dict = dataclasses.field(default_factory=dict)
     nt_inst: object = None
@@ -1064,7 +1068,7 @@ class Config:
                    dwell=a.dwell, settle=a.settle, min_tags=a.min_tags,
                    max_ambiguity=a.max_ambiguity, baseline=a.baseline,
                    baseline_only=a.baseline_only, brightness=a.brightness,
-                   no_nt=a.no_nt, nt_server=a.nt_server)
+                   no_nt=a.no_nt, nt_server=a.nt_server, emit_json=a.json)
 
 
 class Search:
@@ -1471,15 +1475,18 @@ async def _rescue(pv, cam, cfg, st, log):
         ladder = geometric_sweep(st.t_budget, ceiling, EXPOSURE_WALK_STEPS + 1)[1:]
         gain = gains[-1]
 
-    for i, e in enumerate(ladder):
+    for e in ladder:
         _check_abort(cfg, "walking exposure at %.0f us" % e)
         e = min(max(e, lo_e), hi_e)
         s = await trial(pv, cam, cfg, gain, e, log)
         st.trials.append(s)
-        # No tag reference on this walk. The reference is "the best the scene
-        # can do INSIDE the budget", and this walk has already left the budget -
-        # comparing against a count that was measured in a state we have just
-        # abandoned would reject the only settings that work.
+        # No tag reference on either walk, and for the same reason in both
+        # directions: the reference means "the best this scene can do at the
+        # budget exposure", and both walks have left that exposure behind.
+        # On the too-dark walk it would be too strict - the reference was
+        # measured where nothing worked - and on the saturated walk it would
+        # be too lenient, because the reference itself is a washed-out count.
+        # A count from a state we have abandoned is not a floor.
         why = s.why_failed(cfg.min_tags, cfg.max_ambiguity)
         log("   %s gain %-4d exposure %6.0f  %s%s"
             % ("ok " if why is None else "   ", gain, e, s.summary(),
@@ -2555,13 +2562,14 @@ def main():
         finally:
             replay_pending(args.host, args.port)
         return
+    cfg = Config.from_args(args)
     t0 = time.time()
     # The `finally` is the whole fix. An interrupt was never the common case -
     # a websocket death is caught inside tune_camera and returns NORMALLY, so
     # the restore has to hang off the exit, not off an exception.
     try:
         try:
-            results = asyncio.run(_guard_signals(run(Config.from_args(args))))
+            results = asyncio.run(_guard_signals(run(cfg)))
         except (AlreadyRunning, ConnectionError, LookupError) as exc:
             sys.exit("photontune: %s" % exc)
         except (KeyboardInterrupt, Terminated) as exc:
@@ -2571,8 +2579,8 @@ def main():
             # script that launched this can tell WHICH interruption it was.
             print("\ninterrupted - putting camera settings back...")
             sys.exit(143 if isinstance(exc, Terminated) else 130)
-        failed, warnings, code = run_verdict(results, Config.from_args(args))
-        if args.json:
+        failed, warnings, code = run_verdict(results, cfg)
+        if cfg.emit_json:
             print(json.dumps(results, indent=2))
         else:
             print("\ncompleted in %.0f s" % (time.time() - t0))
@@ -2580,7 +2588,7 @@ def main():
                 if r.get("applied"):
                     print("  %-14s exposure -> %.0f, gain %s"
                           % (r["camera"], r["applied"], r.get("gain")))
-                elif args.baseline_only:
+                elif cfg.baseline_only:
                     print("  %-14s baseline asserted%s"
                           % (r["camera"],
                              (" (%d changed)" % len(r["baseline_changed"]))
