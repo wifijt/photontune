@@ -915,7 +915,6 @@ PROBLEMS = {
                   % ", ".join("%s is %s, should be %s" % (k, h, w)
                               for k, w, h in v)),
     "gain_scan_error": (HARD, lambda v: "the gain scan did not finish: %s" % v),
-    "nt_server_not_stopped": (HARD, lambda v: str(v)),
     # ---- warn ----
     "video_mode_switched": (WARN,
         lambda v: "VIDEO MODE CHANGED %s -> %s - this camera is now running a "
@@ -1020,10 +1019,9 @@ def tune_failed(r, args=None):
 def run_problems(args):
     """Problems that belong to the RUN rather than to any one camera.
 
-    "!! COULD NOT STOP the NetworkTables server" was printed and then dropped:
-    the run exited 0 with PhotonVision still serving NetworkTables against the
-    roboRIO, which is the single most disruptive state this tool can leave
-    behind. It has no camera to hang off, so it lives here.
+    A problem with no camera to hang off used to be printed and then dropped -
+    the run exited 0 having reported it. Anything that is true of the whole run
+    lives here so the verdict can still see it.
     """
     return dict(getattr(args, "_run_problems", {}) or {})
 
@@ -1906,12 +1904,13 @@ class RunLock:
     """Advisory lock, so two photontunes cannot fight over the same cameras.
 
     This ships as a daemon AND a CLI on the same box, so a human running the CLI
-    while the daemon's autorun fires is normal rather than exotic, and nothing
-    detected it. Overlapping runs are not merely wasteful: MEASURED on this rig,
-    the second run's NetworkTables-server toggle calls
-    NetworkManager.reinitialize(), which killed the first run's websocket with
-    "no close frame received or sent" and left the camera parked mid-sweep at
-    9966 us on gain 0.
+    while the daemon fires is normal rather than exotic, and nothing detected
+    it. Overlapping runs are not merely wasteful: two writers driving the same
+    camera's gain and exposure interleave, so each one measures the other's
+    settings and both answers are meaningless. MEASURED on this rig with the
+    NetworkTables-server toggle that used to live here, the second run bounced
+    the network stack, killed the first run's websocket with "no close frame
+    received or sent" and left the camera parked mid-sweep at 9966 us on gain 0.
 
     Takes BOTH paths rather than the first one that works. /run is the
     conventional home but is root-only here (drwxr-xr-x root root), and the
@@ -1998,12 +1997,12 @@ class RunLock:
 
     def message(self):
         return ("another photontune is already running (%s).\n"
-                "  Two at once fight over the same cameras: the second one's "
-                "NetworkTables-server\n"
-                "  toggle bounces the network stack and kills the first one's "
-                "websocket mid-sweep,\n"
-                "  leaving a camera at whatever exposure it was testing. Wait "
-                "for it, or stop it." % (self.holder or "pid unknown"))
+                "  Two at once fight over the same cameras: each one measures "
+                "the other's writes,\n"
+                "  so both answers are meaningless and whichever finishes last "
+                "leaves the camera\n"
+                "  wherever it happened to be. Wait for it, or stop it."
+                % (self.holder or "pid unknown"))
 
 
 async def run(args, log=print, progress=None, on_camera=None):
@@ -2017,48 +2016,8 @@ async def run(args, log=print, progress=None, on_camera=None):
 
 
 async def _run_locked(args, log=print, progress=None, on_camera=None):
-    args._nt_we_started = False
-    args._nt_cfg = None
     args._run_problems = {}      # per RUN, not per camera; reset every trigger
-    if not getattr(args, "no_nt", False) and getattr(args, "manage_nt_server", True):
-        # Must happen BEFORE the Photon websocket is opened. Toggling the NT
-        # server posts to /api/settings/general, which also calls
-        # NetworkManager.reinitialize() and bounces the interface - killing any
-        # connection we are already holding ("no close frame received or sent").
-        cfg = await read_network_config(args.host, args.port)
-        if cfg and not cfg.get("runNTServer"):
-            target = cfg.get("ntServerAddress") or args.host
-            if not nt_server_reachable(target):
-                log("no NetworkTables server at %s - starting PhotonVision's"
-                    " temporarily (stopped again afterwards)" % target)
-                args._nt_cfg = cfg
-                # Record that we ASKED before checking whether it worked: if it
-                # half-worked we still own turning it off again.
-                args._nt_we_started = True
-                if not await set_nt_server(args.host, cfg, True, args.port, log):
-                    log("   continuing without it; sampling will fall back to "
-                        "the throttled websocket")
-    try:
-        return await _run_inner(args, log, progress, on_camera)
-    finally:
-        if args._nt_we_started:
-            # Log AFTER the read-back, not before it. This line used to print
-            # unconditionally and was the only record anyone had.
-            if await set_nt_server(args.host, args._nt_cfg, False, args.port, log):
-                log("stopped the NetworkTables server we started")
-            else:
-                log("!! COULD NOT STOP the NetworkTables server we started - "
-                    "PhotonVision is still serving NetworkTables and will fight "
-                    "the roboRIO. Turn runNTServer off in the dashboard.")
-                # Recorded, not merely printed. This exited 0: the tune was fine
-                # and the coprocessor was left serving NetworkTables against the
-                # roboRIO, which is the most disruptive state this tool can
-                # create and the one a human most needs to be told about.
-                note_run_problem(
-                    args, "nt_server_not_stopped",
-                    "PhotonVision is STILL serving NetworkTables - photontune "
-                    "started it and could not stop it again. It will fight the "
-                    "roboRIO. Turn runNTServer off in the dashboard.")
+    return await _run_inner(args, log, progress, on_camera)
 
 
 async def _run_inner(args, log=print, progress=None, on_camera=None):
@@ -2300,118 +2259,6 @@ def replay_pending(host, port=5800, log=print):
     return done
 
 
-NETCFG_FIELDS = ["ntServerAddress", "connectionType", "staticIp", "hostname",
-                 "runNTServer", "shouldManage", "shouldPublishProto",
-                 "networkManagerIface", "setStaticCommand", "setDHCPcommand"]
-
-
-async def read_network_config(host, port=5800):
-    """PhotonVision's network settings, off the websocket broadcast."""
-    uri = "ws://%s:%d/websocket_data" % (host, port)
-    async with websockets.connect(uri, max_size=None, open_timeout=10) as ws:
-        for _ in range(60):
-            m = msgpack.unpackb(await asyncio.wait_for(ws.recv(), 10), raw=False)
-            if not isinstance(m, dict):
-                continue
-            st = m.get("settings")
-            if not isinstance(st, dict):
-                continue
-            nw = st.get("networkSettings") or st.get("network")
-            if nw:
-                return {k: nw[k] for k in NETCFG_FIELDS if k in nw}
-    return None
-
-
-async def set_nt_server(host, cfg, enabled, port=5800, log=None, timeout=20.0):
-    """Turn PhotonVision's own NT server on or off, live, and CONFIRM it.
-
-    Applied by NetworkTablesManager.setConfig() without restarting PhotonVision.
-    Send the WHOLE config with one field changed - the endpoint also calls
-    NetworkManager.reinitialize(), and with shouldManage=true a partial body
-    would let Jackson default-fill fields and could take the coprocessor off the
-    network. Verified: posting the config back unchanged is a clean no-op.
-
-    The POST's own reply proves nothing either way: the HTTP connection drops
-    without a response while the network stack bounces, so a failed read is
-    expected. That was used as licence to swallow EVERY exception and return, and
-    the caller then logged "stopping the NetworkTables server we started"
-    unconditionally - while runNTServer has been found left True after runs that
-    all claimed to have stopped it. Read the config back instead, and say what it
-    actually says. Returns True only if the observed state is the one asked for.
-
-    The wait is polled rather than two hard-coded 4 s sleeps - 8 s of every run
-    spent whether or not anything had happened yet.
-    """
-    import urllib.request, urllib.error
-    body = dict(cfg)
-    body["runNTServer"] = bool(enabled)
-    req = urllib.request.Request(
-        "http://%s:%d/api/settings/general" % (host, port),
-        data=json.dumps(body).encode(), method="POST",
-        headers={"Content-Type": "application/json"})
-
-    def _post():
-        try:
-            urllib.request.urlopen(req, timeout=15).read()
-            return None
-        except Exception as exc:
-            return exc            # expected: the stack restarts under the reply
-
-    posted = await asyncio.get_event_loop().run_in_executor(None, _post)
-    t0 = time.time()
-    seen = None
-    while time.time() - t0 < timeout:
-        await asyncio.sleep(0.5)
-        try:
-            cur = await asyncio.wait_for(read_network_config(host, port), 8)
-        except Exception:
-            continue              # websocket is down while the stack bounces
-        if not cur:
-            continue
-        seen = cur.get("runNTServer")
-        if bool(seen) == bool(enabled):
-            if log:
-                log("   PhotonVision's NT server is %s - confirmed after %.1f s"
-                    % ("ON" if enabled else "OFF", time.time() - t0))
-            return True
-    if log:
-        log("   !! PhotonVision's NT server did NOT go %s: runNTServer still "
-            "reads %r after %.0f s%s"
-            % ("on" if enabled else "off", seen, time.time() - t0,
-               " (POST raised %s)" % type(posted).__name__ if posted else ""))
-    return False
-
-
-def nt_server_reachable(server, wait=4.0):
-    """Is anything serving NetworkTables at `server`?"""
-    try:
-        import ntcore
-    except ImportError:
-        return False
-    # A PRIVATE instance. This used to call startClient4 on the DEFAULT instance -
-    # the same singleton the daemon publishes its status table on - under a
-    # different identity, which orphaned the daemon's publishers. Measured: after
-    # a clean tune the daemon's own log said ok=True while the NT table a team
-    # reads still said "running..." and ok=False, forever. Only `heartbeat`, which
-    # is written every loop, kept moving.
-    inst = ntcore.NetworkTableInstance.create()
-    try:
-        inst.startClient4("photontune-probe")
-        inst.setServer(server, ntcore.NetworkTableInstance.kDefaultPort4)
-        end = time.time() + wait
-        while time.time() < end:
-            if inst.isConnected():
-                return True
-            time.sleep(0.2)
-    finally:
-        try:
-            inst.stopClient()
-            ntcore.NetworkTableInstance.destroy(inst)
-        except Exception:
-            pass
-    return False
-
-
 class NTResults:
     """Read PhotonVision's detections off NetworkTables instead of its websocket.
 
@@ -2427,9 +2274,13 @@ class NTResults:
     "OSError: [Errno 98] Address already in use" on the coprocessor itself.
     Packet + PhotonPipelineResult start no threads.
 
-    Needs an NT server to exist somewhere. On a robot that is the roboRIO; on a
-    bench it is PhotonVision itself when runNTServer is on. If there is none,
-    callers fall back to the websocket.
+    Needs an NT server to ALREADY exist somewhere - on a robot, the roboRIO.
+    photontune never creates one. Verified from PhotonVision's source: toggling
+    runNTServer posts to /api/settings/general, which calls stopServer() (which
+    orphans every NT client) AND NetworkManager.reinitialize(), and the latter
+    restarts the web server and drops every websocket regardless of
+    shouldManage. Managing the server destroys the tool's own control channel.
+    With no server reachable, callers fall back to the websocket at ~9 Hz.
     """
 
     def __init__(self, server, nickname):
@@ -2438,8 +2289,10 @@ class NTResults:
         from photonlibpy.targeting.photonPipelineResult import PhotonPipelineResult
         self._Packet = Packet
         self._Result = PhotonPipelineResult
-        # Private instance, for the same reason as nt_server_reachable: sampling
-        # must not re-point or re-identify the connection the daemon publishes on.
+        # A PRIVATE instance. Sampling must not re-point or re-identify the
+        # connection the daemon publishes its status table on: sharing the
+        # default singleton orphaned the daemon's publishers, and its NT table
+        # then said "running...", ok=false, forever.
         self.inst = ntcore.NetworkTableInstance.create()
         self._own_inst = True
         self.inst.startClient4("photontune-nt")
@@ -3029,11 +2882,6 @@ def build_parser():
                    help="assert the structural settings and stop - do not tune")
     p.add_argument("--no-nt", action="store_true",
                    help="always sample from the websocket, never NetworkTables")
-    p.add_argument("--no-manage-nt-server", dest="manage_nt_server",
-                   action="store_false", default=True,
-                   help="do NOT start PhotonVision's NT server when none is found. "
-                        "By default photontune starts it, tunes, and stops it again, "
-                        "so a stray server is never left to fight the roboRIO.")
     p.add_argument("--autorun", action="store_true",
                    help="daemon: tune once automatically after PhotonVision comes up")
     p.add_argument("--autorun-delay", type=float, default=5.0,
@@ -3150,17 +2998,6 @@ def main():
                 # DEPLOYED mode. Without this the signal unwound to the top with a
                 # traceback and, worse, any camera left mid-sweep stayed there.
                 print("photontune: stopping - restoring any camera left mid-tune")
-                # and never leave PhotonVision's NT server running behind us
-                try:
-                    if getattr(args, "_nt_we_started", False):
-                        cfg = asyncio.run(read_network_config(args.host, args.port))
-                        if cfg:
-                            ok = asyncio.run(set_nt_server(args.host, cfg, False,
-                                                           args.port, print))
-                            print("  turned PhotonVision's NT server back off" if ok
-                                  else "  !! PhotonVision's NT server is STILL ON")
-                except Exception:
-                    pass
                 sys.exit(0)
         finally:
             replay_pending(args.host, args.port)

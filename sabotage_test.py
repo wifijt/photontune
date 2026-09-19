@@ -83,7 +83,6 @@ MATRIX_VALUES = {
     "apply_unconfirmed":      ("camera", "no cameraSettings after the write"),
     "final_state_wrong":      ("camera", [["cameraRedGain", 0, 50]]),
     "gain_scan_error":        ("camera", "ConnectionClosed, 4 candidates untried"),
-    "nt_server_not_stopped":  ("run",    "PhotonVision is STILL serving NT"),
     "video_mode_switched":    ("camera", [0, 1]),
     "would_switch_video_mode": ("camera", [0, 1]),
     "over_blur_budget":       ("camera", 17.9),
