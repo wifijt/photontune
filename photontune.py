@@ -866,22 +866,124 @@ def _escalate_to(args, gain):
     return min(float(args.max_gain), max(gain * 1.5, gain + 10)), False
 
 
-# Failures that must survive being handed up through a recursion or a search.
+# ───────────────── every problem the tool can record ─────────────────
+#
+# THE REGISTRY IS THE VERDICT. There is no other list.
+#
+# Before this, tune_failed() consulted three keys while the code recorded ten,
+# so six detected failures exited 0 - the worst being apply_mismatch, where the
+# tool verified its own final write, printed "*** MISMATCH ***", and then set
+# result["applied"] anyway. A tool that detects its own write failed and reports
+# success is worse than one that never checked.
+#
+# HARD: the run did not do what it says it did. exit 1, and ok=false in NT.
+# WARN: the answer stands, but a human has to be told. exit 0, and the text MUST
+#       appear in the CLI summary and in the daemon's NT status.
+#
+# Adding a problem without adding it here is not possible: note_problem() is the
+# only way to record one and it raises on an unregistered key.
+HARD, WARN = "hard", "warn"
+
+PROBLEMS = {
+    # ---- hard ----
+    "baseline_failed": (HARD,
+        lambda v: "structural settings did not take: %s"
+                  % ", ".join(str(f[0]) for f in v)),
+    "baseline_unconfirmed": (HARD,
+        lambda v: "could not confirm the baseline took (%s)" % v),
+    "setting_rejected": (HARD,
+        lambda v: "the camera rejected %s"
+                  % ", ".join(str(b[0]) for b in v)),
+    "unverified": (HARD,
+        lambda v: "could not read the camera back to confirm the gain (%s)" % v),
+    "calibration_problem": (HARD, lambda v: str(v)),
+    "apply_mismatch": (HARD,
+        lambda v: "the FINAL write did not take: wanted gain %s / exposure %s, "
+                  "camera reports gain %s / exposure %s"
+                  % (v["wanted"][0], v["wanted"][1], v["got"][0], v["got"][1])),
+    "apply_unconfirmed": (HARD,
+        lambda v: "could not confirm the final write (%s)" % v),
+    "final_state_wrong": (HARD,
+        lambda v: "the camera did not END the run in the state we set: %s"
+                  % ", ".join("%s is %s, should be %s" % (k, h, w)
+                              for k, w, h in v)),
+    "gain_scan_error": (HARD, lambda v: "the gain scan did not finish: %s" % v),
+    "nt_server_not_stopped": (HARD, lambda v: str(v)),
+    # ---- warn ----
+    "video_mode_switched": (WARN,
+        lambda v: "VIDEO MODE CHANGED %s -> %s - this camera is now running a "
+                  "different RESOLUTION than it was. It had no calibration for "
+                  "the old one." % (v[0], v[1])),
+    "would_switch_video_mode": (WARN,
+        lambda v: "would switch the video mode %s -> %s (not done: --dry-run)"
+                  % (v[0], v[1])),
+    "over_blur_budget": (WARN,
+        lambda v: "%.1f px of motion blur, over the budget - fine on a bench, "
+                  "smeared on a moving robot. Add light, or raise --max-gain." % v),
+    "range_warning": (WARN,
+        lambda v: "reference tag: %s"
+                  % (("measured %.2f m against a stated %.2f m"
+                      % (v["measured"], v["stated"])) if isinstance(v, dict) else v)),
+    "fellback": (WARN,
+        lambda v: "the chosen exposure failed its own verification; fell back to "
+                  "the shortest exposure that had already passed"),
+    "would_baseline": (WARN,
+        lambda v: "would change %s (not done: --dry-run)" % ", ".join(sorted(v))),
+}
+
+HARD_KEYS = tuple(k for k, (sev, _) in PROBLEMS.items() if sev == HARD)
+WARN_KEYS = tuple(k for k, (sev, _) in PROBLEMS.items() if sev == WARN)
+
+
+def note_problem(rec, key, value=True):
+    """Record a problem. The ONLY way to record one.
+
+    Raises on an unregistered key rather than accepting it: an unregistered key
+    is a problem the verdict cannot see, which is the whole bug class this
+    registry exists to close.
+    """
+    if key not in PROBLEMS:
+        raise KeyError("unregistered problem %r - add it to PROBLEMS, with a "
+                       "deliberate HARD/WARN decision" % key)
+    rec[key] = value
+    return rec
+
+
+def problem_notes(rec, severity=None):
+    """[(key, severity, text)] for every problem recorded on this record."""
+    out = []
+    for key, (sev, describe) in PROBLEMS.items():
+        v = rec.get(key)
+        if not v:
+            continue
+        if severity is not None and sev != severity:
+            continue
+        try:
+            text = describe(v)
+        except Exception:
+            text = "%s=%r" % (key, v)
+        out.append((key, sev, text))
+    return out
+
+
+# Problems must survive being handed up through a recursion or a search.
 #
 # Every one of these was recorded and then lost. tune_camera escalates gain with
 # `return await tune_camera(...)`, which discards the outer frame's dict, and the
 # gain search calls tune_camera with skip_baseline=True, so the frame that ran the
 # baseline is not the frame that returns. The record therefore belongs to the
 # CALLER, which is the only party present for the whole camera.
-FAILURE_KEYS = ("baseline_failed", "setting_rejected", "calibration_problem")
+FAILURE_KEYS = tuple(PROBLEMS)
 
 
 def merge_failures(rec, r):
-    """Fold a tune result into the caller's per-camera record, keeping failures.
+    """Fold a tune result into the caller's per-camera record, keeping problems.
 
     A plain dict.update() is not enough in either direction: the callee may know
     about a rejected setting the caller does not, and the caller may know about a
-    baseline failure the callee (skip_baseline=True) never saw.
+    baseline failure the callee (skip_baseline=True) never saw. Warnings need the
+    same protection as failures - video_mode_switched is recorded by the caller
+    and would otherwise be overwritten by a callee that never saw the switch.
     """
     keep = {k: rec[k] for k in FAILURE_KEYS if rec.get(k)}
     rec.update(r or {})
@@ -896,7 +998,7 @@ def tune_failed(r, args=None):
     rotated 90 degrees with a gain that never took still reported ok=true to the
     dashboard - the one signal a team actually trusts.
     """
-    if any(r.get(k) for k in FAILURE_KEYS):
+    if any(r.get(k) for k in HARD_KEYS):
         return True
     if getattr(args, "baseline_only", False):
         return bool(r.get("error")) and "baseline only" not in str(r.get("error"))
@@ -906,6 +1008,44 @@ def tune_failed(r, args=None):
         # measured nothing at all still exited 0.
         return not r.get("would_apply")
     return not r.get("applied")
+
+
+def run_problems(args):
+    """Problems that belong to the RUN rather than to any one camera.
+
+    "!! COULD NOT STOP the NetworkTables server" was printed and then dropped:
+    the run exited 0 with PhotonVision still serving NetworkTables against the
+    roboRIO, which is the single most disruptive state this tool can leave
+    behind. It has no camera to hang off, so it lives here.
+    """
+    return dict(getattr(args, "_run_problems", {}) or {})
+
+
+def note_run_problem(args, key, value=True):
+    if not hasattr(args, "_run_problems") or args._run_problems is None:
+        args._run_problems = {}
+    note_problem(args._run_problems, key, value)
+    return args._run_problems
+
+
+def run_verdict(results, args):
+    """(failed, warnings, exit_code) for a whole run. The CLI and daemon agree.
+
+    Factored out of main() so the verdict can be tested directly - see
+    sabotage_test.py --verdict-matrix, which asserts the exit code for every key
+    in PROBLEMS one at a time.
+    """
+    rp = run_problems(args)
+    failed = [r for r in (results or []) if tune_failed(r, args)]
+    warnings = []
+    for r in (results or []):
+        for _k, _sev, text in problem_notes(r, WARN):
+            warnings.append((r.get("camera", "?"), text))
+    for _k, _sev, text in problem_notes(rp, WARN):
+        warnings.append(("run", text))
+    hard_run = problem_notes(rp, HARD)
+    code = 1 if (failed or hard_run or not results) else 0
+    return failed, warnings, code
 
 
 async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
@@ -968,7 +1108,7 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
         if problem:
             log("   !! CALIBRATION: %s" % problem)
             result["error"] = "no calibration for the active resolution"
-            result["calibration_problem"] = problem
+            note_problem(result, "calibration_problem", problem)
             return result
         if getattr(args, "baseline_only", False):
             result["applied"] = None
@@ -983,11 +1123,21 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
             for k, want, have in rejected:
                 log("   WARNING: %s did not take (wanted %s, camera has %s)" % (k, want, have))
             log("   the sweep below is NOT at the gain it claims - results are unreliable")
-            result["setting_rejected"] = [list(map(str, b)) for b in rejected]
+            note_problem(result, "setting_rejected",
+                         [list(map(str, b)) for b in rejected])
         if unverified:
-            log("   NOTE: could not read the camera back to confirm the gain. The"
-                " settings were sent; this is a readback timeout, not a rejection.")
-            result["unverified"] = True
+            # NOT a shrug any more. This is reached only after polling for the
+            # whole confirm timeout, which means PhotonVision stopped answering
+            # with cameraSettings at all - the state a bad pipeline selection
+            # puts it in. Everything measured after it is unattributable: the
+            # sweep cannot say what gain it ran at.
+            log("   !! could not read the camera back to confirm the gain, after"
+                " polling for %.0f s." % CONFIRM_TIMEOUT_S)
+            log("   !! PhotonVision is not reporting cameraSettings. Nothing"
+                " below can be attributed to a known gain.")
+            note_problem(result, "unverified",
+                         "no cameraSettings from PhotonVision for %.0f s"
+                         % CONFIRM_TIMEOUT_S)
 
         # What is the camera doing RIGHT NOW, before we touch the exposure? Used
         # afterwards to tell a bad measurement from a genuine detection cliff.
@@ -1078,10 +1228,12 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
                         % (100 * ratio))
                     log("            Tuning at the wrong distance biases exposure badly -")
                     log("            too close under-exposes you for real field tags.")
-                    result["range_warning"] = {"measured": measured, "stated": args.reference_range}
+                    note_problem(result, "range_warning",
+                                 {"measured": measured,
+                                  "stated": args.reference_range})
             else:
                 log("   WARNING: reference tag %d never seen at any exposure." % args.reference_tag)
-                result["range_warning"] = "reference tag never detected"
+                note_problem(result, "range_warning", "never detected")
 
         # A single held tag is detected at shorter exposures than a full multi-tag
         # solve needs, so held-card mode measures a LOWER cliff than field
@@ -1207,7 +1359,7 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
             log("   !! gain is already at %g. Works on a BENCH; will smear on a"
                 % gain)
             log("   !! moving robot. Add light, or raise --max-gain.")
-            result["over_blur_budget"] = round(predicted, 1)
+            note_problem(result, "over_blur_budget", round(predicted, 1))
         elif predicted > args.max_blur_px and at_floor:
             log("   note: %.1f px of blur at %.0f deg/s is over the %.0f px budget,"
                 % (predicted, args.blur_rate, args.max_blur_px))
@@ -1215,7 +1367,7 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
                 % args.min_exposure)
             log("   more gain cannot buy a shorter exposure. Lower --min-exposure"
                 " to explore further, or add light.")
-            result["over_blur_budget"] = round(predicted, 1)
+            note_problem(result, "over_blur_budget", round(predicted, 1))
 
         if args.dry_run:
             log("   dry run - would set exposure %.0f at gain %g; restoring original"
@@ -1247,7 +1399,7 @@ async def tune_camera(pv, cam, args, log=print, progress=None, original=None,
                 await pv.set_setting(unique, cameraExposureRaw=float(shortest.exposure))
                 await asyncio.sleep(args.settle)
                 result["applied"] = shortest.exposure
-                result["fellback"] = True
+                note_problem(result, "fellback", True)
         PENDING_RESTORE.pop(unique, None)
         return result
 
@@ -1722,6 +1874,7 @@ async def run(args, log=print, progress=None, on_camera=None):
 async def _run_locked(args, log=print, progress=None, on_camera=None):
     args._nt_we_started = False
     args._nt_cfg = None
+    args._run_problems = {}      # per RUN, not per camera; reset every trigger
     if not getattr(args, "no_nt", False) and getattr(args, "manage_nt_server", True):
         # Must happen BEFORE the Photon websocket is opened. Toggling the NT
         # server posts to /api/settings/general, which also calls
@@ -1752,6 +1905,15 @@ async def _run_locked(args, log=print, progress=None, on_camera=None):
                 log("!! COULD NOT STOP the NetworkTables server we started - "
                     "PhotonVision is still serving NetworkTables and will fight "
                     "the roboRIO. Turn runNTServer off in the dashboard.")
+                # Recorded, not merely printed. This exited 0: the tune was fine
+                # and the coprocessor was left serving NetworkTables against the
+                # roboRIO, which is the most disruptive state this tool can
+                # create and the one a human most needs to be told about.
+                note_run_problem(
+                    args, "nt_server_not_stopped",
+                    "PhotonVision is STILL serving NetworkTables - photontune "
+                    "started it and could not stop it again. It will fight the "
+                    "roboRIO. Turn runNTServer off in the dashboard.")
 
 
 async def _run_inner(args, log=print, progress=None, on_camera=None):
@@ -1877,7 +2039,7 @@ async def _tune_all(pv, cams, outer_args, log, progress, on_camera, results):
                 if _prob:
                     log("   !! CALIBRATION: %s" % _prob)
                     rec["error"] = "no calibration for the active resolution"
-                    rec["calibration_problem"] = _prob
+                    note_problem(rec, "calibration_problem", _prob)
                     results.append(rec)
                     continue
                 r = await optimise_gain(pv, cam, args, log, cam_progress,
@@ -2402,6 +2564,8 @@ async def daemon(args, log=print):
     busy = tbl.getEntry("busy")              # true while sweeping
     ok_entry = tbl.getEntry("ok")            # <- go / no-go for the last run
     summary = tbl.getEntry("summary")        # <- one line, what it did
+    warnings_e = tbl.getEntry("warnings")    # <- things that are not failures but
+                                             #    that a human must still be told
     progress_e = tbl.getEntry("progress")    # <- 0..1, for a progress bar
     heartbeat = tbl.getEntry("heartbeat")    # <- proves the service is alive
     result_entry = tbl.getEntry("result")    # full JSON
@@ -2420,6 +2584,7 @@ async def daemon(args, log=print):
     hold_e.setBoolean(False)
     status.setString("idle")
     summary.setString("never run")
+    warnings_e.setString("")
     hold_e.setBoolean(False)
     busy.setBoolean(False)
     ok_entry.setBoolean(False)
@@ -2484,6 +2649,7 @@ async def daemon(args, log=print):
 
                 run_ok = {"value": False, "summary": ""}
                 busy.setBoolean(True)
+                warnings_e.setString("")
                 ok_entry.setBoolean(False)
                 progress_e.setDouble(0.0)
                 if args.reference_tag is not None:
@@ -2512,7 +2678,7 @@ async def daemon(args, log=print):
                 try:
                     res = await run(args, log=cap, progress=lambda f: progress_e.setDouble(f),
                                     on_camera=announce)
-                    failed = [r for r in res if tune_failed(r, args)]
+                    failed, warns, code = run_verdict(res, args)
                     applied = [r for r in res if r not in failed and r.get("applied")]
                     line = "; ".join(
                         "%s=%.0f%s" % (r["camera"], r["applied"], " (fallback)" if r.get("fellback") else "")
@@ -2520,7 +2686,19 @@ async def daemon(args, log=print):
                     if failed:
                         line += ("; FAILED: " + ", ".join(
                             "%s (%s)" % (r["camera"], r.get("error", "?")) for r in failed))
-                    every_camera_ok = bool(applied) and not failed
+                    for _k, _s, _t in problem_notes(run_problems(args), HARD):
+                        line += "; FAILED: %s" % _t
+                    # Warnings reach the dashboard, not just the log. A camera
+                    # whose RESOLUTION this tool changed, or one applied over the
+                    # blur budget, published ok=true and said nothing - so the
+                    # one signal a team reads could not tell them their camera is
+                    # no longer running the mode they set.
+                    wline = " | ".join("%s: %s" % (who, t) for who, t in warns)
+                    warnings_e.setString(wline[:500])
+                    if wline:
+                        line += "  [WARN] " + wline
+                        log("WARNINGS: " + wline)
+                    every_camera_ok = bool(applied) and code == 0
                     run_ok["value"] = every_camera_ok
                     run_ok["summary"] = line or "no cameras tuned"
                     ok_entry.setBoolean(every_camera_ok)
@@ -2830,32 +3008,48 @@ def main():
             # The interrupted loop could not complete the restore. Do it on a new one.
             print("\ninterrupted - putting camera settings back...")
             sys.exit(130)
+        # --baseline-only never sets `applied` by design, so "no applied" cannot
+        # mean failure in that mode. A baseline that did NOT take, or a rejected
+        # setting, MUST mean failure in every mode - previously both were recorded
+        # and never consulted, so the tool reported success with a 90-degree
+        # rotated image and a gain that never applied.
+        failed, warnings, code = run_verdict(results, args)
         if args.json:
             print(json.dumps(results, indent=2))
         else:
             print("\ncompleted in %.0f s" % (time.time() - t0))
             for r in results:
                 if r.get("applied"):
-                    print("  %-14s exposure -> %.0f%s" % (r["camera"], r["applied"],
-                                                          "  (fallback)" if r.get("fellback") else ""))
+                    print("  %-14s exposure -> %.0f, gain %s%s"
+                          % (r["camera"], r["applied"], r.get("gain"),
+                             "  (fallback)" if r.get("fellback") else ""))
                 elif r.get("would_apply"):
                     print("  %-14s would set exposure -> %.0f, gain %s  (dry run)"
                           % (r["camera"], r["would_apply"],
                              r.get("would_gain", r.get("gain"))))
                 else:
                     print("  %-14s unchanged (%s)" % (r["camera"], r.get("error", "dry run")))
-        # --baseline-only never sets `applied` by design, so "no applied" cannot
-        # mean failure in that mode. A baseline that did NOT take, or a rejected
-        # setting, MUST mean failure in every mode - previously both were recorded
-        # and never consulted, so the tool reported success with a 90-degree
-        # rotated image and a gain that never applied.
-        failed = [r for r in results if tune_failed(r, args)]
-        if failed:
-            for r in failed:
-                why = (r.get("calibration_problem") or r.get("error")
-                       or ("baseline did not apply: %s" % r.get("baseline_failed")))
-                print("FAILED %s: %s" % (r.get("camera"), why))
-        sys.exit(1 if (failed or not results) else 0)
+            # Warnings are NOT failures and are NOT footnotes. A camera left on a
+            # resolution nobody chose, or applied with 17.9 px of blur against a
+            # 1 px budget, both used to exit 0 with nothing in the summary at all.
+            if warnings:
+                print("")
+                print("WARNINGS - the tune stands, but these need a human to know:")
+                for who, text in warnings:
+                    print("  %-14s %s" % (who, text))
+        for r in failed:
+            notes = [t for _k, _s, t in problem_notes(r, HARD)]
+            # The recorded problem first, not `error`: on --baseline-only the
+            # error field says the benign "baseline only - not tuned" while the
+            # actual failure is the read-back that could not confirm.
+            why = "; ".join(notes) or r.get("error") or "did not apply anything"
+            print("FAILED %s: %s" % (r.get("camera"), why))
+            for text in notes:
+                if text not in why:
+                    print("       %s" % text)
+        for _k, _sev, text in problem_notes(run_problems(args), HARD):
+            print("FAILED run: %s" % text)
+        sys.exit(code)
     finally:
         # EVERY exit path, including the ordinary one and sys.exit above.
         replay_pending(args.host, args.port)
