@@ -124,13 +124,18 @@ the grid up from 0, stop at the first point that sees every tag the reference
 saw, apply that plus one grid step. Reprojection is reported and never used to
 choose anything.
 
-Measured on this rig, both cameras, no NetworkTables server anywhere:
+Measured on this rig, both cameras, no NetworkTables server anywhere. The
+before column is `33951b3` run under exactly those conditions
+(`--no-manage-nt-server`, so it does not create the server the new build
+refuses to create); the 125-143 s in the round-2 notes was measured WITH
+PhotonVision's NT server running, which that build started for itself:
 
 | | before | after |
 |---|---|---|
-| two-camera run | 125-143 s | **42-45 s** |
+| two-camera run | **130 s**, measured here on `33951b3` | **43.5-43.7 s** |
+| the answer it gives | 1500 us at gain 80 and 100 - **10.4 px of blur, over its own budget**, and the two cameras disagree in the same room | 863/860 us at gain 40 on both - 6.0 px, inside budget |
 | baseline-only (the boot path) | ~131 s, a full tune | **8-10 s** |
-| six consecutive runs, same camera | gain 60/80/60/80/100/100 | **the same gain six times** |
+| six consecutive runs, two cameras | gain 60/80/60/80/100/100 on one camera | **the same gain twelve times out of twelve** |
 | `photontune.py` | 3229 lines | 2624 |
 
 Deleted: the gain scan and its decision machinery, NT-server management,
