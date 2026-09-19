@@ -147,8 +147,8 @@ def rate_upper_bound(hits, n, z=_RATE_Z):
 MIN_SAMPLE_FRAMES = 20
 
 # How long a collect may run PAST its dwell to reach MIN_SAMPLE_FRAMES. Bounded
-# on purpose: a dead pipeline must not add this to all eight sweep points, which
-# is why the extension also requires at least one frame to have arrived.
+# on purpose: a dead pipeline must not add this to every trial in the walk,
+# which is why the extension also requires at least one frame to have arrived.
 SAMPLE_EXTEND_S = 4.0
 
 # Exposure bounds to use when a camera does not report its own. Only a
@@ -625,11 +625,11 @@ class Photon:
         """Gather pipeline results for one camera.
 
         min_frames: keep collecting past `seconds` until this many frames have
-        arrived. The websocket is throttled to ~9 fps, so a 0.9 s --fast dwell
-        carries ~8 frames - below MIN_SAMPLE_FRAMES, which would refuse to
-        classify anything in that mode. Extending is the cheap half of the fix.
-        Only extends when frames ARE arriving: at zero the pipeline is dead or
-        the scene is black, and waiting longer buys nothing but a slower sweep.
+        arrived. The websocket is throttled to ~9-11 results/s, so a short
+        dwell can carry fewer than MIN_SAMPLE_FRAMES and nothing could be
+        classified at all. Extending is the cheap half of the fix. Only
+        extends when frames ARE arriving: at zero the pipeline is dead or the
+        scene is black, and waiting longer buys nothing but a slower tune.
         """
         out = {"frames": 0, "solves": 0, "reproj": [], "tags": [], "amb": []}
         def handle(msg):
@@ -814,7 +814,7 @@ async def ensure_calibrated_mode(pv, cam, cfg, log=print):
         await asyncio.sleep(1.0)
     else:
         log("   NOTE: no tags seen in the %.0f s after the mode change - "
-            "continuing anyway, but the sweep below may be measuring a camera "
+            "continuing anyway, but the trials below may be measuring a camera "
             "that is still restarting." % (time.time() - t0))
     return cam, None
 
@@ -831,9 +831,9 @@ def calibration_problem(cam, assume_solvepnp=False):
     honest question is whether the camera will work AFTER it.
 
     With solvePNP on and no calibration for the active resolution, PhotonVision
-    publishes nothing at all, so every exposure scores zero, gain escalates to
-    the ceiling, and the tool blames the lighting. The one config problem it
-    actually is never gets named.
+    publishes nothing at all, so every gain in the walk scores zero, both
+    rescue walks find nothing either, and the tool blames the lighting. The one
+    config problem it actually is never gets named.
     """
     st = cam.get("settings", {})
     if not (assume_solvepnp or st.get("solvePNPEnabled")):
@@ -1831,10 +1831,10 @@ class NTResults:
     """Read PhotonVision's detections off NetworkTables instead of its websocket.
 
     The websocket is the DASHBOARD feed and is throttled for the UI: measured
-    ~9 results/s on a pipeline running 42. A 2.5 s dwell therefore scored each
-    sweep point on ~30 frames, and at a 90% pass threshold that makes 32/36 vs
-    33/36 - one frame - decide a 2x exposure change. NT carries every frame:
-    42.9 results/s measured, ~107 frames per dwell, 4.8x the samples.
+    ~9 results/s on a pipeline running 42. A 4 s dwell therefore scores each
+    trial on ~40 frames, which is enough for the tag-count significance test
+    but leaves a marginal solve rate sitting close to the gate. NT carries
+    every frame: 42.9 results/s measured, ~170 frames per dwell, 4.8x more.
 
     Imports ONLY the decoder. photonlibpy.PhotonCamera pulls in
     photonlibpy/timesync/timeSyncServer.py, which creates a TimeSyncServer at
@@ -1906,10 +1906,10 @@ class NTResults:
 
         Waiting a settle period is not enough. The pipeline runs ~125 ms behind,
         so frames arriving just after an exposure change were exposed BEFORE it.
-        Sampled without this gate, the first sweep point inherited frames from
-        the baseline collect at a much longer exposure and read 0.96 tags where
-        the truth was 0.17 - which then tripped the sanity check. Capture
-        timestamps are stamped at the sensor, so gating on them is exact.
+        Sampled without this gate, the first trial after a change inherited
+        frames exposed at the PREVIOUS setting and read 0.96 tags where the
+        truth was 0.17. Capture timestamps are stamped at the sensor, so
+        gating on them is exact.
         """
         out = {"frames": 0, "solves": 0, "reproj": [], "tags": [], "amb": [],
                "stale_dropped": 0}
@@ -2470,7 +2470,7 @@ async def _guard_signals(coro):
     MEASURED, because the bug report for this was wrong and the wrong diagnosis
     is worth recording. signal.signal was not broken: kill -TERM to the PYTHON
     process restored the camera 14 times out of 14 on this rig (8 different kill
-    positions through a sweep, 4 on the --optimise-gain path, 2 repeats), on both
+    positions through a tune, 4 on the gain-scan path, 2 repeats), on both
     this revision and dc49bcd. The reported "exit 143, no INTERRUPTED line,
     camera left at 6292 us" is a different failure, and it reproduces on demand:
     if photontune is launched under a shell wrapper - `sh -c "python3
@@ -2480,9 +2480,10 @@ async def _guard_signals(coro):
     EXIT=143, `pgrep` still listing the python pid afterwards, log ending at
     "exposure 6292". Nothing inside the process can fix that; kill the python
     process, or use `systemctl stop`, which does.
-    The missing INTERRUPTED line has its own separate explanation: on the
-    --optimise-gain path tune_camera is called with log=lambda m: None, so that
-    line is suppressed even when the restore works perfectly.
+    The missing INTERRUPTED line had its own separate explanation: the gain
+    scan called tune_camera with log=lambda m: None, so the line was
+    suppressed even when the restore worked perfectly. Nothing discards the
+    log any more.
     """
     import signal
     loop = asyncio.get_event_loop()
