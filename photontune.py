@@ -270,7 +270,8 @@ class Sample:
         var = sum((t - m) ** 2 for t in self.tag_counts) / float(n - 1)
         return math.sqrt(var / n)
 
-    def tags_significantly_below(self, reference, z=TAG_DROP_Z):
+    def tags_significantly_below(self, reference, z=TAG_DROP_Z,
+                                 reference_se=None):
         """Is this sample missing tags the reference found, beyond noise?
 
         A FRACTION cannot do this job, and trying one failed twice in opposite
@@ -300,6 +301,16 @@ class Sample:
 
         It tightens with more evidence rather than loosening, which is the same
         behaviour rate_upper_bound() has and for the same reason.
+
+        reference_se: the reference's OWN sampling error, combined in
+        quadrature. The test used to treat the reference as exact, which it
+        is not - it is one dwell like any other, and an audit caught a run
+        reading "tags 2.850" for a camera that read 3.99-4.00 in every
+        neighbouring run. A reference that lands high silently raises the bar
+        for every candidate, and the shortfall it manufactures is compared
+        against the candidate's error alone. Combining the two errors is what
+        the difference of two measured means actually costs; it is free,
+        because both samples already carry their own per-frame counts.
         """
         if reference is None or len(self.tag_counts) < 2:
             return False
@@ -307,21 +318,25 @@ class Sample:
         if short <= 0:
             return False
         se = self.tag_standard_error()
+        if se and reference_se:
+            se = math.sqrt(se * se + reference_se * reference_se)
+        elif not se:
+            se = reference_se
         if not se:
-            # Every frame is short by the same amount. That is not sampling
-            # error, it is the tag being gone.
+            # Every frame is short by the same amount, on both sides. That is
+            # not sampling error, it is the tag being gone.
             return True
         return short > z * se
 
     def passes(self, min_tags, max_ambiguity, tag_reference=None,
-               tag_z=TAG_DROP_Z):
+               tag_z=TAG_DROP_Z, reference_se=None):
         if self.frames < MIN_SAMPLE_FRAMES:
             return False
         # Multi-tag solves happily on a subset, so "it solved" is not the same
         # as "it saw everything available". A gain that loses tags buys nothing
         # at all - the exposure is fixed, so there is no blur being traded for
         # them - which is why this is a significance test and not a fraction.
-        if self.tags_significantly_below(tag_reference, tag_z):
+        if self.tags_significantly_below(tag_reference, tag_z, reference_se):
             return False
         # Prefer the multi-tag criterion when multi-tag is actually running.
         # Judged on the upper confidence bound, not the point estimate: a rate
@@ -335,7 +350,7 @@ class Sample:
         return amb is not None and amb <= max_ambiguity
 
     def why_failed(self, min_tags, max_ambiguity, tag_reference=None,
-                   tag_z=TAG_DROP_Z):
+                   tag_z=TAG_DROP_Z, reference_se=None):
         """One short phrase saying why this sample did not pass, or None.
 
         The gain search reported EVERY outcome as "no passing exposure": a dead
@@ -343,7 +358,8 @@ class Sample:
         room were indistinguishable, and six "sweeps" were seen completing in
         0.00 s total with nothing noticing.
         """
-        if self.passes(min_tags, max_ambiguity, tag_reference, tag_z):
+        if self.passes(min_tags, max_ambiguity, tag_reference, tag_z,
+                       reference_se):
             return None
         if self.frames == 0:
             if self.stale_dropped:
@@ -358,13 +374,15 @@ class Sample:
                     "would be noise). Raise --dwell."
                     % (self.frames, MIN_SAMPLE_FRAMES, self.frames,
                        100 * _effective_floor(self.frames)))
-        if self.tags_significantly_below(tag_reference, tag_z):
+        if self.tags_significantly_below(tag_reference, tag_z, reference_se):
+            se = self.tag_standard_error() or 0.0
+            if reference_se:
+                se = math.sqrt(se * se + reference_se * reference_se)
             return ("saw %.2f tags against the reference's %.2f - %.2f short, "
-                    "over the %.2f that %g sigma of this sample's own scatter "
-                    "allows, so it is a real loss and not noise"
+                    "over the %.2f that %g sigma of the two samples' own "
+                    "scatter allows, so it is a real loss and not noise"
                     % (self.mean_tags, tag_reference,
-                       tag_reference - self.mean_tags,
-                       tag_z * (self.tag_standard_error() or 0.0), tag_z))
+                       tag_reference - self.mean_tags, tag_z * se, tag_z))
         if self.multitag_solves:
             return ("multi-tag solved in %.0f%% of %d frames (at best %.0f%%, "
                     "under the 90%% floor)"
@@ -1195,6 +1213,11 @@ PROBLEMS = {
                               for k, w, h in v)),
     "search_error": (HARD, lambda v: "the gain walk did not finish: %s" % v),
     "no_workable_settings": (HARD, lambda v: str(v)),
+    "applied_point_failed": (HARD,
+        lambda v: "the settings this run APPLIED were then measured and did "
+                  "not pass: gain %s at %.0f us - %s. The camera is at the "
+                  "settings the walk chose and they do not work."
+                  % (v["gain"], v["exposure"], v["why"])),
     "robot_enabled_midrun": (HARD,
         lambda v: "the robot was ENABLED during the tune (%s) - aborted and put "
                   "the camera back. A match must never be interrupted." % v),
@@ -1225,6 +1248,11 @@ PROBLEMS = {
                   "because it is the best available, but it is NOT within the "
                   "blur budget. Add light." % v),
     # ---- warn ----
+    "reference_unusable": (WARN,
+        lambda v: "the reference measurement did not itself pass (%s), so it "
+                  "is not a bar anything can be held to. The walk fell back "
+                  "to its own rate gate and the tag-count floor was not "
+                  "applied." % v),
     "robot_state_unknown": (WARN,
         lambda v: "THE ROBOT-ENABLED GUARD WAS INACTIVE for this tune: %s. "
                   "Nothing would have stopped this run if a match had started "
@@ -1635,7 +1663,31 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
             PENDING_RESTORE.pop(st.unique, None)
             return rec
 
-        best_tags = st.reference.mean_tags
+        # ---- 3b. does the reference itself pass? -------------------------
+        #
+        # It sets the bar every candidate is measured against and nothing had
+        # ever asked whether it clears its own. A reference that does not is
+        # not a high bar, it is a meaningless one: at --max-blur-px 0.05 the
+        # reference once read "multitag 62%  tags 2.44" at an exposure where
+        # every gain in the grid read 0.00, and best_tags was set from a state
+        # the camera was never in.
+        #
+        # Judged without a tag reference of its own, because it IS the
+        # reference. When it fails, the tag-count floor is dropped rather than
+        # applied from a number nobody can stand behind - the walk still has
+        # to clear the 90% rate gate on its own merits, and if nothing does,
+        # _rescue is the correct destination and gets there honestly.
+        ref_why = st.reference.why_failed(cfg.min_tags, cfg.max_ambiguity)
+        if ref_why is None:
+            best_tags = st.reference.mean_tags
+            best_tags_se = st.reference.tag_standard_error()
+        else:
+            log("   !! the reference does not pass its own test (%s), so it "
+                "cannot be a bar. Walking without the tag-count floor; the "
+                "90%% multi-tag gate still applies." % ref_why)
+            note_problem(rec, "reference_unusable", ref_why)
+            best_tags = None
+            best_tags_se = None
 
         # ---- 4. walk gain UP, stop at the first pass ----------------------
         #
@@ -1656,7 +1708,8 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
             else:
                 s = await trial(pv, cam, cfg, g, st.exposure, log)
                 st.trials.append(s)
-            why = s.why_failed(cfg.min_tags, cfg.max_ambiguity, best_tags)
+            why = s.why_failed(cfg.min_tags, cfg.max_ambiguity, best_tags,
+                               reference_se=best_tags_se)
             log("   %s gain %-4d exposure %6.0f  %s%s"
                 % ("ok " if why is None else "   ", g, st.exposure, s.summary(),
                    "" if why is None else "   <- " + why))
@@ -1735,6 +1788,39 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
             % (st.gain, st.exposure, px, cfg.blur_rate, cfg.max_blur_px))
         if px > cfg.max_blur_px * 1.001:
             note_problem(rec, "over_blur_budget", round(px, 1))
+
+        # ---- 8. measure the point that was actually applied ---------------
+        #
+        # gain_with_margin applies picked + one grid step, and NO TRIAL WAS
+        # EVER RUN THERE. verify_final_state checks the VALUE the camera
+        # reports, not whether the camera can see anything at it. So the tool
+        # ended every successful run asserting "this works" about an operating
+        # point it had never measured - inferred from a neighbouring gain, in
+        # a scene whose light the audit showed moving within a session.
+        #
+        # One dwell, ~4.7 s per camera. It is the cheapest claim in the run to
+        # check and the most important one to be right, because it is the only
+        # claim the tool actually makes.
+        _check_abort(cfg, "measuring the applied operating point")
+        final = await trial(pv, cam, cfg, st.gain, st.exposure, log)
+        st.trials.append(final)
+        # No tag reference if a rescue walk moved the exposure, for the same
+        # reason _rescue itself uses none: the reference means "the best this
+        # scene can do at the BUDGET exposure", and we are no longer there.
+        # A count from a state we have abandoned is not a floor.
+        at_budget = abs(st.exposure - st.t_budget) <= 1.0
+        why = final.why_failed(cfg.min_tags, cfg.max_ambiguity,
+                               best_tags if at_budget else None,
+                               reference_se=best_tags_se if at_budget else None)
+        log("   %s applied   gain %-4d exposure %6.0f  %s%s"
+            % ("ok " if why is None else "!! ", st.gain, st.exposure,
+               final.summary(), "" if why is None else "   <- " + why))
+        if why is not None:
+            log("   !! the camera is AT these settings and they do not work. "
+                "Not reporting this tune as a success.")
+            note_problem(rec, "applied_point_failed",
+                         {"gain": st.gain, "exposure": st.exposure,
+                          "why": why})
         rec["applied"] = st.exposure
         PENDING_RESTORE.pop(st.unique, None)
         if progress:
