@@ -146,6 +146,7 @@ python3 sabotage_test.py --photontune "python3 /opt/photontune/photontune.py --h
 python3 sabotage_test.py --verdict-matrix   # offline: exit code per recorded problem
 python3 sabotage_test.py --gain-walk        # offline: recorded samples, real pass rule
 python3 sabotage_test.py --sample-floor     # offline: a 3-frame sample cannot "pass"
+python3 sabotage_test.py --cli-smoke        # offline: the real main(), every flag
 ```
 
 ## Install
