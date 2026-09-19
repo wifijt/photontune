@@ -1028,7 +1028,7 @@ class Search:
     later cannot reintroduce the bug, because there is nowhere to write it.
     """
     __slots__ = ("cam", "unique", "nickname", "original", "fx", "t_budget",
-                 "exposure", "gain", "reference", "trials", "notes")
+                 "exposure", "gain", "reference", "trials")
 
     def __init__(self, cam):
         self.cam = cam
@@ -1045,8 +1045,7 @@ class Search:
         self.exposure = None       # the exposure actually being tried
         self.gain = None           # the gain actually being tried
         self.reference = None      # Sample at max gain: the best the scene can do
-        self.trials = []           # every (gain, exposure, Sample), in order
-        self.notes = []            # human-readable trail, for the record
+        self.trials = []           # every Sample taken, in the order taken
 
     def exposure_bounds(self):
         """The camera's OWN reported exposure limits, as floats.
@@ -1178,15 +1177,24 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
             return rec
 
         # ---- 2. the exposure, which is not searched for -------------------
-        st.fx = camera_fx(cam, cfg.fx)
+        own_fx = camera_fx(cam)
+        st.fx = own_fx if own_fx else cfg.fx
         lo_e, hi_e = st.exposure_bounds()
         want = blur_budget_exposure(cfg.max_blur_px, cfg.blur_rate, st.fx)
         st.t_budget = min(max(want, lo_e), hi_e)
-        rec["budget"] = {"fx": st.fx, "max_blur_px": cfg.max_blur_px,
+        rec["budget"] = {"fx": st.fx, "fx_from_calibration": bool(own_fx),
+                         "max_blur_px": cfg.max_blur_px,
                          "blur_rate": cfg.blur_rate, "wanted": want,
                          "exposure": st.t_budget}
-        log("   fx %.1f from this camera's own calibration; %g px at %.0f deg/s "
-            "allows %.0f us" % (st.fx, cfg.max_blur_px, cfg.blur_rate, want))
+        # Say WHERE fx came from. It sets the whole scale of the budget, and a
+        # line claiming "from this camera's calibration" over a --fx fallback
+        # would be the tool asserting something it had not checked.
+        log("   fx %.1f %s; %g px at %.0f deg/s allows %.0f us"
+            % (st.fx,
+               "from this camera's active calibration" if own_fx
+               else "from --fx (this camera reports NO calibration for its "
+                    "active mode, so the budget is a guess)",
+               cfg.max_blur_px, cfg.blur_rate, want))
         if abs(st.t_budget - want) > 1.0:
             log("   clamped to the camera's reported range %.0f-%.0f us -> %.0f us"
                 % (lo_e, hi_e, st.t_budget))
@@ -1246,7 +1254,7 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
                     "the top of the range - no margin left to add." % picked)
         else:
             # ---- 5/6. nothing in the grid worked at the budget exposure ----
-            st.gain, st.exposure = await _rescue(pv, cam, cfg, st, rec, log)
+            st.gain, st.exposure = await _rescue(pv, cam, cfg, st, log)
             if st.gain is None:
                 msg = ("no gain from %s saw the tags at %.0f us, and neither a "
                        "shorter nor a longer exposure did. That is a LIGHTING "
@@ -1355,7 +1363,7 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
                          for s in st.trials]
 
 
-async def _rescue(pv, cam, cfg, st, rec, log):
+async def _rescue(pv, cam, cfg, st, log):
     """Nothing in the gain grid passed at the budget exposure. Which way is out?
 
     Two possibilities, and they need opposite answers, so guessing is not an
