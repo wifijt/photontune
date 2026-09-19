@@ -1225,6 +1225,11 @@ PROBLEMS = {
                   "because it is the best available, but it is NOT within the "
                   "blur budget. Add light." % v),
     # ---- warn ----
+    "robot_state_unknown": (WARN,
+        lambda v: "THE ROBOT-ENABLED GUARD WAS INACTIVE for this tune: %s. "
+                  "Nothing would have stopped this run if a match had started "
+                  "in the middle of it. The tune stands; know that it was "
+                  "unguarded." % v),
     "video_mode_switched": (WARN,
         lambda v: "VIDEO MODE CHANGED %s -> %s - this camera is now running a "
                   "different RESOLUTION than it was. It had no calibration for "
@@ -1509,6 +1514,17 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
            "trials": [], "budget": None}
     log("── %s ──  current exposure %s, gain %s"
         % (st.nickname, st.original["cameraExposureRaw"], st.original["cameraGain"]))
+    # Asked once, up front, so the answer is in the record and on the
+    # dashboard rather than only in whatever _check_abort happened to see.
+    # cfg.nt_inst is None on the CLI path, where there is no client to ask and
+    # a human is standing at the terminal; this is about the daemon, which is
+    # the mode that runs at a field.
+    if cfg.nt_inst is not None and not cfg.baseline_only:
+        why = robot_state_text(cfg.nt_inst)
+        if why is not None:
+            log("   !! ROBOT-ENABLED GUARD INACTIVE: %s." % why)
+            log("      The tune will NOT be stopped by a match starting.")
+            note_problem(rec, "robot_state_unknown", why)
 
     try:
         # ---- 1. the baseline, and the calibration it depends on -----------
@@ -2525,14 +2541,61 @@ async def assert_baseline(pv, cam, cfg, log=print):
     return list(todo), failed, unconfirmed
 
 
-def robot_is_enabled(inst):
-    """True if the FMS/DS says enabled. Never retune during a match."""
+def robot_state(inst):
+    """True (enabled), False (not enabled), or None (WE CANNOT TELL).
+
+    None is the case this function used to hide. It was
+
+        except Exception:
+            return False
+
+    and, worse, needed no exception at all: with no NetworkTables server
+    reachable, getInteger(0) returns the DEFAULT, which is 0, which reads as
+    "not enabled". So the design's central safety argument - re-check between
+    steps, abort with a restore - was silently inert exactly when
+    NetworkTables was down, which is plausible at a field and is the moment
+    the argument exists for.
+
+    Three things have to be true before a False here means anything: the
+    client is connected to a server, FMSInfo/FMSControlData exists on it, and
+    reading it did not throw. Any of them failing is None, and None is
+    reported rather than assumed - see robot_state_unknown.
+    """
     try:
-        tbl = inst.getTable("FMSInfo")
-        control = tbl.getEntry("FMSControlData").getInteger(0)
+        if not inst.isConnected():
+            return None
+        entry = inst.getTable("FMSInfo").getEntry("FMSControlData")
+        if not entry.exists():
+            return None
+        # -1 as the default, so "the read returned the default" is
+        # distinguishable from "the robot published 0". exists() above should
+        # already have caught it; this is the belt to that brace, because the
+        # bug being fixed IS a default being read as an answer.
+        control = entry.getInteger(-1)
+        if control < 0:
+            return None
         return bool(control & 0x01)          # bit 0 = enabled
     except Exception:
-        return False
+        return None
+
+
+def robot_state_text(inst):
+    """Why we cannot tell, in words, or None if we can."""
+    try:
+        if not inst.isConnected():
+            return ("the NetworkTables client is not connected to any server, "
+                    "so FMSInfo cannot be read")
+        if not inst.getTable("FMSInfo").getEntry("FMSControlData").exists():
+            return ("connected to NetworkTables, but nothing has published "
+                    "FMSInfo/FMSControlData - no robot program is running")
+    except Exception as exc:
+        return "reading FMSInfo raised %s" % type(exc).__name__
+    return None
+
+
+def robot_is_enabled(inst):
+    """True only if the robot is DEFINITELY enabled. See robot_state."""
+    return robot_state(inst) is True
 
 
 async def daemon(args, log=print):
