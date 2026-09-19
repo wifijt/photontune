@@ -497,13 +497,19 @@ class Photon:
         payload["cameraUniqueName"] = unique_name
         await self.ws.send(msgpack.packb({"changePipelineSetting": payload}))
 
-    async def cameras_fresh(self, timeout=8):
+    async def cameras_fresh(self, timeout=8, abortable=True):
         """Camera list over a NEW connection.
 
         PhotonVision sends cameraSettings ONCE, on connect - measured: 1 in 25 s
         against 441 updatePipelineResult. Pumping the long-lived socket for it
         therefore never succeeds after the first read, which silently broke the
         readback in set_and_verify. A fresh connection re-triggers the broadcast.
+
+        abortable=False for the RESTORE path only. Everywhere else a pending
+        SIGTERM ends this loop (see SHUTDOWN), but restore_pending's read-back
+        must run to the end even while the process is dying - aborting the
+        thing that puts the camera back is the opposite of what the signal is
+        for.
         """
         found = {}
         uri = self.uri
@@ -511,6 +517,8 @@ class Photon:
                                       ping_interval=None) as ws:
             t0 = time.time()
             while time.time() - t0 < timeout:
+                if abortable:
+                    raise_if_shutdown("reading camera settings back")
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
                 except asyncio.TimeoutError:
@@ -573,6 +581,10 @@ class Photon:
         await asyncio.sleep(min(settle, timeout))
         bad, read_ok, gap = None, False, 0.5
         while True:
+            # Between polls, not inside one. confirm() is never on the restore
+            # path - restore_pending reads back with cameras_fresh directly -
+            # so aborting here cannot strand a camera.
+            raise_if_shutdown("confirming a write")
             try:
                 cams = await self.cameras_fresh(timeout=6)
             except Exception:
@@ -1784,7 +1796,7 @@ async def restore_pending(host, port=5800):
             for _try in range(3):
                 try:
                     await asyncio.sleep(1.5)
-                    live = await pv.cameras_fresh(timeout=8)
+                    live = await pv.cameras_fresh(timeout=8, abortable=False)
                     got = next((c for c in live if c["uniqueName"] == unique), None)
                     if got and all(_matches(got["settings"].get(k), v)
                                    for k, v in original.items()):
