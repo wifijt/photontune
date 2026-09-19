@@ -2005,28 +2005,6 @@ BASELINE_ALWAYS = {
     "tagFamily": (0, 0, "The family FRC uses."),
 }
 
-# The gain a tune STARTS from, unless --gain says otherwise.
-#
-# ZERO, deliberately. Gain is not a setting with a good value - it is a cost you
-# pay to buy a SHORTER exposure, and you should only pay it when the exposure the
-# scene wants would smear more than the blur budget allows. So the tune starts at
-# the bottom and climbs only when the blur budget forces it. Whatever it lands on
-# is then the least noise that meets the budget, which is the actual goal.
-#
-# Two things this fixes. Starting from the camera's CURRENT gain made the tool
-# non-deterministic and, because escalation is one-way, a ratchet: observed on one
-# rig, same room and same light, one camera starting at 28 and the other at 100
-# purely from run history - and the noisy one reprojected at 1.8-2.1 px against
-# the other's 0.5. Running unattended at boot, that walks toward maximum gain over
-# a season with nothing reporting it. Starting from a fixed GUESS (this was 25 for
-# one revision) is better but still wrong: it silently pays for noise the scene may
-# not need, and it cannot be justified from a measurement.
-#
-# The cost of starting at 0 is an extra sweep in a genuinely dark venue, where the
-# first pass finds nothing and escalation raises gain. That path is loop-guarded
-# and it is the correct answer arrived at honestly.
-BASELINE_START_GAIN = 0
-
 BASELINE_DEFAULT = {
     "decisionMargin": (35, 35,
         "Detection confidence floor - the goal's 'cutoff'. PhotonVision drops any "
