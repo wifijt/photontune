@@ -111,3 +111,42 @@ bend 0.77° and 24 mm between positions to reconcile it; and it puts the room at
 and a bundle adjustment cannot check a constraint it only has once. Moving it so
 a camera can see it alongside tags 7/8/9 is the fix; re-surveying from where it
 sits is not.
+
+## Round 2 outcome (2026-09-18, late)
+
+All 8 audit defects fixed and forced; one extra found and fixed. Two structural
+changes matter more than the individual fixes:
+
+- **A `PROBLEMS` registry IS the verdict.** Every problem carries a deliberate
+  HARD/WARN decision and `note_problem()` RAISES on an unregistered key — so a
+  problem the verdict cannot see is no longer expressible. That closes the class,
+  not the six instances. `sabotage_test.py --verdict-matrix` asserts the real
+  `main()`'s exit status per problem: 17/17. Reverting only the old three-key
+  list makes the same matrix report exactly 6 WRONG — the audit's finding,
+  reproduced as a test.
+- **`_tune_all` rebinds `args` to a per-camera copy** (the parameter is now
+  `outer_args`), so no camera can inherit another's state and later-added lines
+  cannot reintroduce it. That is the gain ratchet's third door, closed by
+  construction.
+
+Honest residue, all from the agent's own report:
+- Runtime went **125 s → 130–143 s** (+4% to +14%): 2 extra gain repeats per
+  camera, end-of-tune verification, baseline-exposure restore.
+- The 35% reproj swing at the deciding gain **could not be forced live** — the
+  room was quiet (0.2% run-to-run). The mechanism is proven by replaying the
+  audit's numbers, not by live noise. **Re-test in different light.**
+- At the default `--tag-fraction 0.85`, the 3.5–3.8 tag drop that motivated D5
+  is still inside tolerance and allowed.
+- Briefly made worse then fixed: the new polling opened a websocket every 0.4 s
+  and killed three runs; it now backs off 0.5→2.0 s.
+- **Pre-existing, NOT fixed:** the daemon's NT status freezes for the duration of
+  a run (it stops the instant `NTResults` creates its private instance and
+  resumes at the end). Proven identical before and after, so not introduced here.
+
+`photontune.service` is **inactive** — deliberately, to avoid lock contention
+during verification. Starting it runs the OLD `/opt` copy and immediately
+retunes both cameras:  `ssh photonvision sudo systemctl start photontune`.
+Deploy the new build first if that matters.
+
+**Next: an independent adversarial audit of round 2, in different light. Then
+push.**
