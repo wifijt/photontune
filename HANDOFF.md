@@ -116,6 +116,154 @@ and a bundle adjustment cannot check a constraint it only has once. Moving it so
 a camera can see it alongside tags 7/8/9 is the fix; re-surveying from where it
 sits is not.
 
+## Round 4 outcome (2026-09-19): the audit's defects, fixed and forced
+
+An independent adversarial audit of round 3 proved nine defects on hardware.
+Eight are fixed on this branch, each forced before and after. **F7 is NOT
+DONE** - see below.
+
+### The blocker, F1: the reference measurement was contaminated
+
+`sample()` passed `after_capture` only on the NetworkTables path and
+`Photon.collect()` had no stale-frame gate at all, so deleting NT-server
+management left the gate inoperative on the transport that is now the default.
+
+Measured here before the fix, one camera: steady state 8.3 results/s, but a 4 s
+read after 10 s unread yields **117** frames. In a real run the reference trial
+collected **79** frames in a 4.0 s dwell against 41-48 for every trial it is
+compared to. Forced two ways and both now correct:
+
+| forced case | 9796175 | now |
+|---|---|---|
+| `--max-blur-px 0.05` (7 us, camera sees nothing at any gain) | reference `multitag 49%  tags 1.95` | `tags 0.00` |
+| hostile pre-state, 60 us / gain 0 | reference `multitag 50%  tags 2.00` | `multitag 100%  tags 4.00` |
+
+Frames per trial after: 37/37/35 and 36/36/34 - flat.
+
+The fix: the websocket now has a reader task that consumes it continuously, so
+nothing queues in front of a measurement, and `collect()` gates on
+`sequenceID`. **The websocket carries no `captureTimestampMicros`** - verified
+by dumping a message: `multitagResult, latency, fps, classNames, sequenceID,
+targets`. `sequenceID` is a per-camera frame counter, measured strictly
+monotonic. **Draining to empty was measured and rejected:** with two cameras
+interleaved the largest gap between messages at steady state is 0.114 s, so no
+`recv()` timeout separates "empty" from "idle".
+
+**`--dwell 4.0` keeps its value and loses its justification.** It was
+attributed to solve-rate statistics; it was really outlasting the backlog. The
+floor is `MIN_SAMPLE_FRAMES` (20, 2.4 s at 8.3/s), but a trial landing near it
+triggers the extension in `collect()` and is then judged on a different sample
+size - and so a different effective gate - than its neighbours. 1.5x the floor
+is 3.6 s; 4.0 is that with 10% margin.
+
+### Stability, re-measured on the gated path
+
+Eight consecutive two-camera runs, default flags, 43-48 s each:
+
+- **camera 1: gain 40, 8 of 8.** camera 2: gain 40 in 7, **gain 20 in run 6**.
+- Every reference read exactly `tags 2.000 / rate 1.00` or `4.000 / 1.00`,
+  n = 33-38. The reference variance the audit saw (one run reading 2.850 for a
+  camera reading 3.99-4.00) did **not** recur.
+
+**The 40->20 shift survives, and it is not a measurement artefact.** Camera 2's
+gain-0 trial read 1.000-1.054 tags at a 0.00-0.05 solve rate in seven runs and
+**1.892 tags at 0.892** in run 6 - 0.9 tags apart, far outside sampling error on
+37 frames. The scene genuinely changed: the second tag became detectable at
+gain 0 for that run. The walk then correctly picked gain 0 and applied 20.
+**Do not make this stickier.** The fragility is in the scene - one tag sits at
+the edge of detectability at gain 0 - not in the tool.
+
+**The `--dwell 2` sensitivity is gone.** The audit found camera 2 answering
+gain 20 in 3/3 runs at `--dwell 2` while the default answered 40. On the gated
+path, 3/3 runs answer **gain 40**, and gain 0 reads 0.00 tags at dwell 2 exactly
+as it does at dwell 4. It was the backlog: a short dwell was mostly frames from
+the previous, higher-gain setting.
+
+### The other fixes
+
+- **F2 `over_blur_budget` is now HARD**, and the too-dark walk is capped at
+  `OVER_BUDGET_LIMIT` (2.0) times the budget rather than at `--max-exposure`.
+  Forced: `--max-blur-px 0.05` applied 188 us (1.3 px, 26x) exit 0, now exits 1
+  with the camera put back; `--max-blur-px 0.5` applied 232 us (1.6 px) exit 0,
+  now applies 109 us and exits 1. The camera is still LEFT at what the walk
+  found - best available beats nothing - and the exit code says it is not the
+  answer that was asked for.
+- **F9 the reference is validated and the applied point is measured.** The
+  reference now runs `why_failed()` against itself and drops the tag-count
+  floor rather than setting it from a sample that sees nothing
+  (`reference_unusable`, WARN). `tags_significantly_below` combines the
+  reference's own standard error in quadrature instead of treating it as
+  exact. And one trial now runs **at the gain that was applied** - nothing ever
+  had. Forced with a competing writer parking the camera at 7 us after the
+  final confirm: 9796175 exits 0, this exits 1 with `applied_point_failed`.
+  Cost: one dwell per camera, and a two-camera run is 43-48 s.
+- **F3** no exit path returns 0 with a camera it could not put back.
+  daemon + SIGTERM + an unrestorable camera was exit 0, now 1; a clean daemon
+  stop is 143 and `photontune.service` declares that a success.
+- **F4** `NTResults.available()` reads the shutdown flag and `_open_readers`
+  runs in an executor. TERM at 2 s: **18.8 s -> 0.3 s**, at 5 s: 15.7 -> 0.3,
+  at 20 s: 7.2 -> 2.2. Before, the 2 s case wrote `cameraBrightness 5 -> 40`
+  to the camera AFTER the signal.
+- **F5** `--verdict-matrix` takes expected severity from `MATRIX_SEVERITY` in
+  the test file, not from the table under test. Downgrading `apply_mismatch`
+  HARD->WARN on 9796175 reports "all 14 cases correct" under the old matrix and
+  `<-- WRONG` under this one.
+- **F6** `--cli-smoke`'s stub answers the way `tune_camera` answers, so the
+  two `--baseline-only` cases stop printing `CAM exposure -> 864, gain 40`, and
+  a fourth column asserts what the output must say. Two planted regressions
+  are caught that the old harness scored "all 14 correct". `sabotage_test`
+  phase 1 now asserts the sabotage (15/15) instead of counting it.
+- **F8** `robot_is_enabled` no longer fails open. `robot_state()` answers
+  True/False/**None**, and None is reported as `robot_state_unknown` (WARN) on
+  the daemon path. Verified against a disconnected ntcore client: 9796175
+  returns `False` - "not enabled" - where this returns `None` and says "the
+  NetworkTables client is not connected to any server".
+
+### NOT DONE
+
+- **F7, SIGKILL leaving a blind camera that boot does not repair.** Not
+  started. The right fix is to persist the intended operating point and have
+  the boot baseline restore it: a pure sanity check cannot work, because the
+  state SIGKILL left (863.5 us / gain 0) is a perfectly legal-looking pair and
+  only a record of what was intended can tell it apart.
+
+### The 6 px blur budget: an unattended attempt to bound it, and why it failed
+
+`blurscale.py` sweeps `blur` at two `decimate` settings and finds the 50%
+detection point **per tag**, using the six tags in view (apparent side 45.5 to
+86.3 px) as the lever. It did not settle the number, and how it failed matters:
+
+```
+sigma50 at the deployed decimate=2, all six tags, same scene, same session
+    side 45.5 px -> 1.75      side 67.9 px -> 3.00
+    side 54.7 px -> 3.00      side 74.9 px -> 1.63
+    side 55.4 px -> 1.75      side 86.3 px -> 3.52
+```
+
+A **2.2x spread between tags at the same moment**, with no relationship to
+apparent size. So the sweep the budget rests on never measured a property of
+the detector - it measured whichever tag in that scene was worst. REDESIGN's
+"multi-tag collapses between sigma 1.5 and 2.0" reproduces exactly, as camera 2
+at 1.63, while camera 1's tags survive to 3.0.
+
+The decimate test was inconsistent - the ratio `sigma50(dec=1)/sigma50(dec=2)`
+is 2.16 for the one tag measured cleanly at both and 1.02 for the other camera
+- so whether `blur` is in full-resolution or decimated pixels is **still
+unresolved**, and that is a factor of two sitting directly under the budget.
+Both cameras also collapse totally at exactly sigma 4.0 at decimate=1, which
+looks like an implementation limit rather than anything physical.
+
+One caution the data supports: upstream apriltag blurs only the image used for
+**quad** detection and decodes bit cells from the unblurred one, which is how
+tags here survive a sigma larger than their own bit cell. Motion blur gets no
+such exemption. If that is right, the proxy measures the more robust half of
+the detector and the 2x that raised the budget from 3.5 to 6 pushes against a
+correction that probably needs to go the other way.
+
+**6 px is unchanged and relabelled: an estimate that may be OPTIMISTIC.**
+`blurtest.py`, with a human waving a tag, is still the only thing that settles
+it.
+
 ## Round 3 outcome (2026-09-19): the rebuild in REDESIGN.md, implemented
 
 `REDESIGN.md` is now the tool. Exposure is FIXED at the blur budget and gain is

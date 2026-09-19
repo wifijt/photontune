@@ -578,7 +578,8 @@ class Photon:
         self.ws = None
         self._subs = []
         self._reader_task = None
-        self._reader_error = None
+        self._reader_error = None      # the socket died: permanent
+        self._sub_error = None         # a subscriber raised: raised once
         self._tick = None
         # uniqueName -> the newest sequenceID delivered for that camera. This
         # is what makes a stale-frame gate possible on the websocket: the
@@ -624,7 +625,11 @@ class Photon:
                 except BaseException as exc:
                     # Do not let a subscriber's bug kill the reader silently;
                     # hand it to the _pump that owns the subscriber instead.
-                    self._reader_error = exc
+                    # Kept SEPARATE from _reader_error, which is the socket
+                    # dying and is permanent: a subscriber's exception is
+                    # raised once and cleared, so it cannot poison the pumps
+                    # the restore path runs afterwards.
+                    self._sub_error = exc
             if self._tick is not None:
                 self._tick.set()
 
@@ -738,6 +743,9 @@ class Photon:
                 # SHUTDOWN. The restore paths do not go through _pump, so
                 # aborting here cannot stop the camera being put back.
                 raise_if_shutdown("sampling")
+                if self._sub_error is not None:
+                    exc, self._sub_error = self._sub_error, None
+                    raise exc
                 if self._reader_error is not None:
                     raise self._reader_error
                 if stop_when is not None and stop_when():
