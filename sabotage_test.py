@@ -427,6 +427,151 @@ pt.main()
 '''
 
 
+_NT_CLOCK_CHILD = r"""
+import sys, json
+src = sys.argv[1]
+sys.path.insert(0, src)
+import ntcore
+import photontune as pt
+
+inst = ntcore.NetworkTableInstance.create()      # no server needed: the write
+tbl = inst.getTable("SabotageNTClock")           # is dropped in LOCAL storage
+out = {}
+
+# A: the way the daemon used to write - getEntry().setString()
+entry = tbl.getEntry("viaEntry")
+entry.setString("before")
+out["entry_before"] = entry.getString("?")
+
+# B: the way it writes now
+nt = pt.NTOut(tbl)
+nt.string("viaNTOut", "before")
+out["ntout_before"] = tbl.getEntry("viaNTOut").getString("?")
+
+out["now_before"] = int(ntcore._now())
+
+# THE SABOTAGE: move the clock the way photonlibpy's import chain does.
+# hal/_initialize.py runs HAL_Initialize at import, which installs
+# HAL_GetFPGATime as wpi::Now(); FPGA time counts from process start.
+import hal                                                            # noqa
+out["now_after"] = int(ntcore._now())
+
+entry.setString("after")
+out["entry_after"] = entry.getString("?")
+nt.string("viaNTOut", "after")
+out["ntout_after"] = tbl.getEntry("viaNTOut").getString("?")
+
+# and the real import site, which must behave the same way
+try:
+    pt.load_photon_decoder()
+    out["decoder"] = "ok"
+except Exception as exc:
+    out["decoder"] = "unavailable: %s" % exc
+nt.string("viaNTOut", "after2")
+out["ntout_after2"] = tbl.getEntry("viaNTOut").getString("?")
+
+print(json.dumps(out))
+"""
+
+
+_re_nt = re.compile(r"\b(\w+)\.set(?:String|Boolean|Double|Integer)\(")
+
+
+def nt_clock_check(src_dir):
+    """FORCE the clock jump that silently killed the whole NT dashboard.
+
+    The defect: importing photonlibpy pulls in wpilib -> hal, and
+    hal/_initialize.py runs HAL_Initialize at import time, which reinstalls
+    wpi::Now() as FPGA time. Measured on the Pi, ntcore 2026.2.2:
+
+        ntcore._now() before import hal : 1790007715324377
+        ntcore._now() after  import hal : 656
+
+    ntcore's LocalStorage DROPS a value whose timestamp is not newer than the
+    one the topic already holds, and setString() still returns True. So every
+    topic the daemon had published before its first tune froze for the life of
+    the process - progress, status, summary, ok, busy and the run trigger
+    itself - while `camera` and `result`, first written during the run, kept
+    working. The tune was correct throughout; the only interface a drive team
+    has said nothing.
+
+    Two independent guards, and this asserts both:
+      1. daemon() calls load_photon_decoder() BEFORE it touches ntcore, so
+         there is one timebase for the life of the process. Checked statically,
+         because an offline test cannot start the daemon.
+      2. NTOut stamps every write with a forced-monotonic timestamp, so a
+         clock that moves anyway cannot silence the dashboard. Checked by
+         forcing the jump in a child process.
+
+    PHASE 1 IS THE SABOTAGE ITSELF: the getEntry() path must come back DEAD.
+    A test that only shows the new path working would score green against a
+    build where the whole problem had been fixed upstream, or where the child
+    never really moved the clock.
+    """
+    print("=" * 78)
+    print("NT CLOCK  - force the wpi::Now() jump that froze the dashboard")
+    print("=" * 78)
+    bad = 0
+
+    proc = subprocess.run([sys.executable, "-c", _NT_CLOCK_CHILD, src_dir],
+                          capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0:
+        print("  !! child failed: %s" % (proc.stdout + proc.stderr)[-600:])
+        return 1
+    d = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    print("  nt::Now()  before the import: %d" % d["now_before"])
+    print("  nt::Now()  after  the import: %d" % d["now_after"])
+    moved = d["now_after"] < d["now_before"]
+    print("  %-58s %s" % ("the sabotage moved the clock BACKWARDS",
+                          "yes" if moved else "NO - sabotage did not bite"))
+    bad += 0 if moved else 1
+
+    # phase 1: the old path must be broken by it
+    dead = d["entry_after"] == "before"
+    print("  %-58s %s" % ("getEntry().setString() after the jump is DROPPED",
+                          "yes (%r)" % d["entry_after"] if dead
+                          else "NO (%r) <-- sabotage not proven"
+                               % d["entry_after"]))
+    bad += 0 if dead else 1
+
+    # phase 2: the path the daemon actually uses must survive it
+    for label, key, want in (("NTOut write after the clock jump",
+                              "ntout_after", "after"),
+                             ("NTOut write after load_photon_decoder()",
+                              "ntout_after2", "after2")):
+        ok = d[key] == want
+        print("  %-58s %s" % (label,
+                              "lands (%r)" % d[key] if ok
+                              else "DROPPED (%r) <-- WRONG" % d[key]))
+        bad += 0 if ok else 1
+    print("  photonlibpy decoder: %s" % d["decoder"])
+
+    # guard 1, statically: the decoder is imported before ntcore is touched
+    src = open(os.path.join(src_dir, "photontune.py")).read()
+    body = src[src.index("async def daemon("):]
+    body = body[:body.index("\n# ─")] if "\n# ─" in body else body
+    i_load = body.find("load_photon_decoder()")
+    i_nt = body.find("NetworkTableInstance.getDefault()")
+    ordered = 0 <= i_load < i_nt
+    print("  %-58s %s"
+          % ("daemon() loads the decoder before it touches ntcore",
+             "yes" if ordered else "NO - the clock will move mid-run <-- WRONG"))
+    bad += 0 if ordered else 1
+
+    # and nothing in the daemon may write NT except through NTOut
+    strays = sorted(set(_re_nt.findall(body)))
+    print("  %-58s %s"
+          % ("no daemon entry writes outside NTOut",
+             "yes" if not strays else "NO: %s <-- WRONG" % strays))
+    bad += 0 if not strays else 1
+
+    print("=" * 78)
+    print("nt clock: %s" % ("all 6 checks correct" if not bad
+                            else "%d WRONG" % bad))
+    return 1 if bad else 0
+
+
 def slots_check(src_dir):
     """Every `st.<attr> =` in the module is declared in Search.__slots__.
 
@@ -950,12 +1095,18 @@ def main():
                    help="offline: drive the real pass/reject rule with recorded "
                         "samples and show which gain the walk lands on. No "
                         "hardware.")
+    p.add_argument("--nt-clock", action="store_true",
+                   help="offline: force the wpi::Now() jump that silently "
+                        "froze the whole NetworkTables dashboard, and assert "
+                        "the daemon's writes survive it. No hardware.")
     p.add_argument("--verdict-matrix", action="store_true",
                    help="offline: assert the exit code and the surfaced text for "
                         "every problem photontune can record. No hardware.")
     p.add_argument("--src", default=os.path.dirname(os.path.abspath(__file__)),
                    help="directory holding photontune.py, for --verdict-matrix")
     a = p.parse_args()
+    if a.nt_clock:
+        sys.exit(nt_clock_check(a.src))
     if a.verdict_matrix:
         sys.exit(verdict_matrix(a.src))
     if a.cli_smoke:

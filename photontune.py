@@ -1602,6 +1602,49 @@ def failure_text(r):
     return r.get("error") or "did not apply anything"
 
 
+def problem_labels(rec, severity):
+    """Short labels for a dashboard widget, not prose.
+
+    The registry's describe() text is written for a human reading a terminal -
+    the longest is over 300 characters, and the daemon used to join all of
+    them with " | " and push >600 characters of prose into ONE NetworkTables
+    string. In a Shuffleboard or Elastic widget that is a grey smear; a drive
+    coach standing at the field has about two seconds. The key IS the label,
+    with its underscores opened out, and the prose stays in the journal and in
+    the `result` JSON where there is room for it.
+    """
+    return [k.replace("_", " ") for k, _sev, _text in problem_notes(rec, severity)]
+
+
+def _nt_line(text, limit):
+    """Collapse to one line and clip. Dashboard widgets are one line wide."""
+    t = " ".join(str(text).split())
+    return t if len(t) <= limit else t[:limit - 1] + "\u2026"
+
+
+def nt_summary(results, failed):
+    """The one line a drive coach reads. Short enough to read standing up.
+
+    Was `OV9281=863@g40; OV9281 (1)=860@g20` plus, appended, every warning's
+    full prose - 600+ characters that no widget can show. The verdict comes
+    first because that is the question being asked, the numbers are what was
+    applied, and WHY something failed is a two-word label. Detail lives in
+    `result` and the journal.
+    """
+    parts = []
+    for r in (results or []):
+        who = r.get("camera", "?")
+        if r in failed:
+            why = ", ".join(problem_labels(r, HARD)) or "failed"
+            parts.append("%s: %s" % (who, why))
+        elif r.get("applied"):
+            parts.append("%s %.0fus g%s" % (who, r["applied"], r.get("gain")))
+        else:
+            parts.append("%s: not tuned" % who)
+    head = "FAILED" if (failed or not results) else "OK"
+    return _nt_line("%s  %s" % (head, " | ".join(parts) or "no cameras"), 120)
+
+
 def run_verdict(results, cfg=None):
     """(failed, warnings, exit_code) for a whole run. The CLI and daemon agree.
 
@@ -2758,6 +2801,115 @@ def replay_pending(host, port=5800, log=print):
     return done
 
 
+_PHOTON_DECODER = None
+
+
+def load_photon_decoder():
+    """Import photonlibpy's result decoder. THE ONLY PLACE IT IS IMPORTED.
+
+    It is a function rather than a top-of-file import because IMPORTING IT
+    MOVES THE CLOCK NETWORKTABLES STAMPS VALUES WITH, and the daemon has to
+    control when that happens.
+
+    MEASURED on the Pi, ntcore 2026.2.2:
+
+        ntcore._now() before import hal : 1790007715324377
+        ntcore._now() after  import hal : 656
+
+    photonlibpy/__init__.py does `from .photonCamera import PhotonCamera`,
+    photonCamera.py line 26 is `import wpilib`, and hal/_initialize.py runs
+    `_wpiHal.initialize(500, 0)` at import time. HAL_Initialize installs
+    HAL_GetFPGATime as wpi::Now(), and FPGA time counts from process start,
+    so nt::Now() drops from epoch microseconds to about zero IN THE MIDDLE OF
+    A RUNNING PROCESS. (The old comment here claimed this import was narrow
+    enough to avoid photonlibpy's package body. It never was - Python runs
+    __init__.py before it can give you a submodule.)
+
+    ntcore's LocalStorage silently DROPS a value whose timestamp is not newer
+    than the one the topic already holds, and setString() still returns True.
+    So every topic the daemon had already published froze at the value it held
+    when this import ran, for the rest of the process - while topics published
+    for the FIRST time afterwards worked normally, because they had no older
+    timestamp to lose to. That asymmetry is the whole of the dashboard bug:
+    `camera` and `result`, first written during the run, updated; `status`,
+    `progress`, `summary`, `ok`, `busy` and `run`, all written at startup, did
+    not. Forced and measured - see NTOut.
+
+    Two things keep it fixed, and they are independent on purpose: the daemon
+    calls this BEFORE it publishes anything, so the process has one timebase
+    for its whole life; and NTOut stamps every write with a forced-monotonic
+    timestamp, so a clock that moves anyway cannot silence it.
+    """
+    global _PHOTON_DECODER
+    if _PHOTON_DECODER is None:
+        from photonlibpy.packet import Packet
+        from photonlibpy.targeting.photonPipelineResult import PhotonPipelineResult
+        _PHOTON_DECODER = (Packet, PhotonPipelineResult)
+    return _PHOTON_DECODER
+
+
+class NTOut:
+    """The daemon's ONLY way to write to NetworkTables.
+
+    Two jobs, and the second is why it is a class rather than a few calls.
+
+    1. It holds real publishers. getEntry().setX() creates an implicit
+       publisher on first write, which makes "has this topic ever been
+       written" a hidden piece of state that changes how the topic behaves.
+       Publishing every key up front removes that.
+
+    2. IT STAMPS EVERY WRITE ITSELF, with a timestamp that cannot go
+       backwards. ntcore stamps values with wpi::Now() and LocalStorage drops
+       a value that is not newer than the stored one - silently, returning
+       True. Anything that reinstalls wpi::Now() therefore kills every topic
+       already published, permanently, with no error anywhere.
+
+       That is not hypothetical: `import hal`, which photonlibpy pulls in, did
+       exactly that mid-run - see load_photon_decoder. The daemon now imports
+       that decoder before it publishes anything, which is the direct fix. This
+       is the structural one: with a monotonic stamp of our own, the NEXT
+       library that moves the clock cannot take the dashboard down, and the
+       dashboard is the only interface a drive team has.
+
+    FORCED, on this rig, with an NT server standing in for the roboRIO:
+    writing through getEntry() across the jump leaves the local value at its
+    old string ("*** DEAD ***" in the probe); writing through here lands, both
+    locally and at the server.
+    """
+
+    def __init__(self, table):
+        self._table = table
+        self._pubs = {}
+        self._last_ts = 0
+
+    def _ts(self):
+        import ntcore
+        t = int(ntcore._now())
+        if t <= self._last_ts:
+            # The clock moved backwards (or stood still). Keep going forwards
+            # by a microsecond rather than letting ntcore discard the write.
+            t = self._last_ts + 1
+        self._last_ts = t
+        return t
+
+    def _pub(self, name, kind):
+        p = self._pubs.get(name)
+        if p is None:
+            topic = getattr(self._table, "get%sTopic" % kind)(name)
+            p = topic.publish()
+            self._pubs[name] = p
+        return p
+
+    def string(self, name, value):
+        self._pub(name, "String").set(str(value), self._ts())
+
+    def boolean(self, name, value):
+        self._pub(name, "Boolean").set(bool(value), self._ts())
+
+    def double(self, name, value):
+        self._pub(name, "Double").set(float(value), self._ts())
+
+
 class NTResults:
     """Read PhotonVision's detections off NetworkTables instead of its websocket.
 
@@ -2767,11 +2919,14 @@ class NTResults:
     but leaves a marginal solve rate sitting close to the gate. NT carries
     every frame: 42.9 results/s measured, ~170 frames per dwell, 4.8x more.
 
-    Imports ONLY the decoder. photonlibpy.PhotonCamera pulls in
-    photonlibpy/timesync/timeSyncServer.py, which creates a TimeSyncServer at
-    module scope (line 94) and binds a UDP port PhotonVision already owns -
-    "OSError: [Errno 98] Address already in use" on the coprocessor itself.
-    Packet + PhotonPipelineResult start no threads.
+    The decoder comes from load_photon_decoder(), which is the only import
+    site in the module. This class used to import it here, and its comment
+    claimed the import was narrow enough to leave the rest of photonlibpy
+    alone. IT WAS NOT, and could not be: Python runs photonlibpy/__init__.py
+    before it will hand you photonlibpy.packet, and that body imports
+    photonCamera -> wpilib -> hal, whose HAL_Initialize reinstalls wpi::Now().
+    Doing that inside the first tune moved the clock under NetworkTables and
+    silently froze the daemon's whole dashboard. See load_photon_decoder.
 
     Needs an NT server to ALREADY exist somewhere - on a robot, the roboRIO.
     photontune never creates one. Verified from PhotonVision's source: toggling
@@ -2784,10 +2939,7 @@ class NTResults:
 
     def __init__(self, server, nickname):
         import ntcore
-        from photonlibpy.packet import Packet
-        from photonlibpy.targeting.photonPipelineResult import PhotonPipelineResult
-        self._Packet = Packet
-        self._Result = PhotonPipelineResult
+        self._Packet, self._Result = load_photon_decoder()
         # A PRIVATE instance. Sampling must not re-point or re-identify the
         # connection the daemon publishes its status table on: sharing the
         # default singleton orphaned the daemon's publishers, and its NT table
@@ -2805,22 +2957,22 @@ class NTResults:
     def close(self):
         """Release the private NT client. Without this every reader leaks one."""
         try:
-            # Stop the client, but do NOT destroy the instance.
+            # Stop the client, but do NOT destroy the instance. destroy() on
+            # a handle that is not a live private instance takes the default
+            # instance out with it, and the default instance is where the
+            # daemon publishes.
             #
-            # In ntcore the DEFAULT instance is handle 0, and destroy() on a
-            # handle that is not a live private instance takes the default out
-            # with it - which is the daemon's own publishers. Symptom, measured
-            # end to end against a real NT server: a tune completes and logs
-            # "done: OV9281=863@g40; OV9281 (1)=860@g20", the process stays
-            # alive and keeps looping, and its NT session is gone - heartbeat
-            # reads the -1 default, summary is empty, ok is false, and a second
-            # press of the run button does nothing. The dashboard is the only
-            # interface a drive team has, so this is fatal even though the tune
-            # itself is correct.
+            # A correction to what this comment used to say. It blamed
+            # destroy() for the whole dashboard failure - "a tune completes,
+            # the process keeps looping, and its NT session is gone". Removing
+            # destroy() was a real fix and the session does survive a run now,
+            # but it was NOT the cause of the freeze. That was the clock jump
+            # in load_photon_decoder, forced and measured since: create() and
+            # stopClient() on a private instance, on this rig, leave the
+            # default instance's publishers working normally.
             #
             # stopClient() alone releases the connection; the instance is then
-            # garbage with no references and costs nothing. Not destroying it
-            # cannot orphan anything that is not ours.
+            # garbage with no references and costs nothing.
             self.inst.stopClient()
         except Exception:
             pass
@@ -3136,6 +3288,29 @@ async def daemon(args, log=print):
     except ImportError:
         sys.exit("daemon mode needs: pip install pyntcore")
 
+    # BEFORE the NT client exists, and before anything is published.
+    #
+    # This import reinstalls wpi::Now() and the clock falls from epoch
+    # microseconds to roughly zero; ntcore then silently discards every write
+    # to a topic that already holds a value stamped with the old clock. Doing
+    # it here means the daemon lives its whole life in ONE timebase. Doing it
+    # lazily - which is what NTResults used to do, inside the first tune -
+    # froze the entire dashboard at the values it held when the first run
+    # started. See load_photon_decoder for the measurement.
+    #
+    # It costs ~1-2 s of wpilib import at startup and it is paid once, while
+    # the daemon is waiting for PhotonVision to finish booting anyway.
+    t_imp = time.time()
+    try:
+        load_photon_decoder()
+        log("photonlibpy decoder loaded in %.1f s" % (time.time() - t_imp))
+    except Exception as exc:
+        # Not fatal: without it there is no NetworkTables sampling and the
+        # tune falls back to the websocket. It IS worth saying, because the
+        # fallback is 4.8x fewer frames per trial.
+        log("photonlibpy not available (%s) - sampling will use the websocket"
+            % exc)
+
     inst = ntcore.NetworkTableInstance.getDefault()
     inst.startClient4("photontune")
     if args.nt_server:
@@ -3146,30 +3321,30 @@ async def daemon(args, log=print):
     base_cfg = dataclasses.replace(Config.from_args(args), nt_inst=inst)
 
     tbl = inst.getTable(args.nt_table)
-    run_entry = tbl.getEntry("run")
-    run_entry.setDefaultBoolean(False)
-    status = tbl.getEntry("status")          # live human-readable line
-    busy = tbl.getEntry("busy")              # true while tuning
-    ok_entry = tbl.getEntry("ok")            # <- go / no-go for the last run
-    summary = tbl.getEntry("summary")        # <- one line, what it did
-    warnings_e = tbl.getEntry("warnings")    # <- things that are not failures but
-                                             #    that a human must still be told
-    progress_e = tbl.getEntry("progress")    # <- 0..1, for a progress bar
-    heartbeat = tbl.getEntry("heartbeat")    # <- proves the service is alive
-    result_entry = tbl.getEntry("result")    # full JSON
-    camera_e = tbl.getEntry("camera")        # <- camera being tuned, "2 of 3"
-    boot_ran = tbl.getEntry("bootBaselineRan")      # <- did the boot baseline happen
-    boot_ok = tbl.getEntry("bootBaselineOk")        # <- did it succeed
-    boot_sum = tbl.getEntry("bootBaselineSummary")  # <- what it did, or why not
-    status.setString("idle")
-    summary.setString("never run")
-    warnings_e.setString("")
-    busy.setBoolean(False)
-    ok_entry.setBoolean(False)
-    progress_e.setDouble(0.0)
-    boot_ran.setBoolean(False)
-    boot_ok.setBoolean(False)
-    boot_sum.setString("pending")
+    # ONE writer for the whole daemon. Nothing below may call setString /
+    # setBoolean / setDouble on an entry - see NTOut for why that silently
+    # stopped working and took the dashboard with it.
+    nt = NTOut(tbl)
+    # Read-only view of the trigger. The daemon WRITES it through nt.
+    run_sub = tbl.getBooleanTopic("run").subscribe(False)
+
+    # EXPLICIT False, not setDefaultBoolean. A server that still holds run=true
+    # from the last session would otherwise trigger a tune the instant the
+    # daemon came up - on a robot that is a camera being swept while somebody
+    # is carrying it to the field.
+    nt.boolean("run", False)
+    nt.string("status", "idle")              # live human-readable line
+    nt.string("summary", "never run")        # <- short: what it did
+    nt.string("warnings", "")                # <- short labels, not prose
+    nt.boolean("busy", False)                # true while tuning
+    nt.boolean("ok", False)                  # <- go / no-go for the last run
+    nt.double("progress", 0.0)               # <- 0..1, for a progress bar
+    nt.double("heartbeat", 0.0)              # <- proves the service is alive
+    nt.string("camera", "")                  # <- camera being tuned, "2 of 3"
+    nt.string("result", "")                  # full JSON, the detail
+    nt.boolean("bootBaselineRan", False)     # <- did the boot baseline happen
+    nt.boolean("bootBaselineOk", False)      # <- did it succeed
+    nt.string("bootBaselineSummary", "pending")
 
     async def boot_baseline():
         """Wait for PhotonVision to answer, then assert the baseline. Seconds.
@@ -3202,8 +3377,9 @@ async def daemon(args, log=print):
             await asyncio.sleep(2.0)
         if not ready:
             why = "PhotonVision not ready within %.0fs" % args.boot_timeout
-            boot_ran.setBoolean(False); boot_ok.setBoolean(False)
-            boot_sum.setString(why)
+            nt.boolean("bootBaselineRan", False)
+            nt.boolean("bootBaselineOk", False)
+            nt.string("bootBaselineSummary", _nt_line(why, 120))
             log("boot baseline skipped: " + why)
             return
         # The baseline is safe with the robot enabled in a way a tune is not -
@@ -3211,19 +3387,21 @@ async def daemon(args, log=print):
         # move exposure or gain - but it still changes the pipeline, so it
         # waits rather than interrupting a match.
         if robot_is_enabled(inst):
-            boot_ran.setBoolean(False); boot_ok.setBoolean(False)
-            boot_sum.setString("skipped: robot was enabled at boot")
+            nt.boolean("bootBaselineRan", False)
+            nt.boolean("bootBaselineOk", False)
+            nt.string("bootBaselineSummary", "skipped: robot was enabled at boot")
             log("boot baseline skipped: robot is enabled")
             return
-        status.setString("asserting the baseline...")
+        nt.string("status", "asserting the baseline...")
         t1 = time.time()
         try:
             res = await run(dataclasses.replace(base_cfg, baseline_only=True),
                             log=log)
         except Exception as exc:
-            boot_ran.setBoolean(True); boot_ok.setBoolean(False)
-            boot_sum.setString("error: %s" % exc)
-            status.setString("boot baseline error: %s" % exc)
+            nt.boolean("bootBaselineRan", True)
+            nt.boolean("bootBaselineOk", False)
+            nt.string("bootBaselineSummary", _nt_line("error: %s" % exc, 120))
+            nt.string("status", _nt_line("boot baseline error: %s" % exc, 100))
             log("boot baseline error: %s" % exc)
             return
         failed, warns, code = run_verdict(
@@ -3236,45 +3414,86 @@ async def daemon(args, log=print):
         if failed:
             line += "; FAILED: " + ", ".join(
                 "%s (%s)" % (r["camera"], failure_text(r)) for r in failed)
-        boot_ran.setBoolean(True)
-        boot_ok.setBoolean(code == 0)
-        boot_sum.setString(line[:200])
-        status.setString("idle - baseline asserted in %.0f s" % (time.time() - t1))
+        nt.boolean("bootBaselineRan", True)
+        nt.boolean("bootBaselineOk", code == 0)
+        nt.string("bootBaselineSummary", _nt_line(line, 120))
+        nt.string("status",
+                  "idle - baseline asserted in %.0f s" % (time.time() - t1))
         log("boot baseline done in %.0f s: ok=%s %s"
             % (time.time() - t1, code == 0, line))
 
+    async def heartbeat():
+        """Its own task, because the trigger loop is BLOCKED for a whole tune.
+
+        heartbeat is the key that says "the service is alive", and it was
+        incremented in the trigger loop - which sits inside `await run(...)`
+        for the 45 s a two-camera tune takes. So the one signal that means
+        alive stopped for the entire time the tool was doing the thing you
+        asked it to do, which is exactly when somebody is watching it. A
+        dashboard watchdog cannot tell that apart from a dead daemon.
+
+        The loop is free during a tune (every long wait is an await or an
+        executor - see _open_readers), so a task is all it takes.
+        """
+        beat = 0.0
+        while True:
+            beat += 1.0
+            nt.double("heartbeat", beat)
+            await asyncio.sleep(0.2)
+
     asyncio.ensure_future(boot_baseline())
+    asyncio.ensure_future(heartbeat())
 
     log("daemon up. table /%s  - set 'run' true to tune." % args.nt_table)
     last = False
-    beat = 0.0
     while True:
-        beat += 1.0
-        heartbeat.setDouble(beat)
-        trigger = run_entry.getBoolean(False)
+        trigger = run_sub.get()
         if trigger and not last:
             if robot_is_enabled(inst):
-                status.setString("refused: robot enabled")
+                nt.string("status", "refused: robot enabled")
                 log("trigger ignored - robot is enabled")
-                run_entry.setBoolean(False)
+                nt.boolean("run", False)
             else:
-                busy.setBoolean(True)
-                warnings_e.setString("")
-                ok_entry.setBoolean(False)
-                progress_e.setDouble(0.0)
-                status.setString("tuning on the tags in view...")
-                summary.setString("running...")
+                nt.boolean("busy", True)
+                nt.string("warnings", "")
+                nt.boolean("ok", False)
+                nt.double("progress", 0.0)
+                nt.string("status", "tuning on the tags in view...")
+                nt.string("summary", "running...")
                 def cap(msg):
-                    log(msg); status.setString(str(msg)[:120])
+                    log(msg); nt.string("status", _nt_line(msg, 100))
                 def announce(nick, idx, total):
-                    camera_e.setString("%s (%d of %d)" % (nick, idx + 1, total))
+                    nt.string("camera", "%s (%d of %d)" % (nick, idx + 1, total))
 
                 try:
                     res = await run(base_cfg, log=cap,
-                                    progress=lambda f: progress_e.setDouble(f),
+                                    progress=lambda f: nt.double("progress", f),
                                     on_camera=announce)
                     failed, warns, code = run_verdict(res, base_cfg)
                     applied = [r for r in res if r not in failed and r.get("applied")]
+                    every_camera_ok = bool(applied) and code == 0
+                    short = nt_summary(res, failed)
+                    # Warnings reach the dashboard, not just the log. A camera
+                    # whose RESOLUTION this tool changed, or one applied over
+                    # the blur budget, published ok=true and said nothing - so
+                    # the one signal a team reads could not tell them their
+                    # camera is no longer running the mode they set.
+                    #
+                    # LABELS, not prose. The full sentences went to NT as one
+                    # 600+ character string; they are in the journal below and
+                    # in `result`, and what the widget gets is readable at a
+                    # glance.
+                    wshort = " | ".join(
+                        "%s: %s" % (r.get("camera", "?"),
+                                    ", ".join(problem_labels(r, WARN)))
+                        for r in res if problem_labels(r, WARN))
+                    nt.string("warnings", _nt_line(wshort, 120))
+                    nt.boolean("ok", every_camera_ok)
+                    nt.string("summary", short)
+                    nt.string("status", short)
+                    nt.string("result", json.dumps(res))
+                    nt.double("progress", 1.0)
+                    # The long form, for the log only.
                     line = "; ".join("%s=%.0f@g%s" % (r["camera"], r["applied"],
                                                       r.get("gain"))
                                      for r in applied)
@@ -3282,23 +3501,9 @@ async def daemon(args, log=print):
                         line += ("; FAILED: " + ", ".join(
                             "%s (%s)" % (r["camera"], failure_text(r))
                             for r in failed))
-                    # Warnings reach the dashboard, not just the log. A camera
-                    # whose RESOLUTION this tool changed, or one applied over
-                    # the blur budget, published ok=true and said nothing - so
-                    # the one signal a team reads could not tell them their
-                    # camera is no longer running the mode they set.
                     wline = " | ".join("%s: %s" % (who, t) for who, t in warns)
-                    warnings_e.setString(wline[:500])
                     if wline:
-                        line += "  [WARN] " + wline
                         log("WARNINGS: " + wline)
-                    every_camera_ok = bool(applied) and code == 0
-                    ok_entry.setBoolean(every_camera_ok)
-                    summary.setString(line or "no cameras tuned")
-                    status.setString(("DONE - " if every_camera_ok
-                                      else "DONE WITH ERRORS - ") + line)
-                    result_entry.setString(json.dumps(res))
-                    progress_e.setDouble(1.0)
                     log("done: " + line)
                 except AlreadyRunning as exc:
                     # SKIP the trigger, do not fail it. A human at the CLI while
@@ -3306,11 +3511,13 @@ async def daemon(args, log=print):
                     # human's run is the one that should win - they are standing
                     # there watching it.
                     msg = "skipped: %s" % str(exc).splitlines()[0]
-                    summary.setString(msg); status.setString(msg); log(msg)
+                    nt.string("summary", _nt_line(msg, 120))
+                    nt.string("status", _nt_line(msg, 100))
+                    log(msg)
                 except Exception as exc:
-                    ok_entry.setBoolean(False)
-                    summary.setString("error: %s" % exc)
-                    status.setString("error: %s" % exc)
+                    nt.boolean("ok", False)
+                    nt.string("summary", _nt_line("error: %s" % exc, 120))
+                    nt.string("status", _nt_line("error: %s" % exc, 100))
                     log("error: %s" % exc)
                 finally:
                     # The daemon is the DEPLOYED mode, and the replay used to
@@ -3326,9 +3533,9 @@ async def daemon(args, log=print):
                                    unique, orig))
                     except Exception as rexc:
                         log("restore replay failed: %s" % rexc)
-                    busy.setBoolean(False)
-                    camera_e.setString("")
-                    run_entry.setBoolean(False)
+                    nt.boolean("busy", False)
+                    nt.string("camera", "")
+                    nt.boolean("run", False)
         last = trigger
         await asyncio.sleep(0.2)
 

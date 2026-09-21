@@ -190,10 +190,22 @@ one is yours to post, with the AI Disclosure box ticked.
 These were found and consciously not fixed, because the tune's correctness was
 prioritised over crash edge cases:
 
-- the daemon's NT status may still freeze for the duration of a run (the cause —
-  the NT-server toggle — has been deleted, but this was **not re-verified** after
-  the rewrite)
+- ~~the daemon's NT status may still freeze for the duration of a run~~ **FIXED
+  2026-09-21, and the cause was neither of the two things guessed at here.**
+  Importing `photonlibpy` pulls in `wpilib` → `hal`, and `hal/_initialize.py`
+  runs `HAL_Initialize` at import time, which reinstalls `wpi::Now()` as FPGA
+  time. Measured on the Pi: `ntcore._now()` goes from `1790007715324377` to
+  `656`. ntcore then silently drops every write to a topic that already held a
+  value stamped with the old clock — `setString()` still returns True. So
+  `status`, `progress`, `summary`, `ok`, `busy` and `run` froze the instant the
+  first tune reached `_open_readers`, while `camera` and `result`, written for
+  the first time after it, kept working. The daemon now loads that decoder
+  before it publishes anything, and `NTOut` stamps every write with a
+  forced-monotonic timestamp. `sabotage_test.py --nt-clock` forces the jump.
 - `Photon.cameras()` waits its full 12 s timeout against a PhotonVision that
   connects but never broadcasts; the boot probe uses 3 s
 - `--verdict-matrix` and `--cli-smoke` do not cover this round's behaviour
-  changes: four deliberate reversions of the headline fixes all scored green
+  changes: four deliberate reversions of the headline fixes all scored green.
+  `--nt-clock` is the exception — three planted reversions of the NT fix
+  (the whole old file, `NTOut` without its timestamp, and the decoder load
+  moved back after the NT client) each exit 1 against it
