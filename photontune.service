@@ -1,31 +1,44 @@
 [Unit]
-Description=PhotonTune - NetworkTables-triggered exposure tuner for PhotonVision
+Description=PhotonTune - boot baseline + NetworkTables-triggered tuner for PhotonVision
 After=network-online.target photonvision.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/photontune
-# --nt-server: point at a NetworkTables server that ALREADY EXISTS - the
-#              roboRIO at competition (e.g. 10.TE.AM.2), or use --team
-#              <number> instead. photontune never starts one; if none is
-#              reachable it samples over PhotonVision's websocket instead.
+
+# -u: without it Python block-buffers stdout to the journal pipe and SIGTERM
+#     discards the buffer, so the daemon logs nothing for its whole life.
 #
-# The daemon asserts the baseline once at boot and then waits. Set
-# PhotonTune/run true from the dashboard to tune, at the field, in the light
-# you will actually play in.
-ExecStart=/usr/bin/python3 /opt/photontune/photontune.py \
+# --nt-server: EDIT THIS. It must point at a NetworkTables server that ALREADY
+#     EXISTS - the roboRIO at competition (10.TE.AM.2, or use --team <number>
+#     instead). photontune never starts one: toggling PhotonVision's own
+#     runNTServer posts to /api/settings/general, which restarts the web
+#     server and tore down the tool's own control channel. With no NT server
+#     reachable it falls back to PhotonVision's websocket at ~9 results/s,
+#     which the gain walk tolerates - it is 4.8x fewer frames per trial.
+#     On a bench with no roboRIO: 127.0.0.1, if runNTServer is on.
+#
+# Boot asserts the STRUCTURAL baseline only - seconds, and it cannot leave a
+#     camera mid-sweep. Tuning is on demand: set PhotonTune/run true, at the
+#     field, in the light you will actually play in.
+ExecStart=/usr/bin/python3 -u /opt/photontune/photontune.py \
     --daemon \
-    --nt-server 10.0.0.2 \
     --host 127.0.0.1 \
-    --nt-table PhotonTune
+    --nt-server 10.0.0.2 \
+    --nt-table PhotonTune \
+    --boot-timeout 90
 Restart=on-failure
 RestartSec=5
+
 # photontune exits 143 on SIGTERM (128 + 15, the shell's convention) so that a
 # script can tell an interruption from a clean finish. Declaring it a success
-# keeps `systemctl stop` from looking like a crash. It is NOT a blanket
-# amnesty: a camera the tool could not put back exits 1 specifically, so that
-# case still reaches the journal as a failure.
+# keeps `systemctl stop` from looking like a crash, and keeps Restart=on-failure
+# from bouncing the daemon after a deliberate TERM. It is NOT a blanket amnesty:
+# a camera the tool could not put back exits 1 specifically, so that case still
+# reaches the journal as a failure.
+SuccessExitStatus=143
+
 # Never higher priority than the vision pipeline itself
 Nice=5
 
