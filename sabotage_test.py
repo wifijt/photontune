@@ -92,6 +92,9 @@ TUNED = {
 HARD, WARN = "hard", "warn"
 
 MATRIX_SEVERITY = {
+    # WARN: the tune is valid for detection, which is what is being tuned;
+    # single-tag pose is ambiguous and the run says so rather than implying it.
+    "single_tag_scene": "warn",
     "baseline_failed":        HARD,
     "baseline_unconfirmed":   HARD,
     "setting_rejected":       HARD,
@@ -127,6 +130,7 @@ MATRIX_SEVERITY = {
 }
 
 MATRIX_VALUES = {
+    "single_tag_scene":       ("camera", "1.00 tags, ambiguity 0.023 over 36 frames"),
     "baseline_failed":        ("camera", [["cameraBrightness", "40", "5"]]),
     "baseline_unconfirmed":   ("camera", "no cameraSettings for 12 s"),
     "setting_rejected":       ("camera", [["cameraGain", "20", "0"]]),
@@ -172,6 +176,7 @@ MATRIX_VALUES = {
 # on purpose. problem_notes has a try/except fallback for that; _describe()
 # below mirrors it, so the test checks what a human would actually see.
 MATRIX_FALSY = {
+    "single_tag_scene":       ("camera", ""),
     "baseline_failed":        ("camera", []),
     "baseline_unconfirmed":   ("camera", ""),
     "setting_rejected":       ("camera", []),

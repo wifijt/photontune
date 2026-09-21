@@ -1458,6 +1458,31 @@ PROBLEMS = {
                   "instead." % (v["got"], v["scene_best"], v["scene_at"],
                                 v["scene_gain"])),
     # ---- warn ----
+    # A scene with exactly one tag in it is a legitimate scene. The tag-count
+    # floor exists to catch "a bad setting LOST tags you could have had" - it
+    # is a relative idea, which is why tags_significantly_below is measured
+    # against the reference rather than a constant. --min-tags 2 was the one
+    # absolute left over, and it turned "this camera can only see one tag"
+    # into "nothing worked at any gain or exposure: check the lighting".
+    #
+    # Measured on OV9281 (1): tag 2 detected in 172 of 172 frames, ambiguity
+    # 0.019-0.023 throughout, at every gain from 0 to 100 and every exposure
+    # from 860 to 1719 us. Nothing was wrong with the exposure. Multi-tag needs
+    # two tags and the scene has one, so no setting could ever have passed.
+    #
+    # The floor now comes from the scene. What is NOT claimed is pose quality:
+    # single-tag PnP on a planar target has two valid solutions, and this rig
+    # measured one tag reporting 0.33 m when the truth was 2.4 m. So the tune
+    # is valid for DETECTION - the thing being tuned - and says so, rather
+    # than implying a pose it cannot vouch for.
+    "single_tag_scene": (WARN,
+        lambda v: "this camera can only see one tag (%s), so multi-tag cannot "
+                  "run and the tag-count floor was taken from the scene rather "
+                  "than from --min-tags. Exposure and gain are tuned for "
+                  "DETECTION and that part is verified; single-tag pose is "
+                  "ambiguous, so pose accuracy is NOT verified by this run. "
+                  "Aim so two tags are in frame if you need a trustworthy "
+                  "pose from this camera." % v),
     "robot_state_unknown": (WARN,
         lambda v: "THE ROBOT-ENABLED GUARD WAS INACTIVE for this tune: %s. "
                   "Nothing would have stopped this run if a match had started "
@@ -1966,7 +1991,32 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
         # applied from a number nobody can stand behind - the walk still has
         # to clear the 90% rate gate on its own merits, and if nothing does,
         # _rescue is the correct destination and gets there honestly.
-        ref_why = st.reference.why_failed(cfg.min_tags, cfg.max_ambiguity)
+        # Does this SCENE have more than one tag to offer? Judge the floor by
+        # what the reference could see, not by a constant. Deliberately narrow:
+        # the reference must be detecting its one tag reliably and at a
+        # trustworthy ambiguity, so this cannot rescue a genuinely broken
+        # camera that happens to glimpse a tag occasionally.
+        eff_min_tags = cfg.min_tags
+        r = st.reference
+        one_tag_scene = (
+            not r.multitag_solves
+            and r.frames >= MIN_SAMPLE_FRAMES
+            and 0.90 <= r.mean_tags < 1.5
+            and r.med_ambiguity is not None
+            and r.med_ambiguity <= cfg.max_ambiguity)
+        if one_tag_scene and cfg.min_tags > 1.0:
+            eff_min_tags = 1.0
+            log("   only one tag is visible to this camera (%.2f tags at "
+                "ambiguity %.3f, %d frames). Multi-tag needs two, so the "
+                "tag-count floor comes from the scene: tuning for detection "
+                "of the one tag. Pose from a single tag is ambiguous and is "
+                "NOT verified by this run."
+                % (r.mean_tags, r.med_ambiguity, r.frames))
+            note_problem(rec, "single_tag_scene",
+                         "%.2f tags, ambiguity %.3f over %d frames"
+                         % (r.mean_tags, r.med_ambiguity, r.frames))
+
+        ref_why = st.reference.why_failed(eff_min_tags, cfg.max_ambiguity)
         if ref_why is None:
             best_tags = st.reference.mean_tags
             best_tags_se = st.reference.tag_standard_error()
@@ -1998,7 +2048,7 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
             else:
                 s = await trial(pv, cam, cfg, g, st.exposure, log)
                 st.trials.append(s)
-            why = s.why_failed(cfg.min_tags, cfg.max_ambiguity, best_tags,
+            why = s.why_failed(eff_min_tags, cfg.max_ambiguity, best_tags,
                                reference_se=best_tags_se)
             log("   %s gain %-4d exposure %6.0f  %s%s"
                 % ("ok " if why is None else "   ", g, st.exposure, s.summary(),
@@ -2105,7 +2155,7 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
         # scene can do at the BUDGET exposure", and we are no longer there.
         # A count from a state we have abandoned is not a floor.
         at_budget = abs(st.exposure - st.t_budget) <= 1.0
-        why = final.why_failed(cfg.min_tags, cfg.max_ambiguity,
+        why = final.why_failed(eff_min_tags, cfg.max_ambiguity,
                                best_tags if at_budget else None,
                                reference_se=best_tags_se if at_budget else None)
         log("   %s applied   gain %-4d exposure %6.0f  %s%s"
@@ -2755,9 +2805,23 @@ class NTResults:
     def close(self):
         """Release the private NT client. Without this every reader leaks one."""
         try:
+            # Stop the client, but do NOT destroy the instance.
+            #
+            # In ntcore the DEFAULT instance is handle 0, and destroy() on a
+            # handle that is not a live private instance takes the default out
+            # with it - which is the daemon's own publishers. Symptom, measured
+            # end to end against a real NT server: a tune completes and logs
+            # "done: OV9281=863@g40; OV9281 (1)=860@g20", the process stays
+            # alive and keeps looping, and its NT session is gone - heartbeat
+            # reads the -1 default, summary is empty, ok is false, and a second
+            # press of the run button does nothing. The dashboard is the only
+            # interface a drive team has, so this is fatal even though the tune
+            # itself is correct.
+            #
+            # stopClient() alone releases the connection; the instance is then
+            # garbage with no references and costs nothing. Not destroying it
+            # cannot orphan anything that is not ours.
             self.inst.stopClient()
-            import ntcore as _nt
-            _nt.NetworkTableInstance.destroy(self.inst)
         except Exception:
             pass
 
@@ -3411,6 +3475,16 @@ def _install_signal_handlers():
 
     for sig in (signal.SIGTERM, signal.SIGHUP):
         try:
+            # Never override an INHERITED ignore. nohup protects a process by
+            # setting SIGHUP to SIG_IGN before exec; registering a handler here
+            # silently undid that, so a daemon started with `nohup ... &` over
+            # ssh died the moment the session closed - it ran its boot baseline,
+            # logged "stopping - restoring any camera left mid-tune", and was
+            # gone before anyone could trigger a tune. systemd never sends
+            # SIGHUP so the deployed path was unaffected, which is exactly why
+            # it went unnoticed.
+            if signal.getsignal(sig) == signal.SIG_IGN:
+                continue
             signal.signal(sig, _raise)
         except (ValueError, OSError, AttributeError):
             pass          # not the main thread, or not supported here
