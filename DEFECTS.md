@@ -185,7 +185,7 @@ one is yours to post, with the AI Disclosure box ticked.
 
 ---
 
-## D11. Exposure units differ between USB and CSI cameras, and nothing says so
+## 11. Exposure units differ between USB and CSI cameras, and nothing says so
 
 **Condition:** any USB (UVC) camera. Every value photontune computes, applies and
 reports is wrong by the ratio between the camera's raw unit and a microsecond -
