@@ -236,13 +236,34 @@ value, not microseconds, and do not compare it against a CSI camera's. Divide
 the reported figure by 100 to get approximate microseconds before reasoning
 about motion blur. `--max-blur-px` is not meaningful on USB until this is fixed.
 
-**Fix, not yet applied.** Units cannot be known with certainty - PhotonVision
+**FIXED 2026-10-01.** The unit cannot be known with certainty - PhotonVision
 accepts any of `raw_exposure_absolute`, `raw_exposure_time_absolute`, `exposure`
-or `raw_Exposure`, and they do not share a scale. The defensible approach is to
-infer and say so: no real camera has a maximum exposure of 20 ms, so a
-`maxExposureRaw` below about 20000 means the units are not microseconds. Assume
-the UVC 100 us convention, scale, and raise a warning that names the assumption,
-with an explicit override flag for anyone whose camera differs.
+or `raw_Exposure`, and they do not share a scale - so photontune infers it and
+says so. No camera has a maximum exposure of 20 ms, so a `maxExposureRaw` below
+20000 is not microseconds; `exposure_unit_us()` returns 100 for those and 1
+otherwise, `--exposure-unit-us` overrides, and a WARN-level
+`exposure_units_inferred` names the assumption in the verdict so nobody compares
+the printed number against a libcamera camera's by mistake.
+
+The budget is still computed in microseconds and converted ONCE, where it is
+set. Every read, write and verify downstream stays in the camera's own units,
+which is why this is one conversion and not the eight the boundary would have
+needed.
+
+Verified by forcing the case, not by watching the CSI pair succeed - the CSI
+pair cannot show the bug, its factor is 1. `sabotage_test.py --exposure-units`,
+7 cases:
+
+```
+USB OV9281, UVC - 100 us per unit      unit 100   writes 8.6   -> 5.56 px
+CSI OV9281, libcamera                  unit   1   writes 863.5 -> 6.00 px
+what the bug did:  USB wrote 863 raw as if us    -> 600.0 px of smear
+```
+
+**Residual limitation.** A UVC camera quantises exposure to 100 us steps, so the
+budget can only be hit to within one step - about 12% at 863 us. The error lands
+on the safe side (8 steps, not 9), but a USB camera cannot track a blur budget
+as finely as a CSI one.
 
 ## Deferred, deliberately
 

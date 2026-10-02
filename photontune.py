@@ -198,6 +198,31 @@ WS_MARK_STALE_S = 0.5
 EXPOSURE_FLOOR_FALLBACK = 100.0
 EXPOSURE_CEILING_FALLBACK = 25000.0
 
+# EXPOSURE UNITS ARE NOT ALWAYS MICROSECONDS, and PhotonVision says they are
+# anyway. GenericUSBCameraSettables.setExposureRaw clamps to the V4L2 property's
+# own min/max and writes the number straight through, while logging it as
+# "(user requested N us)". On libcamera that is true. On a UVC camera it is not:
+# CT_EXPOSURE_TIME_ABSOLUTE_CONTROL is specified in units of 100 us.
+#
+# Measured on one Pi carrying the SAME OV9281 sensor behind both drivers:
+#     CSI  (libcamera)  minExposureRaw 7   maxExposureRaw 80000   -> real us
+#     USB  (UVC)        min 1  max 5000  default 157             -> 100 us each
+# The default settles it: 157 x 100 us = 15.7 ms, a conventional value, where
+# 157 us would be absurd and a 5 ms ceiling absurd for a MAXIMUM.
+#
+# So a budget of 863 us written to a USB camera becomes 86.3 ms - 600 px of
+# smear where 6 was intended, on a tag edge about 70 px across. It does not
+# look like a failure, because the saturation branch then walks exposure back
+# down and the run converges on something usable. The budget is simply never
+# enforced.
+#
+# The unit cannot be known for certain: PhotonVision accepts any of
+# raw_exposure_absolute, raw_exposure_time_absolute, exposure or raw_Exposure,
+# and they do not share a scale. So INFER it and SAY SO. No camera has a maximum
+# exposure of 20 ms, so a ceiling below that is not microseconds.
+UVC_RAW_UNIT_US = 100.0
+US_UNIT_MIN_CEILING = 20000.0
+
 # How long a read-back may poll for the camera to agree before it is called a
 # failure. PhotonVision's cameraSettings broadcast lags a write by 1-2 s, so
 # anything under a few seconds cries wolf; 12 s is long enough that "still not
@@ -542,6 +567,28 @@ def _median(xs):
 #
 # blurtest.py, with a human waving a tag, is the only thing that settles it.
 # ---------------------------------------------------------------------------
+
+def exposure_unit_us(cam, override=None):
+    """Microseconds per unit of this camera's exposure value.
+
+    1.0 for libcamera, which really is microseconds. 100.0 for a standard UVC
+    camera. Inferred from the reported ceiling, because the unit is not
+    published anywhere - see the block comment at UVC_RAW_UNIT_US.
+
+    An override is taken verbatim and un-sanity-checked on purpose: the point of
+    it is the camera whose units are neither of the two this can guess.
+    """
+    if override:
+        return float(override)
+    hi = cam.get("maxExposureRaw")
+    if hi is not None:
+        try:
+            if float(hi) < US_UNIT_MIN_CEILING:
+                return UVC_RAW_UNIT_US
+        except (TypeError, ValueError):
+            pass
+    return 1.0
+
 
 def blur_px(exposure_us, blur_rate_deg_s, fx):
     """Motion smear, in pixels, at this exposure and angular rate."""
@@ -1351,6 +1398,15 @@ def calibration_problem(cam, assume_solvepnp=False):
 HARD, WARN = "hard", "warn"
 
 PROBLEMS = {
+    "exposure_units_inferred": (WARN,
+        lambda v: "exposure is in units of %g us on this camera, not 1 us - "
+                  "%s (maxExposureRaw %s). Every exposure printed by this run "
+                  "is in those units; divide by %g to compare it against a "
+                  "libcamera camera. PhotonVision labels both as us."
+                  % (v["unit_us"],
+                     "inferred from the reported ceiling"
+                     if v.get("inferred") else "set with --exposure-unit-us",
+                     v.get("max_raw"), v["unit_us"])),
     # ---- hard ----
     "baseline_failed": (HARD,
         lambda v: "structural settings did not take: %s"
@@ -1698,6 +1754,8 @@ class Config:
     tag_size: float = 0.1651        # 6.5 in, the FRC tag, metres
     fx: float = 1105.9              # fallback only; camera_fx() reads the real one
     max_exposure: float = 25000.0   # ceiling for the over-budget walk only
+    # 0 means infer per camera. See exposure_unit_us().
+    exposure_unit_us: float = 0.0
 
     # how a measurement is taken
     dwell: float = 4.0
@@ -1727,6 +1785,7 @@ class Config:
         return cls(host=a.host, port=a.port, cameras=a.cameras,
                    max_gain=a.max_gain, max_blur_px=a.max_blur_px,
                    blur_rate=a.blur_rate, fx=a.fx, max_exposure=a.max_exposure,
+                   exposure_unit_us=a.exposure_unit_us,
                    max_range=a.max_range, tag_size=a.tag_size,
                    dwell=a.dwell, settle=a.settle, min_tags=a.min_tags,
                    max_ambiguity=a.max_ambiguity, baseline=a.baseline,
@@ -1750,7 +1809,8 @@ class Search:
     later cannot reintroduce the bug, because there is nowhere to write it.
     """
     __slots__ = ("cam", "unique", "nickname", "original", "fx", "budget_px",
-                 "t_budget", "exposure", "gain", "reference", "trials")
+                 "t_budget", "exposure", "gain", "reference", "trials",
+                 "unit_us")
 
     def __init__(self, cam):
         self.cam = cam
@@ -1764,7 +1824,8 @@ class Search:
         }
         self.fx = None
         self.budget_px = None      # the blur budget, in pixels (see blur_budget_px)
-        self.t_budget = None       # the blur budget, in microseconds
+        self.t_budget = None       # the blur budget, in the CAMERA'S units
+        self.unit_us = 1.0         # microseconds per unit - exposure_unit_us()
         self.exposure = None       # the exposure actually being tried
         self.gain = None           # the gain actually being tried
         self.reference = None      # Sample at max gain: the best the scene can do
@@ -1942,14 +2003,31 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
         # camera's fx. Without --max-range this is cfg.max_blur_px and
         # nothing about the answer changes.
         st.budget_px = blur_budget_px(cfg, st.fx)
-        want = blur_budget_exposure(st.budget_px, cfg.blur_rate, st.fx)
+        st.unit_us = exposure_unit_us(cam, cfg.exposure_unit_us or None)
+        # The budget is physics, so it is computed in MICROSECONDS and then
+        # converted into whatever unit this camera's exposure value is in. Every
+        # read, write and verify downstream stays in the camera's own units,
+        # which is the only reason this is one line instead of eight.
+        want_us = blur_budget_exposure(st.budget_px, cfg.blur_rate, st.fx)
+        want = want_us / st.unit_us
         st.t_budget = min(max(want, lo_e), hi_e)
         rec["budget"] = {"fx": st.fx, "fx_from_calibration": bool(own_fx),
                          "max_blur_px": st.budget_px,
                          "max_range": cfg.max_range,
                          "tag_size": cfg.tag_size if cfg.max_range else None,
                          "blur_rate": cfg.blur_rate, "wanted": want,
+                         "wanted_us": want_us,
+                         "exposure_unit_us": st.unit_us,
+                         "exposure_us": st.t_budget * st.unit_us,
                          "exposure": st.t_budget}
+        if st.unit_us != 1.0:
+            # Not a footnote. Every exposure this run prints is in units of
+            # st.unit_us, so a reader comparing it against a CSI camera's
+            # number without knowing that is off by that factor.
+            note_problem(rec, "exposure_units_inferred",
+                         {"unit_us": st.unit_us,
+                          "max_raw": cam.get("maxExposureRaw"),
+                          "inferred": not bool(cfg.exposure_unit_us)})
         # Say WHERE fx came from. It sets the whole scale of the budget, and a
         # line claiming "from this camera's calibration" over a --fx fallback
         # would be the tool asserting something it had not checked.
@@ -2165,10 +2243,12 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
             rec["error"] = "the final write did not take"
             return rec
 
-        px = blur_px(st.exposure, cfg.blur_rate, st.fx)
-        log("   applied gain %d / exposure %.0f - confirmed. %s px of smear "
+        px = blur_px(st.exposure * st.unit_us, cfg.blur_rate, st.fx)
+        log("   applied gain %d / exposure %.0f%s - confirmed. %s px of smear "
             "at %.0f deg/s (budget %g)"
-            % (st.gain, st.exposure, fmt_px(px), cfg.blur_rate, st.budget_px))
+            % (st.gain, st.exposure,
+               "" if st.unit_us == 1.0 else " (= %.0f us)" % (st.exposure * st.unit_us),
+               fmt_px(px), cfg.blur_rate, st.budget_px))
         if px > st.budget_px * 1.001:
             # The RAW px, not round(px, 1). Rounding is what produced the
             # 0.0 that both readers then treated as "no problem"; the value
@@ -2359,8 +2439,10 @@ async def _rescue(pv, cam, cfg, st, log):
         # nothing can work is not finding an answer, it is spending trials to
         # produce one that fails on a moving robot - and it shipped as exit 0.
         blur_cap = blur_budget_exposure(st.budget_px * OVER_BUDGET_LIMIT,
-                                        cfg.blur_rate, st.fx)
-        ceiling = min(hi_e, cfg.max_exposure, blur_cap)
+                                        cfg.blur_rate, st.fx) / st.unit_us
+        # hi_e is in the camera's units; blur_cap and --max-exposure are in
+        # microseconds, so both have to be converted before the min().
+        ceiling = min(hi_e, cfg.max_exposure / st.unit_us, blur_cap)
         if ceiling <= st.t_budget * 1.001:
             log("   even gain %d cannot work at %.0f us, and there is no longer "
                 "exposure available (ceiling %.0f us)."
@@ -3599,6 +3681,10 @@ def build_parser():
                         "directly with fx, and on this rig fx is 1105.9 at "
                         "1280x800 but 570.5 at 640x400, so a default carried "
                         "across a resolution change overstates blur by 1.94x.")
+    p.add_argument("--exposure-unit-us", type=float, default=0.0,
+                   help="microseconds per unit of the camera's exposure value. "
+                        "0 (default) infers it: libcamera is 1, a UVC camera is "
+                        "100. Set it explicitly if your camera is neither.")
     p.add_argument("--max-exposure", type=float, default=25000.0,
                    help="an ABSOLUTE ceiling for the too-dark exposure walk. "
                         "It is rarely the binding one: that walk also stops at "

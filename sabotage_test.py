@@ -95,6 +95,11 @@ MATRIX_SEVERITY = {
     # WARN: the tune is valid for detection, which is what is being tuned;
     # single-tag pose is ambiguous and the run says so rather than implying it.
     "single_tag_scene": "warn",
+    # WARN: the tune is correct in the camera's own units, and the budget IS
+    # enforced once they are known. What a human must be told is that the
+    # number printed is not microseconds, so it cannot be compared against a
+    # libcamera camera's. See UVC_RAW_UNIT_US in photontune.py.
+    "exposure_units_inferred": WARN,
     "baseline_failed":        HARD,
     "baseline_unconfirmed":   HARD,
     "setting_rejected":       HARD,
@@ -131,6 +136,8 @@ MATRIX_SEVERITY = {
 
 MATRIX_VALUES = {
     "single_tag_scene":       ("camera", "1.00 tags, ambiguity 0.023 over 36 frames"),
+    "exposure_units_inferred": ("camera", {"unit_us": 100.0, "max_raw": 5000.0,
+                                           "inferred": True}),
     "baseline_failed":        ("camera", [["cameraBrightness", "40", "5"]]),
     "baseline_unconfirmed":   ("camera", "no cameraSettings for 12 s"),
     "setting_rejected":       ("camera", [["cameraGain", "20", "0"]]),
@@ -177,6 +184,9 @@ MATRIX_VALUES = {
 # below mirrors it, so the test checks what a human would actually see.
 MATRIX_FALSY = {
     "single_tag_scene":       ("camera", ""),
+    # falsy in this key's own natural type: an empty dict, which is what a
+    # describe() reading v["unit_us"] will raise on - deliberately.
+    "exposure_units_inferred": ("camera", {}),
     "baseline_failed":        ("camera", []),
     "baseline_unconfirmed":   ("camera", ""),
     "setting_rejected":       ("camera", []),
@@ -628,6 +638,71 @@ def cli_smoke(src_dir):
     print("=" * 78)
     print("cli paths: %s"
           % ("all %d correct" % len(CLI_CASES) if not bad else "%d WRONG" % bad))
+    return 1 if bad else 0
+
+
+def exposure_units(src_dir):
+    """A UVC camera's exposure is NOT microseconds. Offline.
+
+    The bug this closes: photontune derived a budget in microseconds and wrote
+    it as the camera's raw exposure value. On libcamera that is the same number.
+    On a UVC camera the unit is 100 us, so a 6 px budget became 600 px of smear
+    and the budget was silently never enforced. PhotonVision labels both as us.
+
+    This forces the USB case rather than observing a success on the CSI pair -
+    the CSI pair cannot show the bug at all, because its factor is 1.
+    """
+    sys.path.insert(0, src_dir)
+    import photontune as pt
+
+    print("=" * 74)
+    print("EXPOSURE UNITS  - is the blur budget enforced on a UVC camera?")
+    print("=" * 74)
+
+    FX, RATE, PX = 1105.9, 360.0, 6.0
+    want_us = pt.blur_budget_exposure(PX, RATE, FX)
+    print("  budget: %g px at %.0f deg/s, fx %.1f  ->  %.1f us\n" % (PX, RATE, FX, want_us))
+
+    cases = [
+        # maxExposureRaw, override, expect_unit, label
+        (80000.0, None, 1.0,   "CSI OV9281, libcamera - really microseconds"),
+        (5000.0,  None, 100.0, "USB OV9281, UVC - 100 us per unit"),
+        (1000.0,  None, 100.0, "another UVC range"),
+        (None,    None, 1.0,   "camera reports no ceiling - assume us"),
+        (5000.0,  10.0, 10.0,  "--exposure-unit-us overrides the inference"),
+        (20000.0, None, 1.0,   "exactly at the threshold stays microseconds"),
+        (19999.0, None, 100.0, "just under it does not"),
+    ]
+    bad = 0
+    print("  %-46s %8s %10s %9s" % ("camera", "unit", "writes", "smear px"))
+    for hi, override, want_unit, label in cases:
+        cam = {} if hi is None else {"maxExposureRaw": hi}
+        unit = pt.exposure_unit_us(cam, override)
+        raw = want_us / unit
+        # what the sensor ACTUALLY does - PhotonVision casts to int
+        actual_us = int(raw) * unit
+        px = pt.blur_px(actual_us, RATE, FX)
+        ok = (unit == want_unit) and (px <= PX * 1.02)
+        if not ok:
+            bad += 1
+        print("  %-46s %8g %10.1f %9.2f  %s"
+              % (label, unit, raw, px, "ok" if ok else "FAIL"))
+
+    print()
+    print("  what the bug did, for comparison:")
+    for hi, unit_label in ((80000.0, "CSI"), (5000.0, "USB")):
+        px = pt.blur_px(want_us * (1.0 if hi > 20000 else 100.0), RATE, FX)
+        print("     %-4s wrote %.0f raw as if us -> %.1f px of smear"
+              % (unit_label, want_us, px))
+
+    print()
+    print("  NOTE: a UVC camera quantises to 100 us, so the budget can only be")
+    print("  hit to within one step. At %.0f us that is a %.0f%% granularity."
+          % (want_us, 100.0 * 100.0 / want_us))
+
+    print("=" * 74)
+    print("exposure units: %d problem(s)" % bad if bad
+          else "exposure units: all %d cases correct" % len(cases))
     return 1 if bad else 0
 
 
@@ -1086,6 +1161,9 @@ def main():
     p.add_argument("--photontune", default=None,
                    help="command that runs photontune (default: python3 "
                         "<the photontune.py next to this file>)")
+    p.add_argument("--exposure-units", action="store_true",
+                   help="offline: is the blur budget enforced on a UVC camera, "
+                        "whose exposure unit is 100 us and not 1")
     p.add_argument("--sample-floor", action="store_true",
                    help="offline: assert a sample too small to judge is refused.")
     p.add_argument("--cli-smoke", action="store_true",
@@ -1113,6 +1191,8 @@ def main():
         sys.exit(cli_smoke(a.src))
     if a.gain_walk:
         sys.exit(gain_walk_replay(a.src))
+    if a.exposure_units:
+        sys.exit(exposure_units(a.src))
     if a.sample_floor:
         sys.exit(sample_floor(a.src))
     a.photontune = (a.photontune.split() if a.photontune
