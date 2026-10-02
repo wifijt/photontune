@@ -185,6 +185,65 @@ one is yours to post, with the AI Disclosure box ticked.
 
 ---
 
+## D11. Exposure units differ between USB and CSI cameras, and nothing says so
+
+**Condition:** any USB (UVC) camera. Every value photontune computes, applies and
+reports is wrong by the ratio between the camera's raw unit and a microsecond -
+100x for a standard UVC camera.
+
+**What is true.** PhotonVision reads the exposure bounds straight off the V4L2
+property and writes the value straight back, with **no unit conversion**, while
+its own log line calls the number microseconds
+(`GenericUSBCameraSettables.setExposureRaw`, v2026.3.4):
+
+```java
+int propVal = (int) MathUtil.clamp(exposureRaw, minExposure, maxExposure);
+logger.debug("Setting property " + exposureAbsProp.getName() + " to " + propVal
+             + " (user requested " + exposureRaw + " μs)");
+```
+
+Measured on one Pi carrying both, same OV9281 sensor behind both drivers:
+
+```
+CSI  (libcamera)  minExposureRaw 7      maxExposureRaw 80000    -> genuinely us
+USB  (UVC)        exposure_time_absolute  min=1  max=5000  default=157
+```
+
+UVC specifies `CT_EXPOSURE_TIME_ABSOLUTE_CONTROL` in units of 100 us. The
+`default=157` confirms it: 157 x 100 us = 15.7 ms, a conventional default,
+where 157 us would be absurd and a 5 ms ceiling would be absurd for a maximum.
+
+**Consequence.** photontune derives `t_budget` in microseconds and writes it as
+`cameraExposureRaw`. On a USB camera that number is interpreted as hundreds of
+microseconds:
+
+```
+intended    863.5 us  ->    6.0 px of smear at 360 deg/s   (the budget)
+actual    86350.0 us  ->  600.0 px of smear
+```
+
+against a tag edge about 70 px across at 2.4 m. The tag is erased many times
+over. In practice 86 ms is grossly overexposed indoors, so the saturation branch
+walks exposure back down and the run still converges on something usable - which
+is why this does not look like a failure. **The blur budget is simply not being
+enforced, and the reported exposure is not comparable to a CSI camera's.**
+
+photontune has no backend awareness at all - it never reads `isCSICamera`, which
+PhotonVision does publish on the camera object.
+
+**Workaround today:** on USB cameras treat the exposure number as a raw device
+value, not microseconds, and do not compare it against a CSI camera's. Divide
+the reported figure by 100 to get approximate microseconds before reasoning
+about motion blur. `--max-blur-px` is not meaningful on USB until this is fixed.
+
+**Fix, not yet applied.** Units cannot be known with certainty - PhotonVision
+accepts any of `raw_exposure_absolute`, `raw_exposure_time_absolute`, `exposure`
+or `raw_Exposure`, and they do not share a scale. The defensible approach is to
+infer and say so: no real camera has a maximum exposure of 20 ms, so a
+`maxExposureRaw` below about 20000 means the units are not microseconds. Assume
+the UVC 100 us convention, scale, and raise a warning that names the assumption,
+with an explicit override flag for anyone whose camera differs.
+
 ## Deferred, deliberately
 
 These were found and consciously not fixed, because the tune's correctness was
