@@ -25,16 +25,31 @@ PhotonVision over its websocket — nothing to build, no PhotonVision changes.
 
 ---
 
-## Install
+## Where it runs — pick one
 
-### No internet on the Pi? Start here
+photontune talks to PhotonVision over the network, so it can run in two places.
+They are not alternatives for the same job.
 
-A team network usually has none and a competition field has none at all. The
-[latest release](https://github.com/wifijt/photontune/releases/latest) ships a
-bundle that needs **no network on the Pi, and no pip to begin with**:
+| | use it when | what you get |
+|---|---|---|
+| **On the Pi** | this is a robot | a service the drive team triggers from the dashboard, and settings asserted at every power-on |
+| **From a laptop** | a quick one-off tune, or a bench | a tune, and nothing else — no service, no dashboard button |
+
+**For a robot, install it on the Pi.** The laptop route exists because you do not
+always want to install anything to tune a camera once.
+
+---
+
+## Install on the Pi
+
+### The easy way, and the only way with no internet
+
+A team network usually has no internet and a competition field has none at all.
+The [latest release](https://github.com/wifijt/photontune/releases/latest) ships
+a bundle that needs **no network on the Pi, and no pip there to begin with**:
 
 ```sh
-# on any machine with internet - Windows, Mac or Linux
+# on any machine WITH internet - Windows, Mac or Linux
 curl -LO https://github.com/wifijt/photontune/releases/latest/download/photontune-offline-full.tar.gz
 tar -xzf photontune-offline-full.tar.gz
 
@@ -44,62 +59,47 @@ ssh photon@<pi-address>
 sudo bash /tmp/photontune-offline-full/install.sh
 ```
 
+Login is `photon` / `vision`. **Use the Pi's IP address**, not
+`photonvision.local` — mDNS usually fails on a managed network (`hostname -I` on
+the Pi).
+
 Built for Python 3.11 / Debian 12 / aarch64, which is the PhotonVision Pi image.
-`install.sh` is safe to re-run, verifies by importing rather than trusting pip,
-and gets pip with no network by running the bundled pip wheel as a zipapp -
-falling back to unpacking the wheels and writing a `.pth` pointer if even that
-fails. **Use the Pi's IP address**, not `photonvision.local`; mDNS usually fails
-on a managed network.
+`install.sh` is safe to re-run and verifies by importing rather than trusting
+pip. It gets pip with no network by running the bundled pip wheel as a zipapp,
+and if that fails it unpacks the wheels and writes a `.pth` pointer so Python
+finds them with no `PYTHONPATH` anywhere — which matters, because `sudo` strips
+`PYTHONPATH` and systemd never had it.
 
-To build the bundle yourself instead, see
-[photonvision-tools/SETUP.md](https://github.com/wifijt/photonvision-tools/blob/main/SETUP.md)
-- the wheel platform tags are the part that wastes an evening.
+To build the bundle yourself, see
+[photonvision-tools/SETUP.md](https://github.com/wifijt/photonvision-tools/blob/main/SETUP.md).
+The wheel platform tags are the part that wastes an evening.
 
-### On a laptop
+### By hand, if the Pi does have internet
 
-```sh
-pip install msgpack websockets
-python3 photontune.py --host photonvision.local
-```
-
-That is everything for CLI use. `pyntcore` and `photonlibpy` are optional here (see
-below); without them, sampling uses the websocket.
-
-### On the coprocessor — a PhotonVision Raspberry Pi image
-
-**None of these ship on the image**, including `pip3` itself, and the package lists are
-stale on a fresh boot. Verified on PhotonVision v2026.3.4 / Debian 12 / Python 3.11:
+**Nothing below ships on the image, including `pip3` itself**, and the package
+lists are stale on a fresh boot. Verified on PhotonVision v2026.3.4 / Debian 12 /
+Python 3.11:
 
 ```sh
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
     python3-msgpack python3-websockets python3-pip
 sudo pip3 install --break-system-packages pyntcore photonlibpy
-```
 
-| package | needed for | if missing |
-|---|---|---|
-| `msgpack`, `websockets` | everything | exits immediately |
-| `pyntcore` | daemon mode | `--daemon` exits with a message; CLI is unaffected |
-| `photonlibpy` | decoding detections **off NetworkTables** | logs it and falls back to the websocket — **4.8x fewer frames per trial** |
-
-`photonlibpy` is easy to skip and costs the most: over NT the tool samples ~43 results/s
-against ~9 on the websocket, so every trial is built on 4.8x the evidence.
-
-Then install the files:
-
-```sh
 sudo mkdir -p /opt/photontune
 sudo cp photontune.py sabotage_test.py /opt/photontune/
 ```
 
-Check it runs before making it a service:
+### Either way, check it before making it a service
 
 ```sh
 python3 /opt/photontune/photontune.py --host 127.0.0.1 --baseline-only
 ```
 
-### As a service
+`--baseline-only` asserts the structural settings and stops. No exposure sweep,
+so it cannot leave a camera somewhere useless. **If this fails, stop here.**
+
+### Then the service
 
 ```sh
 sudo cp photontune.service /etc/systemd/system/
@@ -108,14 +108,46 @@ sudo systemctl enable --now photontune
 journalctl -u photontune -f
 ```
 
-**Edit `--nt-server` in the unit first.** It must point at a NetworkTables server that
-already exists — the roboRIO on a robot (`--team <number>`, or `10.TE.AM.2`). photontune
-never starts one. On a bench with no roboRIO, either point it at PhotonVision's own NT
-server (`127.0.0.1`, if you have enabled `runNTServer` in the dashboard) or leave it and
-accept the websocket fallback.
+**Edit `--nt-server` in the unit first.** It must point at a NetworkTables server
+that already **exists** — the roboRIO on a robot (`--team <number>`, or
+`10.TE.AM.2`). photontune never starts one. On a bench with no roboRIO, either
+point it at PhotonVision's own NT server (`127.0.0.1`, if `runNTServer` is on) or
+leave it and accept the websocket fallback.
 
-At startup the daemon asserts the baseline on every camera and stops — seconds, and it
-cannot leave a camera mid-sweep. It does **not** tune at boot; see below.
+At startup the daemon asserts the baseline on every camera and stops — seconds,
+and it cannot leave a camera mid-sweep. It does **not** tune at boot; see below.
+
+Trigger a tune by setting `PhotonTune/run` true from your dashboard. There is a
+ready-made Elastic layout in
+[photonvision-tools/dashboards/](https://github.com/wifijt/photonvision-tools/tree/main/dashboards).
+
+---
+
+## Install on a laptop instead
+
+For a one-off tune over the network, with nothing installed on the Pi:
+
+```sh
+pip install msgpack websockets
+python3 photontune.py --host <pi-address>
+```
+
+That is everything for CLI use. You do **not** get the service, the boot
+baseline, or the dashboard button — those need it on the Pi.
+
+---
+
+## What each dependency buys
+
+| package | needed for | if missing |
+|---|---|---|
+| `msgpack`, `websockets` | everything | exits immediately |
+| `pyntcore` | daemon mode | `--daemon` exits with a message; CLI is unaffected |
+| `photonlibpy` | decoding detections **off NetworkTables** | logs it and falls back to the websocket — **4.8x fewer frames per trial** |
+
+`photonlibpy` is the easiest to skip and costs the most: over NT the tool samples
+~43 results/s against ~9 on the websocket, so every trial is built on 4.8x the
+evidence. Answers get noisier, not wrong.
 
 ---
 
