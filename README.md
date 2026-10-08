@@ -27,6 +27,34 @@ PhotonVision over its websocket — nothing to build, no PhotonVision changes.
 
 ## Install
 
+### No internet on the Pi? Start here
+
+A team network usually has none and a competition field has none at all. The
+[latest release](https://github.com/wifijt/photontune/releases/latest) ships a
+bundle that needs **no network on the Pi, and no pip to begin with**:
+
+```sh
+# on any machine with internet - Windows, Mac or Linux
+curl -LO https://github.com/wifijt/photontune/releases/latest/download/photontune-offline-full.tar.gz
+tar -xzf photontune-offline-full.tar.gz
+
+# copy it over, then one command
+scp -r photontune-offline-full photon@<pi-address>:/tmp/
+ssh photon@<pi-address>
+sudo bash /tmp/photontune-offline-full/install.sh
+```
+
+Built for Python 3.11 / Debian 12 / aarch64, which is the PhotonVision Pi image.
+`install.sh` is safe to re-run, verifies by importing rather than trusting pip,
+and gets pip with no network by running the bundled pip wheel as a zipapp -
+falling back to unpacking the wheels and writing a `.pth` pointer if even that
+fails. **Use the Pi's IP address**, not `photonvision.local`; mDNS usually fails
+on a managed network.
+
+To build the bundle yourself instead, see
+[photonvision-tools/SETUP.md](https://github.com/wifijt/photonvision-tools/blob/main/SETUP.md)
+- the wheel platform tags are the part that wastes an evening.
+
 ### On a laptop
 
 ```sh
@@ -155,6 +183,8 @@ python3 sabotage_test.py --verdict-matrix   # offline: exit code per recorded pr
 python3 sabotage_test.py --gain-walk        # offline: recorded samples, real pass rule
 python3 sabotage_test.py --sample-floor     # offline: a 3-frame sample cannot "pass"
 python3 sabotage_test.py --cli-smoke        # offline: the real main(), every flag
+python3 sabotage_test.py --exposure-units   # offline: is the budget enforced on a UVC camera
+python3 sabotage_test.py --nt-clock         # offline: can an import silence NetworkTables
 ```
 
 The first breaks 15 settings on purpose, checks each is repaired, and leaves the cameras
@@ -271,6 +301,7 @@ success. `inputImageRotationMode=0`, `blur=0`, `cameraAutoExposure=off`, red/blu
 | `--fx` | 1105.9 | fallback only; the camera's own calibration wins |
 | `--min-tags` / `--max-ambiguity` | 2.0 / 0.20 | bars when multi-tag is unavailable |
 | `--baseline-only`, `--no-baseline`, `--brightness` | | the structural settings |
+| `--exposure-unit-us` | 0 = infer | microseconds per unit of the camera's exposure value. libcamera is 1, a UVC camera is 100 |
 | `--nt-server`, `--team`, `--no-nt`, `--json` | | |
 
 ## Limitations
@@ -284,6 +315,12 @@ success. `inputImageRotationMode=0`, `blur=0`, `cameraAutoExposure=off`, red/blu
   is deliberate: a finer grid would decide on differences smaller than the measurement.
 - **Multi-camera is sequential**, so cameras cannot perturb each other — but N cameras
   takes N times as long.
+- **A USB camera cannot track the budget finely.** PhotonVision passes the
+  exposure value straight to V4L2 with no conversion while calling it
+  microseconds; on a UVC camera the unit is actually 100 us. photontune infers
+  the unit and warns which assumption it made, but the 100 us step size means
+  the budget can only be hit to about 12% at 863 us. It errs under budget.
+  See [DEFECTS.md](DEFECTS.md) #11.
 - The right answer genuinely moves as lighting changes. Retune where you will play.
 
 [DEFECTS.md](DEFECTS.md) lists what is known to be wrong, the conditions it appears
