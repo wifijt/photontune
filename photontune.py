@@ -45,7 +45,7 @@ Modes:
   Daemon  python photontune.py --daemon --nt-server 10.TE.AM.2
           (asserts the baseline at boot; tunes only when told to)
 """
-import argparse, asyncio, dataclasses, json, math, sys, time
+import argparse, asyncio, dataclasses, json, math, os, sys, time
 
 try:
     import msgpack, websockets
@@ -3875,9 +3875,131 @@ def _finish(code, host, port, log=print):
     return code
 
 
+
+# ---------------------------------------------------------------------------
+# Local log.
+#
+# This used to not exist, and the consequence was worse than an inconvenience:
+# journald captures the SERVICE's output, so a tune somebody ran from a shell -
+#
+#     python3 /opt/photontune/photontune.py
+#
+# which is the obvious thing to type and is what the docs show - printed to
+# their terminal and was recorded NOWHERE. Afterwards nobody could say what the
+# cameras had been set to, or that a tune had even been attempted. A reporting
+# tool reading only the journal then said "no tune since boot" about a tune
+# that had just run and FAILED, which is the worst possible answer.
+#
+# It is fixed here, in the tuner, rather than in a wrapper script: a wrapper
+# only logs the runs that go through it, and the raw path is the one people
+# actually type.
+#
+# Rules this follows:
+#   - logging NEVER breaks a tune. Every failure is swallowed and mentioned
+#     once on stderr.
+#   - every line is flushed, because a tune gets Ctrl-C'd and the interesting
+#     part is usually what was on screen when it did.
+#   - a run writes a start banner and an exit line, so a reader can tell where
+#     one run ends and the next begins, and whether it finished at all.
+# ---------------------------------------------------------------------------
+
+LOCAL_LOG = os.environ.get("PHOTONTUNE_LOG", "/var/log/photontune/photontune.log")
+
+
+class _Tee(object):
+    """Write to the terminal AND to the log, timestamping only the log."""
+
+    def __init__(self, stream, handle):
+        self._stream = stream
+        self._handle = handle
+        self._at_line_start = True
+
+    def write(self, text):
+        self._stream.write(text)
+        try:
+            for piece in text.splitlines(True):
+                if self._at_line_start and piece.strip():
+                    self._handle.write("%s %s" % (_now_iso(), piece))
+                else:
+                    self._handle.write(piece)
+                self._at_line_start = piece.endswith("\n")
+            self._handle.flush()
+        except (IOError, OSError, ValueError):
+            pass                 # a full disk must not stop a tune
+        return len(text)
+
+    def flush(self):
+        self._stream.flush()
+        try:
+            self._handle.flush()
+        except (IOError, OSError, ValueError):
+            pass
+
+    def isatty(self):
+        return getattr(self._stream, "isatty", lambda: False)()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _now_iso():
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S+0000")
+
+
+def start_local_log(argv=None, path=None):
+    """Tee stdout/stderr into the local log. Returns the handle, or None.
+
+    Called after argument parsing so --help is not logged - a help request is
+    not an event.
+    """
+    path = path or LOCAL_LOG
+    if os.environ.get("PHOTONTUNE_NO_LOG"):
+        return None
+    try:
+        directory = os.path.dirname(path)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory)
+        handle = open(path, "a", 1)          # line buffered
+    except (IOError, OSError) as exc:
+        sys.stderr.write(
+            "note: not logging to %s (%s). The run continues; it just will "
+            "not be recorded.\n" % (path, exc))
+        return None
+
+    argv = argv if argv is not None else sys.argv[1:]
+    try:
+        handle.write("%s photontune run started: %s\n"
+                     % (_now_iso(), " ".join(argv)))
+        handle.flush()
+    except (IOError, OSError):
+        return None
+
+    sys.stdout = _Tee(sys.stdout, handle)
+    sys.stderr = _Tee(sys.stderr, handle)
+
+    import atexit
+
+    def _close():
+        # atexit so the exit line is written on EVERY path, including
+        # sys.exit from deep inside a verdict and an uncaught exception.
+        try:
+            handle.write("%s photontune run finished\n" % _now_iso())
+            handle.flush()
+            handle.close()
+        except (IOError, OSError, ValueError):
+            pass
+
+    atexit.register(_close)
+    return handle
+
+
 def main():
     _install_signal_handlers()
     args = build_parser().parse_args()
+    # After parse_args, so --help is not an event worth recording.
+    start_local_log()
     if args.max_blur_px <= 0:
         sys.exit("--max-blur-px must be > 0: it is what SETS the exposure")
     if args.max_range is not None and args.max_range <= 0:
