@@ -1809,7 +1809,7 @@ class Search:
     later cannot reintroduce the bug, because there is nowhere to write it.
     """
     __slots__ = ("cam", "unique", "nickname", "original", "fx", "budget_px",
-                 "t_budget", "exposure", "gain", "reference", "trials",
+                 "t_budget", "exposure", "gain", "reference", "bar", "trials",
                  "unit_us")
 
     def __init__(self, cam):
@@ -1828,7 +1828,15 @@ class Search:
         self.unit_us = 1.0         # microseconds per unit - exposure_unit_us()
         self.exposure = None       # the exposure actually being tried
         self.gain = None           # the gain actually being tried
-        self.reference = None      # Sample at max gain: the best the scene can do
+        # Sample at max gain. This used to be commented "the best the scene
+        # can do", which is an ASSUMPTION and a false one: on a camera where
+        # high gain costs more in sensor noise than it buys in signal, the top
+        # of the grid is where it reads WORST. Kept at max gain because the
+        # walk reuses it at g == top and _rescue starts from it.
+        self.reference = None
+        # The sample that actually sets the bar. Normally the reference; the
+        # second look when the reference turned out to be the outlier.
+        self.bar = None
         self.trials = []           # every Sample taken, in the order taken
 
     def exposure_bounds(self):
@@ -2117,16 +2125,46 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
         # the reference must be detecting its one tag reliably and at a
         # trustworthy ambiguity, so this cannot rescue a genuinely broken
         # camera that happens to glimpse a tag occasionally.
-        eff_min_tags = cfg.min_tags
-        r = st.reference
-        one_tag_scene = (
-            not r.multitag_solves
-            and r.frames >= MIN_SAMPLE_FRAMES
-            and 0.90 <= r.mean_tags < 1.5
-            and r.med_ambiguity is not None
-            and r.med_ambiguity <= cfg.max_ambiguity)
+        st.bar = st.reference
+        eff_min_tags, one_tag_scene, ref_why = _as_reference(st.bar, cfg)
+
+        # A SECOND LOOK before the floor is given up.
+        #
+        # The reference is ONE sample at ONE gain, and that gain is the top of
+        # the grid - chosen on the assumption that maximum gain is where a
+        # camera sees most, which is not true of a camera whose noise floor
+        # rises faster than its signal. When it fails, the whole run loses its
+        # tag-count floor and can no longer report success whatever the walk
+        # goes on to measure, so the cost of one bad sample is the entire
+        # tune. See _as_reference for the two runs, sixty seconds apart, that
+        # disagreed on nothing but this.
+        #
+        # One extra dwell, and only on a run that was otherwise already lost.
+        if ref_why is not None and len(gains) > 2:
+            alt_gain = gains[len(gains) // 2]
+            log("   the reference does not pass its own test (%s). Taking ONE "
+                "more at gain %d before giving up the tag-count floor - the "
+                "reference is a single sample at the top of the grid, and the "
+                "top is not always where this camera reads best."
+                % (ref_why, alt_gain))
+            _check_abort(cfg, "before the second reference look")
+            alt = await trial(pv, cam, cfg, alt_gain, st.exposure, log)
+            st.trials.append(alt)
+            log("   second look  gain %-4d exposure %6.0f  %s"
+                % (alt_gain, st.exposure, alt.summary()))
+            a_eff, a_one, a_why = _as_reference(alt, cfg)
+            if a_why is None:
+                log("   the second look passes where gain %d did not, so it "
+                    "sets the bar. One sample at the top of the grid is not "
+                    "the scene." % top)
+                note_problem(rec, "reference_resampled",
+                             "gain %d unusable (%s); gain %d usable"
+                             % (top, ref_why, alt_gain))
+                st.bar = alt
+                eff_min_tags, one_tag_scene, ref_why = a_eff, a_one, a_why
+
+        r = st.bar
         if one_tag_scene and cfg.min_tags > 1.0:
-            eff_min_tags = 1.0
             log("   only one tag is visible to this camera (%.2f tags at "
                 "ambiguity %.3f, %d frames). Multi-tag needs two, so the "
                 "tag-count floor comes from the scene: tuning for detection "
@@ -2137,10 +2175,9 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
                          "%.2f tags, ambiguity %.3f over %d frames"
                          % (r.mean_tags, r.med_ambiguity, r.frames))
 
-        ref_why = st.reference.why_failed(eff_min_tags, cfg.max_ambiguity)
         if ref_why is None:
-            best_tags = st.reference.mean_tags
-            best_tags_se = st.reference.tag_standard_error()
+            best_tags = r.mean_tags
+            best_tags_se = r.tag_standard_error()
         else:
             log("   !! the reference does not pass its own test (%s), so it "
                 "cannot be a bar. Walking without the tag-count floor; the "
@@ -2195,14 +2232,17 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
             # ---- 5/6. nothing in the grid worked at the budget exposure ----
             st.gain, st.exposure = await _rescue(pv, cam, cfg, st, log)
             if st.gain is None:
-                msg = ("no gain from %s saw the tags at %.0f us, and neither a "
-                       "shorter nor a longer exposure did. That is a LIGHTING "
-                       "or CONFIG problem, not a tuning one: check "
-                       "cameraBrightness, check the camera is pointed at tags, "
-                       "add light." % (gains, st.t_budget))
+                msg = _why_nothing_worked(st, cfg, gains)
                 log("   !! " + msg)
                 note_problem(rec, "no_workable_settings", msg)
-                rec["error"] = "nothing worked at any gain or exposure"
+                # The one-line summary a human reads first. "nothing worked at
+                # any gain or exposure" is true of the settings and false about
+                # the scene, and read as the second it sends someone to fix
+                # the light on a camera that can see its tag.
+                saw = max([t.mean_tags for t in st.trials if t.frames] or [0.0])
+                rec["error"] = ("nothing worked at any gain or exposure"
+                                if saw <= 0 else
+                                "saw up to %.2f tags but nothing met the bar" % saw)
                 await pv.set_setting(st.unique, **st.original)
                 await asyncio.sleep(0.4)
                 PENDING_RESTORE.pop(st.unique, None)
@@ -2396,6 +2436,90 @@ async def tune_camera(pv, cam, cfg, log=print, progress=None):
                           "med_reproj": s.med_reproj,
                           "med_ambiguity": s.med_ambiguity}
                          for s in st.trials]
+
+
+def _as_reference(sample, cfg):
+    """Can this sample serve as the bar? (eff_min_tags, one_tag_scene, why).
+
+    `why` is None when it can. Pulled out of run() because it now has to be
+    asked of more than one sample: the reference is taken at the TOP of the
+    gain grid, and the top is not always where a camera reads best.
+
+    MEASURED 2026-11-16, camera "Left", two runs sixty seconds apart on the
+    same tags in the same room:
+
+        run A   gain 100 -> 0.89 tags, ambiguity 0.937   <- reference
+                gain  20 -> 1.00 tags, ambiguity 0.800
+                gain  40 -> 1.00 tags, ambiguity 0.429
+                gain  60 -> 1.00 tags, ambiguity 0.429
+                gain  80 -> 1.00 tags, ambiguity 0.460
+        run B   gain 100 -> 1.00 tags, ambiguity 0.173   <- reference, tuned
+
+    In run A the reference missed the one-tag gate by a hundredth of a tag and
+    the ambiguity limit by four times, the tag-count floor was dropped, and the
+    run could not report success however well the walk read. In run B the same
+    camera in the same scene produced a usable reference and tuned normally.
+    Nothing changed but which side of a gate one sample landed on.
+    """
+    eff = cfg.min_tags
+    one_tag = (
+        not sample.multitag_solves
+        and sample.frames >= MIN_SAMPLE_FRAMES
+        and 0.90 <= sample.mean_tags < 1.5
+        and sample.med_ambiguity is not None
+        and sample.med_ambiguity <= cfg.max_ambiguity)
+    if one_tag and cfg.min_tags > 1.0:
+        eff = 1.0
+    return eff, one_tag, sample.why_failed(eff, cfg.max_ambiguity)
+
+
+def _why_nothing_worked(st, cfg, gains):
+    """Why no setting passed - from the samples, not from a fixed sentence.
+
+    The message this replaces was one string for every failure:
+
+        no gain from [...] saw the tags at 863 us, and neither a shorter nor a
+        longer exposure did. That is a LIGHTING or CONFIG problem, not a tuning
+        one: check cameraBrightness, check the camera is pointed at tags, add
+        light.
+
+    It was printed on a camera whose own six preceding log lines read "tags
+    1.00" at four separate gains. A student reading it goes to find lamps, for
+    a camera that could see the tag perfectly well at every gain tried. The
+    three cases below need three different actions and only one of them is
+    light, so they are now told apart by what the trials measured.
+    """
+    seen = [t for t in st.trials if t.frames]
+    best_tags = max([t.mean_tags for t in seen] or [0.0])
+    ambs = [t.med_ambiguity for t in seen
+            if t.med_ambiguity is not None and t.mean_tags > 0]
+    best_amb = min(ambs) if ambs else None
+
+    # Nothing here about the reference, deliberately. note_problem's
+    # "reference_unusable" entry already explains it and the summary appends
+    # that to this same sentence, so saying it here too printed it TWICE in
+    # one line on the first hardware run of this change - which reads as a
+    # tool that cannot remember what it has already told you.
+
+    if best_tags <= 0:
+        return ("no gain from %s saw a tag at %.0f us, and neither a shorter "
+                "nor a longer exposure did. NOTHING was detected at any "
+                "setting, so this is lighting or aim, not tuning: check a tag "
+                "is actually in view, check cameraBrightness, add light."
+                % (gains, st.t_budget))
+
+    if best_amb is not None and best_amb > cfg.max_ambiguity:
+        return ("tags WERE seen - up to %.2f of them - but pose ambiguity "
+                "never came under %.2f (best %.3f). That is viewing geometry, "
+                "not light: a tag at a shallow angle or too far away is "
+                "ambiguous at every exposure and adding light will not change "
+                "it. Aim so a tag sits closer to face-on, or move it nearer."
+                % (best_tags, cfg.max_ambiguity, best_amb))
+
+    return ("tags WERE seen - up to %.2f - but never the %.2f this run needed, "
+            "at any gain or exposure. The scene has fewer tags in view than "
+            "--min-tags asks for: put another tag in frame, or lower it."
+            % (best_tags, cfg.min_tags))
 
 
 async def _rescue(pv, cam, cfg, st, log):

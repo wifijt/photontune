@@ -265,6 +265,40 @@ budget can only be hit to within one step - about 12% at 863 us. The error lands
 on the safe side (8 steps, not 9), but a USB camera cannot track a blur budget
 as finely as a CSI one.
 
+## 12. A single tag at a shallow angle can never be tuned, and that is correct
+
+**Condition.** A camera that can see exactly one tag, viewed obliquely or from
+far enough away that its pose ambiguity sits above `--max-ambiguity` (0.20).
+
+**What happens.** The run fails and applies nothing. The single-tag rescue in
+`_as_reference` deliberately requires BOTH a reliable detection (0.90–1.5 tags)
+and a trustworthy ambiguity, so a tag the camera can see but cannot place does
+not lower the tag-count floor. The walk then has to clear `--min-tags` 2.0 with
+one tag in view, which nothing can do.
+
+**Measured 2026-11-16, camera `Left`**, one tag in frame, four consecutive runs:
+
+```
+run A   gain 100  1.00 tags  ambiguity 0.937      run C  gain 100  1.00  0.391
+run B   gain 100  1.00 tags  ambiguity 0.173      run D  gain 100  1.00  0.447
+```
+
+Same tag, same room, minutes apart. Only run B's reference cleared 0.20, and
+only run B tuned. **The outcome is set by viewing geometry and sampling noise,
+not by anything exposure can change** — which is why the failure message now
+says so instead of asking for more light.
+
+**What to do.** Put a second tag in that camera's view, or aim so the one tag
+sits closer to face-on. If a single oblique tag genuinely is the scene, tune
+that camera with `--min-tags 1 --max-ambiguity 0.6` and understand what you are
+accepting: exposure tuned for DETECTION, with pose explicitly not verified.
+
+**Why it is not "fixed".** Relaxing the ambiguity gate so these runs pass would
+certify a pose the tool knows is ambiguous. The run failing is the honest
+outcome; what was broken was the explanation, which blamed the lighting.
+
+---
+
 ## Deferred, deliberately
 
 These were found and consciously not fixed, because the tune's correctness was
